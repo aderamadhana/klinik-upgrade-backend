@@ -2,20 +2,10 @@
 
 namespace App\Models\master;
 
-class MasterUser extends BaseMasterModel
+class MasterKaryawanPenempatan extends BaseMasterModel
 {
-    protected $table = 'master_user';
+    protected $table = 'master_karyawan_penempatan';
     protected $primaryKey = 'id';
-
-    protected $hidden = [
-        'password',
-        'remember_token',
-    ];
-
-    public function role()
-    {
-        return $this->belongsTo(MasterRole::class, 'role_id', 'id');
-    }
 
     public function karyawan()
     {
