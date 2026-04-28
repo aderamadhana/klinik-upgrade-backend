@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Models\master;
+namespace App\Models\Master;
 
 class MasterTreatment extends BaseMasterModel
 {

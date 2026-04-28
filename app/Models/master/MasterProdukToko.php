@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Models\master;
+namespace App\Models\Master;
 
 class MasterProdukToko extends BaseMasterModel
 {
