@@ -16,7 +16,7 @@ class MasterUserController extends Controller
     {
         $search = $request->get('search');
 
-        $data = MasterUser::query()
+        $query = MasterUser::query()
             ->active()
             ->with(['karyawan', 'penempatan.toko'])
             ->when($search, function ($q) use ($search) {
@@ -25,16 +25,32 @@ class MasterUserController extends Controller
                         ->orWhere('nama', 'like', "%{$search}%")
                         ->orWhere('display_name', 'like', "%{$search}%")
                         ->orWhere('email', 'like', "%{$search}%")
-                        ->orWhere('role', 'like', "%{$search}%");
+                        ->orWhere('role_name', 'like', "%{$search}%")
+                        ->orWhereHas('karyawan', function ($karyawan) use ($search) {
+                            $karyawan->where('nama', 'like', "%{$search}%")
+                                ->orWhere('kode', 'like', "%{$search}%");
+                        })
+                        ->orWhereHas('penempatan.toko', function ($toko) use ($search) {
+                            $toko->where('nama_toko', 'like', "%{$search}%")
+                                ->orWhere('kode_toko', 'like', "%{$search}%");
+                        });
                 });
             })
-            ->orderBy('nama')
-            ->paginate($request->get('per_page', 10));
+            ->orderBy('nama');
+
+        $perPage = (int) $request->get('per_page', 10);
+        $data = $query->paginate($perPage);
 
         return response()->json([
             'status' => true,
             'message' => 'Data user berhasil diambil',
-            'data' => $data,
+            'data' => $data->items(),
+            'meta' => [
+                'current_page' => $data->currentPage(),
+                'per_page' => $data->perPage(),
+                'total' => $data->total(),
+                'last_page' => $data->lastPage(),
+            ],
         ]);
     }
 
@@ -42,12 +58,17 @@ class MasterUserController extends Controller
     {
         $validator = Validator::make($request->all(), [
             'karyawan_id' => 'nullable|exists:master_karyawan,id',
-            'role' => 'required|string|max:50',
+
+            'role_id' => 'required|integer',
+            'role_name' => 'required|string|max:100',
+
             'username' => 'required|string|max:100|unique:master_user,username',
             'password' => 'nullable|string|min:6',
             'email' => 'nullable|email|max:150|unique:master_user,email',
+
             'nama' => 'required|string|max:150',
             'display_name' => 'nullable|string|max:150',
+
             'is_active' => 'nullable|boolean',
             'must_change_password' => 'nullable|boolean',
 
@@ -65,20 +86,35 @@ class MasterUserController extends Controller
             ], 422);
         }
 
+        $penempatanError = $this->validatePenempatan($request->penempatan ?? []);
+
+        if ($penempatanError) {
+            return response()->json([
+                'status' => false,
+                'message' => $penempatanError,
+            ], 422);
+        }
+
         DB::beginTransaction();
 
         try {
             $user = MasterUser::create([
                 'karyawan_id' => $request->karyawan_id,
-                'role' => $request->role,
+
+                'role_id' => $request->role_id,
+                'role_name' => $request->role_name,
+
                 'username' => $request->username,
                 'password' => Hash::make($request->password ?: '123456'),
                 'email' => $request->email,
+
                 'nama' => $request->nama,
                 'display_name' => $request->display_name ?: $request->nama,
+
                 'is_active' => $request->is_active ?? 1,
                 'is_delete' => 0,
                 'must_change_password' => $request->password ? 0 : 1,
+
                 'created_by' => auth('api')->user()->username ?? 'system',
                 'created_at' => now(),
             ]);
@@ -137,12 +173,17 @@ class MasterUserController extends Controller
 
         $validator = Validator::make($request->all(), [
             'karyawan_id' => 'nullable|exists:master_karyawan,id',
-            'role' => 'required|string|max:50',
+
+            'role_id' => 'required|integer',
+            'role_name' => 'required|string|max:100',
+
             'username' => 'required|string|max:100|unique:master_user,username,' . $id,
             'password' => 'nullable|string|min:6',
             'email' => 'nullable|email|max:150|unique:master_user,email,' . $id,
+
             'nama' => 'required|string|max:150',
             'display_name' => 'nullable|string|max:150',
+
             'is_active' => 'nullable|boolean',
             'must_change_password' => 'nullable|boolean',
 
@@ -160,18 +201,33 @@ class MasterUserController extends Controller
             ], 422);
         }
 
+        $penempatanError = $this->validatePenempatan($request->penempatan ?? []);
+
+        if ($penempatanError) {
+            return response()->json([
+                'status' => false,
+                'message' => $penempatanError,
+            ], 422);
+        }
+
         DB::beginTransaction();
 
         try {
             $payload = [
                 'karyawan_id' => $request->karyawan_id,
-                'role' => $request->role,
+
+                'role_id' => $request->role_id,
+                'role_name' => $request->role_name,
+
                 'username' => $request->username,
                 'email' => $request->email,
+
                 'nama' => $request->nama,
                 'display_name' => $request->display_name ?: $request->nama,
+
                 'is_active' => $request->is_active ?? 1,
                 'must_change_password' => $request->must_change_password ?? $user->must_change_password,
+
                 'updated_by' => auth('api')->user()->username ?? 'system',
                 'updated_at' => now(),
             ];
@@ -268,6 +324,36 @@ class MasterUserController extends Controller
             'status' => true,
             'message' => 'Password user berhasil direset ke default 123456',
         ]);
+    }
+
+    private function validatePenempatan(array $penempatan): ?string
+    {
+        if (!count($penempatan)) {
+            return null;
+        }
+
+        $primaryCount = collect($penempatan)
+            ->filter(fn ($item) => (int) ($item['is_primary'] ?? 0) === 1)
+            ->count();
+
+        if ($primaryCount !== 1) {
+            return 'Harus ada tepat 1 penempatan utama';
+        }
+
+        $tokoIds = collect($penempatan)
+            ->pluck('toko_id')
+            ->filter()
+            ->values();
+
+        if ($tokoIds->count() !== count($penempatan)) {
+            return 'Semua penempatan harus memilih toko';
+        }
+
+        if ($tokoIds->unique()->count() !== $tokoIds->count()) {
+            return 'Toko pada penempatan tidak boleh duplikat';
+        }
+
+        return null;
     }
 
     private function syncPenempatan($userId, array $penempatan): void
