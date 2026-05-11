@@ -13,27 +13,56 @@ class MasterKaryawanController extends Controller
 {
     public function index(Request $request)
     {
-        $search = $request->get('search');
+        $search = trim((string) $request->get('search', ''));
+        $jabatanId = $request->get('jabatan_id');
+        $tokoId = $request->get('toko_id');
 
-        $data = MasterKaryawan::query()
+        $perPage = (int) $request->get('per_page', 10);
+        $perPage = $perPage > 0 ? min($perPage, 100) : 10;
+
+        $query = MasterKaryawan::query()
             ->active()
             ->with(['jabatan', 'penempatan.toko'])
-            ->when($search, function ($q) use ($search) {
+            ->when($search !== '', function ($q) use ($search) {
                 $q->where(function ($qq) use ($search) {
                     $qq->where('kode', 'like', "%{$search}%")
                         ->orWhere('nama', 'like', "%{$search}%")
                         ->orWhere('no_telp', 'like', "%{$search}%")
-                        ->orWhere('nik', 'like', "%{$search}%");
+                        ->orWhere('nik', 'like', "%{$search}%")
+                        ->orWhereHas('jabatan', function ($jabatan) use ($search) {
+                            $jabatan->where('nama', 'like', "%{$search}%")
+                                ->orWhere('nama_jabatan', 'like', "%{$search}%");
+                        })
+                        ->orWhereHas('penempatan.toko', function ($toko) use ($search) {
+                            $toko->where('nama_toko', 'like', "%{$search}%")
+                                ->orWhere('kode_toko', 'like', "%{$search}%");
+                        });
+                });
+            })
+            ->when($jabatanId, function ($q) use ($jabatanId) {
+                $q->where('jabatan_id', $jabatanId);
+            })
+            ->when($tokoId, function ($q) use ($tokoId) {
+                $q->whereHas('penempatan', function ($penempatan) use ($tokoId) {
+                    $penempatan->active()
+                        ->where('toko_id', $tokoId);
                 });
             })
             ->orderBy('sort_order')
-            ->orderBy('nama')
-            ->paginate($request->get('per_page', 10));
+            ->orderBy('nama');
+
+        $data = $query->paginate($perPage);
 
         return response()->json([
             'status' => true,
             'message' => 'Data karyawan berhasil diambil',
-            'data' => $data,
+            'data' => $data->items(),
+            'meta' => [
+                'current_page' => $data->currentPage(),
+                'per_page' => $data->perPage(),
+                'total' => $data->total(),
+                'last_page' => $data->lastPage(),
+            ],
         ]);
     }
 

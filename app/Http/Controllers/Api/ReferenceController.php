@@ -8,6 +8,10 @@ use App\Models\Master\MasterRole;
 use App\Models\Master\MasterJabatan;
 use App\Models\Master\MasterToko;
 use App\Models\Master\MasterKaryawan;
+use App\Models\Master\MasterGolonganProduk;
+use App\Models\Master\MasterKategoriProduk;
+use App\Models\Master\MasterTempatProduk;
+use App\Models\Master\MasterSatuan;
 
 
 class ReferenceController extends Controller
@@ -131,6 +135,62 @@ class ReferenceController extends Controller
             'data' => [
                 'kode' => $kode,
             ],
+        ]);
+    }
+
+    public function golonganProduk()
+    {
+        $data = MasterGolonganProduk::query()
+            ->active()
+            ->orderBy('nama_golongan_produk')
+            ->get();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data golongan produk berhasil diambil',
+            'data' => $data,
+        ]);
+    }
+
+    public function kategoriProduk()
+    {
+        $data = MasterKategoriProduk::query()
+            ->active()
+            ->orderBy('nama_kategori_produk')
+            ->get();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data kategori produk berhasil diambil',
+            'data' => $data,
+        ]);
+    }
+
+    public function tempatProduk()
+    {
+        $data = MasterTempatProduk::query()
+            ->active()
+            ->orderBy('nama_tempat_produk')
+            ->get();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data tempat produk berhasil diambil',
+            'data' => $data,
+        ]);
+    }
+
+    public function satuan()
+    {
+        $data = MasterSatuan::query()
+            ->active()
+            ->orderBy('nama_satuan')
+            ->get();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data satuan berhasil diambil',
+            'data' => $data,
         ]);
     }
 }

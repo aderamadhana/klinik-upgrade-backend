@@ -16,4 +16,9 @@ class MasterProdukToko extends BaseMasterModel
     {
         return $this->belongsTo(MasterToko::class, 'toko_id', 'id');
     }
+
+    public function supplier()
+    {
+        return $this->belongsTo(MasterSuplier::class, 'supplier_id', 'id');
+    }
 }

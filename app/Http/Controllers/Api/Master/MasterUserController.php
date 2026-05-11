@@ -14,12 +14,19 @@ class MasterUserController extends Controller
 {
     public function index(Request $request)
     {
-        $search = $request->get('search');
+        $search = trim((string) $request->get('search', ''));
+        $roleId = $request->get('role_id');
+        $roleName = $request->get('role_name');
+        $tokoId = $request->get('toko_id');
+        $isActive = $request->get('is_active');
+
+        $perPage = (int) $request->get('per_page', 10);
+        $perPage = $perPage > 0 ? min($perPage, 100) : 10;
 
         $query = MasterUser::query()
             ->active()
             ->with(['karyawan', 'penempatan.toko'])
-            ->when($search, function ($q) use ($search) {
+            ->when($search !== '', function ($q) use ($search) {
                 $q->where(function ($qq) use ($search) {
                     $qq->where('username', 'like', "%{$search}%")
                         ->orWhere('nama', 'like', "%{$search}%")
@@ -28,7 +35,9 @@ class MasterUserController extends Controller
                         ->orWhere('role_name', 'like', "%{$search}%")
                         ->orWhereHas('karyawan', function ($karyawan) use ($search) {
                             $karyawan->where('nama', 'like', "%{$search}%")
-                                ->orWhere('kode', 'like', "%{$search}%");
+                                ->orWhere('kode', 'like', "%{$search}%")
+                                ->orWhere('no_telp', 'like', "%{$search}%")
+                                ->orWhere('nik', 'like', "%{$search}%");
                         })
                         ->orWhereHas('penempatan.toko', function ($toko) use ($search) {
                             $toko->where('nama_toko', 'like', "%{$search}%")
@@ -36,9 +45,23 @@ class MasterUserController extends Controller
                         });
                 });
             })
+            ->when($roleId, function ($q) use ($roleId) {
+                $q->where('role_id', $roleId);
+            })
+            ->when($roleName, function ($q) use ($roleName) {
+                $q->where('role_name', $roleName);
+            })
+            ->when($tokoId, function ($q) use ($tokoId) {
+                $q->whereHas('penempatan', function ($penempatan) use ($tokoId) {
+                    $penempatan->active()
+                        ->where('toko_id', $tokoId);
+                });
+            })
+            ->when($isActive !== null && $isActive !== '', function ($q) use ($isActive) {
+                $q->where('is_active', (int) $isActive);
+            })
             ->orderBy('nama');
 
-        $perPage = (int) $request->get('per_page', 10);
         $data = $query->paginate($perPage);
 
         return response()->json([
