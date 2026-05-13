@@ -15,17 +15,18 @@ class MasterVoucherDiskonController extends Controller
     public function index(Request $request)
     {
         $search = trim((string) $request->get('search', ''));
+
         $tokoId = $request->get('toko_id');
+        $statusVoucher = $request->get('status_voucher');
         $modeVoucher = $request->get('mode_voucher');
         $tipeDiskon = $request->get('tipe_diskon');
-        $statusVoucher = $request->get('status_voucher');
 
         $perPage = (int) $request->get('per_page', 10);
         $perPage = $perPage > 0 ? min($perPage, 100) : 10;
 
         $query = MasterVoucherDiskon::query()
             ->active()
-            ->with(['toko', 'items'])
+            ->with($this->voucherRelations())
             ->when($search !== '', function ($q) use ($search) {
                 $q->where(function ($qq) use ($search) {
                     $qq->where('nama_voucher', 'like', "%{$search}%")
@@ -44,14 +45,14 @@ class MasterVoucherDiskonController extends Controller
                         ->orWhere('toko_id', $tokoId);
                 });
             })
+            ->when($statusVoucher !== null && $statusVoucher !== '', function ($q) use ($statusVoucher) {
+                $q->where('status_voucher', (int) $statusVoucher);
+            })
             ->when($modeVoucher, function ($q) use ($modeVoucher) {
                 $q->where('mode_voucher', $modeVoucher);
             })
             ->when($tipeDiskon, function ($q) use ($tipeDiskon) {
                 $q->where('tipe_diskon', $tipeDiskon);
-            })
-            ->when($statusVoucher !== null && $statusVoucher !== '', function ($q) use ($statusVoucher) {
-                $q->where('status_voucher', (int) $statusVoucher);
             })
             ->orderBy('sort_order')
             ->orderBy('nama_voucher');
@@ -73,6 +74,8 @@ class MasterVoucherDiskonController extends Controller
 
     public function store(Request $request)
     {
+        $this->normalizeRequestField($request);
+
         $validator = Validator::make($request->all(), [
             'legacy_id' => 'nullable|integer',
 
@@ -81,6 +84,7 @@ class MasterVoucherDiskonController extends Controller
 
             'mode_voucher' => [
                 'required',
+                'string',
                 Rule::in(['direct', 'generate']),
             ],
 
@@ -93,7 +97,8 @@ class MasterVoucherDiskonController extends Controller
 
             'tipe_diskon' => [
                 'required',
-                Rule::in(['percent', 'nominal']),
+                'string',
+                Rule::in(['percent', 'nominal', 'persen', 'rupiah']),
             ],
 
             'total_diskon' => 'required|numeric|min:0',
@@ -111,13 +116,15 @@ class MasterVoucherDiskonController extends Controller
             'items' => 'nullable|array',
             'items.*.item_type' => [
                 'required_with:items',
+                'string',
                 Rule::in(['treatment', 'produk']),
             ],
             'items.*.item_id' => 'required_with:items|integer',
             'items.*.harga_snapshot' => 'nullable|numeric|min:0',
             'items.*.tipe_diskon_item' => [
                 'nullable',
-                Rule::in(['percent', 'nominal']),
+                'string',
+                Rule::in(['percent', 'nominal', 'persen', 'rupiah']),
             ],
             'items.*.nilai_diskon_item' => 'nullable|numeric|min:0',
         ]);
@@ -139,6 +146,16 @@ class MasterVoucherDiskonController extends Controller
             ], 422);
         }
 
+        $items = $this->normalizeItemsPayload($request);
+        $itemsError = $this->validateVoucherItems($items);
+
+        if ($itemsError) {
+            return response()->json([
+                'status' => false,
+                'message' => $itemsError,
+            ], 422);
+        }
+
         DB::beginTransaction();
 
         try {
@@ -152,7 +169,7 @@ class MasterVoucherDiskonController extends Controller
 
                 'mode_voucher' => $request->mode_voucher,
 
-                'toko_id' => $request->is_all_toko ? null : $request->toko_id,
+                'toko_id' => (int) ($request->is_all_toko ?? 0) === 1 ? null : $request->toko_id,
                 'is_all_toko' => $request->is_all_toko ?? 0,
 
                 'kategori_voucher_id' => $request->kategori_voucher_id,
@@ -162,15 +179,13 @@ class MasterVoucherDiskonController extends Controller
                 'tipe_diskon' => $request->tipe_diskon,
                 'total_diskon' => $request->total_diskon,
 
-                'qty_generate' => $request->mode_voucher === 'generate'
-                    ? ($request->qty_generate ?? 1)
-                    : 1,
+                'qty_generate' => $request->qty_generate ?? 1,
 
                 'is_bisa_digabung_promo' => $request->is_bisa_digabung_promo ?? 0,
                 'is_unlimited_date' => $request->is_unlimited_date ?? 0,
 
-                'tanggal_mulai' => $request->is_unlimited_date ? null : $request->tanggal_mulai,
-                'tanggal_akhir' => $request->is_unlimited_date ? null : $request->tanggal_akhir,
+                'tanggal_mulai' => (int) ($request->is_unlimited_date ?? 0) === 1 ? null : $request->tanggal_mulai,
+                'tanggal_akhir' => (int) ($request->is_unlimited_date ?? 0) === 1 ? null : $request->tanggal_akhir,
 
                 'status_voucher' => $request->status_voucher ?? 0,
                 'is_delete' => 0,
@@ -180,14 +195,14 @@ class MasterVoucherDiskonController extends Controller
                 'created_at' => now(),
             ]);
 
-            $this->syncItems($voucher->id, $request->items ?? [], $actor);
+            $this->syncItems($voucher->id, $items, $actor);
 
             DB::commit();
 
             return response()->json([
                 'status' => true,
                 'message' => 'Data voucher diskon berhasil disimpan',
-                'data' => $voucher->fresh()->load(['toko', 'items']),
+                'data' => $voucher->fresh()->load($this->voucherRelations()),
             ], 201);
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -204,7 +219,7 @@ class MasterVoucherDiskonController extends Controller
     {
         $data = MasterVoucherDiskon::query()
             ->active()
-            ->with(['toko', 'items'])
+            ->with($this->voucherRelations())
             ->find($id);
 
         if (!$data) {
@@ -223,6 +238,8 @@ class MasterVoucherDiskonController extends Controller
 
     public function update(Request $request, $id)
     {
+        $this->normalizeRequestField($request);
+
         $voucher = MasterVoucherDiskon::active()->find($id);
 
         if (!$voucher) {
@@ -240,6 +257,7 @@ class MasterVoucherDiskonController extends Controller
 
             'mode_voucher' => [
                 'required',
+                'string',
                 Rule::in(['direct', 'generate']),
             ],
 
@@ -252,7 +270,8 @@ class MasterVoucherDiskonController extends Controller
 
             'tipe_diskon' => [
                 'required',
-                Rule::in(['percent', 'nominal']),
+                'string',
+                Rule::in(['percent', 'nominal', 'persen', 'rupiah']),
             ],
 
             'total_diskon' => 'required|numeric|min:0',
@@ -270,13 +289,15 @@ class MasterVoucherDiskonController extends Controller
             'items' => 'nullable|array',
             'items.*.item_type' => [
                 'required_with:items',
+                'string',
                 Rule::in(['treatment', 'produk']),
             ],
             'items.*.item_id' => 'required_with:items|integer',
             'items.*.harga_snapshot' => 'nullable|numeric|min:0',
             'items.*.tipe_diskon_item' => [
                 'nullable',
-                Rule::in(['percent', 'nominal']),
+                'string',
+                Rule::in(['percent', 'nominal', 'persen', 'rupiah']),
             ],
             'items.*.nilai_diskon_item' => 'nullable|numeric|min:0',
         ]);
@@ -298,6 +319,16 @@ class MasterVoucherDiskonController extends Controller
             ], 422);
         }
 
+        $items = $this->normalizeItemsPayload($request);
+        $itemsError = $this->validateVoucherItems($items);
+
+        if ($itemsError) {
+            return response()->json([
+                'status' => false,
+                'message' => $itemsError,
+            ], 422);
+        }
+
         DB::beginTransaction();
 
         try {
@@ -311,7 +342,7 @@ class MasterVoucherDiskonController extends Controller
 
                 'mode_voucher' => $request->mode_voucher,
 
-                'toko_id' => $request->is_all_toko ? null : $request->toko_id,
+                'toko_id' => (int) ($request->is_all_toko ?? 0) === 1 ? null : $request->toko_id,
                 'is_all_toko' => $request->is_all_toko ?? 0,
 
                 'kategori_voucher_id' => $request->kategori_voucher_id,
@@ -321,15 +352,13 @@ class MasterVoucherDiskonController extends Controller
                 'tipe_diskon' => $request->tipe_diskon,
                 'total_diskon' => $request->total_diskon,
 
-                'qty_generate' => $request->mode_voucher === 'generate'
-                    ? ($request->qty_generate ?? 1)
-                    : 1,
+                'qty_generate' => $request->qty_generate ?? 1,
 
                 'is_bisa_digabung_promo' => $request->is_bisa_digabung_promo ?? 0,
                 'is_unlimited_date' => $request->is_unlimited_date ?? 0,
 
-                'tanggal_mulai' => $request->is_unlimited_date ? null : $request->tanggal_mulai,
-                'tanggal_akhir' => $request->is_unlimited_date ? null : $request->tanggal_akhir,
+                'tanggal_mulai' => (int) ($request->is_unlimited_date ?? 0) === 1 ? null : $request->tanggal_mulai,
+                'tanggal_akhir' => (int) ($request->is_unlimited_date ?? 0) === 1 ? null : $request->tanggal_akhir,
 
                 'status_voucher' => $request->status_voucher ?? 0,
                 'sort_order' => $request->sort_order ?? 0,
@@ -338,16 +367,14 @@ class MasterVoucherDiskonController extends Controller
                 'updated_at' => now(),
             ]);
 
-            if ($request->has('items')) {
-                $this->syncItems($voucher->id, $request->items ?? [], $actor);
-            }
+            $this->syncItems($voucher->id, $items, $actor);
 
             DB::commit();
 
             return response()->json([
                 'status' => true,
                 'message' => 'Data voucher diskon berhasil diperbarui',
-                'data' => $voucher->fresh()->load(['toko', 'items']),
+                'data' => $voucher->fresh()->load($this->voucherRelations()),
             ]);
         } catch (\Throwable $e) {
             DB::rollBack();
@@ -405,55 +432,123 @@ class MasterVoucherDiskonController extends Controller
         }
     }
 
+    private function voucherRelations(): array
+    {
+        return [
+            'toko',
+            'items' => function ($q) {
+                $q->active()
+                    ->orderBy('item_type')
+                    ->orderBy('id');
+            },
+        ];
+    }
+
+    private function normalizeRequestField(Request $request): void
+    {
+        if (!$request->has('items') && $request->has('item')) {
+            $request->merge([
+                'items' => $request->item,
+            ]);
+        }
+
+        if (!$request->has('nama_voucher') && $request->has('nama')) {
+            $request->merge([
+                'nama_voucher' => $request->nama,
+            ]);
+        }
+
+        if (!$request->has('total_diskon') && $request->has('nilai_diskon')) {
+            $request->merge([
+                'total_diskon' => $request->nilai_diskon,
+            ]);
+        }
+
+        if (!$request->has('tipe_diskon') && $request->has('diskon_type')) {
+            $request->merge([
+                'tipe_diskon' => $request->diskon_type,
+            ]);
+        }
+    }
+
     private function validateBusinessRule(Request $request): ?string
     {
-        if ((int) ($request->is_all_toko ?? 0) === 0 && !$request->toko_id) {
-            return 'Toko wajib dipilih jika voucher tidak berlaku untuk semua toko';
+        $isAllToko = (int) ($request->is_all_toko ?? 0);
+        $isUnlimitedDate = (int) ($request->is_unlimited_date ?? 0);
+
+        if ($isAllToko !== 1 && !$request->toko_id) {
+            return 'Toko wajib dipilih jika voucher tidak berlaku untuk semua cabang';
         }
 
-        if ($request->mode_voucher === 'generate') {
-            if (!$request->qty_generate || (int) $request->qty_generate < 1) {
-                return 'Qty generate wajib diisi minimal 1 untuk mode generate';
+        if ($isUnlimitedDate !== 1) {
+            if (!$request->tanggal_mulai) {
+                return 'Tanggal mulai wajib diisi jika voucher memakai periode tanggal';
+            }
+
+            if (!$request->tanggal_akhir) {
+                return 'Tanggal akhir wajib diisi jika voucher memakai periode tanggal';
             }
         }
 
-        if ($request->tipe_diskon === 'percent') {
-            $totalDiskon = (float) $request->total_diskon;
-
-            if ($totalDiskon < 0 || $totalDiskon > 100) {
-                return 'Total diskon persen harus antara 0 sampai 100';
+        if ($request->tipe_diskon === 'percent' || $request->tipe_diskon === 'persen') {
+            if ((float) $request->total_diskon > 100) {
+                return 'Total diskon persen tidak boleh lebih dari 100';
             }
         }
 
-        if ((int) ($request->is_unlimited_date ?? 0) === 0) {
-            if (!$request->tanggal_mulai || !$request->tanggal_akhir) {
-                return 'Tanggal mulai dan tanggal akhir wajib diisi jika voucher tidak unlimited date';
-            }
+        if ($request->mode_voucher === 'direct' && (int) ($request->qty_generate ?? 1) !== 1) {
+            return 'Mode direct hanya boleh memiliki qty_generate 1';
         }
 
-        $items = $request->items ?? [];
+        return null;
+    }
 
-        if (is_array($items) && count($items)) {
-            $keys = collect($items)
-                ->map(fn ($item) => ($item['item_type'] ?? '') . '-' . ($item['item_id'] ?? ''))
-                ->filter()
-                ->values();
+    private function normalizeItemsPayload(Request $request): array
+    {
+        $rows = $request->input('items', []);
 
-            if ($keys->unique()->count() !== $keys->count()) {
-                return 'Item voucher tidak boleh duplikat';
-            }
+        if (!is_array($rows)) {
+            return [];
+        }
 
-            foreach ($items as $item) {
-                $tipeDiskonItem = $item['tipe_diskon_item'] ?? null;
-                $nilaiDiskonItem = $item['nilai_diskon_item'] ?? null;
+        return collect($rows)
+            ->map(function ($item) {
+                return [
+                    'item_type' => $item['item_type'] ?? null,
+                    'item_id' => $item['item_id'] ?? null,
+                    'harga_snapshot' => $item['harga_snapshot'] ?? null,
+                    'tipe_diskon_item' => $item['tipe_diskon_item'] ?? null,
+                    'nilai_diskon_item' => $item['nilai_diskon_item'] ?? null,
+                ];
+            })
+            ->filter(function ($item) {
+                return !empty($item['item_type']) && !empty($item['item_id']);
+            })
+            ->values()
+            ->toArray();
+    }
 
-                if ($tipeDiskonItem === 'percent') {
-                    $nilai = (float) ($nilaiDiskonItem ?? 0);
+    private function validateVoucherItems(array $items): ?string
+    {
+        if (!count($items)) {
+            return null;
+        }
 
-                    if ($nilai < 0 || $nilai > 100) {
-                        return 'Nilai diskon item persen harus antara 0 sampai 100';
-                    }
-                }
+        $keys = collect($items)->map(function ($item) {
+            return $item['item_type'] . '-' . $item['item_id'];
+        });
+
+        if ($keys->unique()->count() !== $keys->count()) {
+            return 'Item voucher tidak boleh duplikat';
+        }
+
+        foreach ($items as $item) {
+            if (
+                in_array($item['tipe_diskon_item'], ['percent', 'persen'], true) &&
+                $item['nilai_diskon_item'] !== null &&
+                (float) $item['nilai_diskon_item'] > 100
+            ) {
+                return 'Nilai diskon item persen tidak boleh lebih dari 100';
             }
         }
 
@@ -473,9 +568,11 @@ class MasterVoucherDiskonController extends Controller
                 'voucher_diskon_id' => $voucherId,
                 'item_type' => $item['item_type'],
                 'item_id' => $item['item_id'],
-                'harga_snapshot' => $item['harga_snapshot'] ?? null,
-                'tipe_diskon_item' => $item['tipe_diskon_item'] ?? null,
-                'nilai_diskon_item' => $item['nilai_diskon_item'] ?? null,
+
+                'harga_snapshot' => $item['harga_snapshot'],
+                'tipe_diskon_item' => $item['tipe_diskon_item'],
+                'nilai_diskon_item' => $item['nilai_diskon_item'],
+
                 'is_delete' => 0,
                 'created_by' => $actor,
                 'created_at' => now(),

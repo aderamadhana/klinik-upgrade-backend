@@ -7,12 +7,12 @@ class MasterTreatment extends BaseMasterModel
     protected $table = 'master_treatment';
     protected $primaryKey = 'id';
 
-    public function tipeTreatment()
+    public function tipe()
     {
         return $this->belongsTo(MasterTipeTreatment::class, 'tipe_treatment_id', 'id');
     }
 
-    public function unitTreatment()
+    public function unit()
     {
         return $this->belongsTo(MasterUnitTreatment::class, 'unit_treatment_id', 'id');
     }
