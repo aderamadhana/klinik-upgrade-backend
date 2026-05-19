@@ -13,6 +13,10 @@ use App\Http\Controllers\Api\Master\MasterProdukController;
 use App\Http\Controllers\Api\Master\MasterTreatmentController;
 use App\Http\Controllers\Api\Master\MasterVoucherDiskonController;
 
+use App\Http\Controllers\Api\Administrasi\PasienController;
+
+use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
+
 
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/auth/refresh', [AuthController::class, 'refresh']);
@@ -36,6 +40,19 @@ Route::middleware('auth:api')->group(function () {
         Route::post('user/{id}/reset-password', [MasterUserController::class, 'resetPassword']);
     });
     
+    Route::prefix('administrasi')->group(function () {
+        Route::apiResource('pasien', PasienController::class);
+    });
+
+    Route::prefix('registrasi-layanan')->group(function () {
+        Route::get('/', [RegistrasiLayananController::class, 'index']);
+        Route::post('/', [RegistrasiLayananController::class, 'store']);
+        Route::get('/{id}', [RegistrasiLayananController::class, 'show']);
+        Route::post('/{id}/cancel', [RegistrasiLayananController::class, 'cancel']);
+
+        Route::post('/task/{taskId}/start', [RegistrasiLayananController::class, 'startTask']);
+        Route::post('/task/{taskId}/finish', [RegistrasiLayananController::class, 'finishTask']);
+    });
 });
 
 Route::prefix('reference')->group(function () {
@@ -54,4 +71,11 @@ Route::prefix('reference')->group(function () {
     Route::get('voucher-diskon-jenis', [ReferenceController::class, 'voucherDiskonJenis']);
     Route::get('voucher-diskon-kategori', [ReferenceController::class, 'voucherDiskonKategori']);
     Route::get('voucher-diskon-template', [ReferenceController::class, 'voucherDiskonTemplate']);
+    Route::get('provinces', [ReferenceController::class, 'provinces']);
+    Route::get('regencies/{provinceCode}', [ReferenceController::class, 'regencies'])->where('provinceCode', '[0-9]+');
+    Route::get('districts/{regencyCode}', [ReferenceController::class, 'districts'])->where('regencyCode', '[0-9.]+');
+    Route::get('villages/{districtCode}', [ReferenceController::class, 'villages'])->where('districtCode', '[0-9.]+');
+    Route::get('agama', [ReferenceController::class, 'agama']);
+    Route::get('pekerjaan', [ReferenceController::class, 'pekerjaan']);
+    Route::get('pasien', [ReferenceController::class, 'pasien']);
 });

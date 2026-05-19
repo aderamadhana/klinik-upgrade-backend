@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Http\Request;
 use App\Models\Master\MasterRole;
 use App\Models\Master\MasterJabatan;
@@ -19,6 +20,10 @@ use App\Models\Master\MasterTreatment;
 use App\Models\master\MasterVoucherDiskonJenis;
 use App\Models\master\MasterVoucherDiskonKategori;
 use App\Models\master\MasterVoucherDiskonTemplate;
+use App\Models\Master\MasterAgama;
+use App\Models\Master\MasterPekerjaan;
+use App\Models\Pasien;
+
 
 
 class ReferenceController extends Controller
@@ -515,5 +520,195 @@ class ReferenceController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    public function agama()
+    {
+        $data = MasterAgama::query()
+            ->where(function ($q) {
+                $q->where('is_delete', 0)
+                  ->orWhereNull('is_delete');
+            })
+            ->where('is_active', 1)
+            ->orderBy('urutan', 'asc')
+            ->orderBy('nama_agama', 'asc')
+            ->get([
+                'id',
+                'kode_agama',
+                'nama_agama',
+            ])
+            ->map(function ($item) {
+                return [
+                    'id'          => $item->id,
+                    'kode_agama'  => $item->kode_agama,
+                    'nama_agama'  => $item->nama_agama,
+                    'label'       => $item->nama_agama,
+                    'value'       => $item->id,
+                    'value_text'  => $item->nama_agama,
+                ];
+            });
+
+        return response()->json([
+            'status'  => true,
+            'message' => 'Data agama berhasil diambil',
+            'data'    => $data,
+        ]);
+    }
+
+    public function pekerjaan()
+    {
+        $data = MasterPekerjaan::query()
+            ->where(function ($q) {
+                $q->where('is_delete', 0)
+                  ->orWhereNull('is_delete');
+            })
+            ->where('is_active', 1)
+            ->orderBy('urutan', 'asc')
+            ->orderBy('nama_pekerjaan', 'asc')
+            ->get([
+                'id',
+                'nama_pekerjaan',
+            ])
+            ->map(function ($item) {
+                return [
+                    'id'              => $item->id,
+                    'nama_pekerjaan'  => $item->nama_pekerjaan,
+                    'label'           => $item->nama_pekerjaan,
+                    'value'           => $item->id,
+                    'value_text'      => $item->nama_pekerjaan,
+                ];
+            });
+
+        return response()->json([
+            'status'  => true,
+            'message' => 'Data pekerjaan berhasil diambil',
+            'data'    => $data,
+        ]);
+    }
+
+     public function provinces()
+    {
+        return $this->getWilayahId('provinces.json');
+    }
+
+    public function regencies($provinceCode)
+    {
+        return $this->getWilayahId("regencies/{$provinceCode}.json");
+    }
+
+    public function districts($regencyCode)
+    {
+        return $this->getWilayahId("districts/{$regencyCode}.json");
+    }
+
+    public function villages($districtCode)
+    {
+        return $this->getWilayahId("villages/{$districtCode}.json");
+    }
+
+    private function getWilayahId($endpoint)
+    {
+        try {
+            $url = "https://wilayah.id/api/{$endpoint}";
+
+            $response = Http::timeout(20)
+                ->withoutVerifying()
+                ->acceptJson()
+                ->get($url);
+
+            if (! $response->successful()) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Gagal mengambil data dari wilayah.id',
+                    'url' => $url,
+                    'http_status' => $response->status(),
+                    'data' => [],
+                    'error' => $response->body(),
+                ], 502);
+            }
+
+            $json = $response->json();
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Data wilayah berhasil diambil',
+                'data' => $json['data'] ?? $json ?? [],
+                'meta' => $json['meta'] ?? null,
+            ]);
+        } catch (\Throwable $e) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Terjadi kesalahan saat mengambil data wilayah',
+                'data' => [],
+                'error' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ], 500);
+        }
+    }
+
+    public function pasien(Request $request)
+    {
+        $search = trim((string) $request->get('search', ''));
+        $limit = (int) $request->get('limit', 20);
+
+        if ($limit <= 0) {
+            $limit = 20;
+        }
+
+        if ($limit > 50) {
+            $limit = 50;
+        }
+
+        $query = Pasien::query()
+            ->active()
+            ->select([
+                'id',
+                'no_rm',
+                'nama',
+                'no_identitas',
+                'no_hp',
+                'no_wa',
+                'toko_id',
+            ]);
+
+        if ($search !== '') {
+            $query->where(function ($q) use ($search) {
+                $q->where('no_rm', 'like', "%{$search}%")
+                    ->orWhere('nama', 'like', "%{$search}%")
+                    ->orWhere('no_identitas', 'like', "%{$search}%")
+                    ->orWhere('no_hp', 'like', "%{$search}%")
+                    ->orWhere('no_wa', 'like', "%{$search}%");
+            });
+        }
+
+        $data = $query
+            ->orderByDesc('id')
+            ->limit($limit)
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'id' => $item->id,
+                    'no_rm' => $item->no_rm,
+                    'nama' => $item->nama,
+                    'no_identitas' => $item->no_identitas,
+                    'no_hp' => $item->no_hp,
+                    'no_wa' => $item->no_wa,
+                    'toko_id' => $item->toko_id,
+
+                    'label' => trim(
+                        ($item->no_rm ? $item->no_rm . ' - ' : '') .
+                        $item->nama .
+                        ($item->no_hp ? ' - ' . $item->no_hp : '')
+                    ),
+                    'value' => $item->id,
+                ];
+            });
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data pasien berhasil diambil',
+            'data' => $data,
+        ]);
     }
 }
