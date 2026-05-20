@@ -1,8 +1,10 @@
 <?php
 
 use Illuminate\Support\Facades\Route;
+
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ReferenceController;
+
 use App\Http\Controllers\Api\Master\MasterKaryawanController;
 use App\Http\Controllers\Api\Master\MasterUserController;
 use App\Http\Controllers\Api\Master\MasterSupplierController;
@@ -16,6 +18,12 @@ use App\Http\Controllers\Api\Master\MasterVoucherDiskonController;
 use App\Http\Controllers\Api\Administrasi\PasienController;
 
 use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
+
+use App\Http\Controllers\Api\PelayananMedis\AntrianDokterController;
+use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatController;
+use App\Http\Controllers\Api\PelayananMedis\RiwayatPelayananController;
+
+use App\Http\Controllers\Api\Kasir\PembayaranController;
 
 
 Route::post('/login', [AuthController::class, 'login']);
@@ -47,11 +55,58 @@ Route::middleware('auth:api')->group(function () {
     Route::prefix('registrasi-layanan')->group(function () {
         Route::get('/', [RegistrasiLayananController::class, 'index']);
         Route::post('/', [RegistrasiLayananController::class, 'store']);
-        Route::get('/{id}', [RegistrasiLayananController::class, 'show']);
-        Route::post('/{id}/cancel', [RegistrasiLayananController::class, 'cancel']);
+        Route::get('/antrian-dokter', [RegistrasiLayananController::class, 'antrianDokter']);
+        Route::delete('/antrian-dokter/{id}', [RegistrasiLayananController::class, 'destroyAntrianDokter'])
+            ->whereNumber('id');
+        Route::post('/task/{taskId}/start', [RegistrasiLayananController::class, 'startTask'])
+            ->whereNumber('taskId');
+        Route::post('/task/{taskId}/finish', [RegistrasiLayananController::class, 'finishTask'])
+            ->whereNumber('taskId');
+        Route::post('/{id}/start-current-task', [RegistrasiLayananController::class, 'startCurrentTask'])
+            ->whereNumber('id');
 
-        Route::post('/task/{taskId}/start', [RegistrasiLayananController::class, 'startTask']);
-        Route::post('/task/{taskId}/finish', [RegistrasiLayananController::class, 'finishTask']);
+        Route::post('/{id}/finish-current-task', [RegistrasiLayananController::class, 'finishCurrentTask'])
+            ->whereNumber('id');
+        Route::get('/{id}', [RegistrasiLayananController::class, 'show'])
+            ->whereNumber('id');
+
+        Route::post('/{id}/cancel', [RegistrasiLayananController::class, 'cancel'])
+            ->whereNumber('id');
+    });
+
+    Route::prefix('pelayanan-medis')->group(function () {
+        Route::prefix('antrian-dokter')->group(function () {
+            Route::get('/', [AntrianDokterController::class, 'index']);
+            Route::get('/{id}', [AntrianDokterController::class, 'show'])->whereNumber('id');
+            Route::post('/{id}/start', [AntrianDokterController::class, 'start'])->whereNumber('id');
+            Route::post('/{id}/finish', [AntrianDokterController::class, 'finish'])->whereNumber('id');
+            Route::delete('/{id}', [AntrianDokterController::class, 'destroy'])->whereNumber('id');
+        });
+        Route::prefix('antrian-perawat')->group(function () {
+            Route::get('/', [AntrianPerawatController::class, 'index']);
+            Route::get('/{id}', [AntrianPerawatController::class, 'show'])->whereNumber('id');
+            Route::post('/{id}/start', [AntrianPerawatController::class, 'start'])->whereNumber('id');
+            Route::post('/{id}/finish', [AntrianPerawatController::class, 'finish'])->whereNumber('id');
+            Route::delete('/{id}', [AntrianPerawatController::class, 'destroy'])->whereNumber('id');
+        });
+        Route::prefix('riwayat-pelayanan')->group(function () {
+            Route::get('/', [RiwayatPelayananController::class, 'index']);
+            Route::get('/{id}', [RiwayatPelayananController::class, 'show'])
+                ->whereNumber('id');
+        });
+    });
+
+    Route::prefix('kasir')->group(function () {
+        Route::prefix('pembayaran')->group(function () {
+            Route::get('/', [PembayaranController::class, 'index']);
+            Route::get('/{id}', [PembayaranController::class, 'show'])->whereNumber('id');
+            Route::post('/generate/{registrasiId}', [PembayaranController::class, 'generate'])
+                ->whereNumber('registrasiId');
+            Route::post('/{id}/start', [PembayaranController::class, 'start'])->whereNumber('id');
+            Route::post('/{id}/finish', [PembayaranController::class, 'finish'])->whereNumber('id');
+            Route::post('/{id}/recalculate', [PembayaranController::class, 'recalculate'])->whereNumber('id');
+            Route::post('/{id}/cancel', [PembayaranController::class, 'cancel'])->whereNumber('id');
+        });
     });
 });
 

@@ -3,17 +3,15 @@
 namespace App\Http\Controllers\Api\Registrasi;
 
 use App\Http\Controllers\Controller;
-use App\Models\Registrasi\RegistrasiDokterResepDetail;
-use App\Models\Registrasi\RegistrasiDokterSoap;
+use App\Models\Master\MasterProdukToko;
+use App\Models\Master\MasterTreatmentToko;
+use App\Models\Pasien;
 use App\Models\Registrasi\RegistrasiKonsultasiFoto;
 use App\Models\Registrasi\RegistrasiKonsultasiIntake;
 use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiPenjualanDetail;
 use App\Models\Registrasi\RegistrasiTask;
 use App\Models\Registrasi\RegistrasiTreatmentDetail;
-use App\Models\Pasien;
-use App\Models\Master\MasterProdukToko;
-use App\Models\Master\MasterTreatmentToko;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -59,6 +57,9 @@ class RegistrasiLayananController extends Controller
                         $p->where('nama', 'like', "%{$search}%")
                             ->orWhere('no_rm', 'like', "%{$search}%")
                             ->orWhere('no_hp', 'like', "%{$search}%");
+                    })
+                    ->orWhereHas('dokterAwal', function ($d) use ($search) {
+                        $d->where('nama', 'like', "%{$search}%");
                     });
             });
         }
@@ -170,6 +171,13 @@ class RegistrasiLayananController extends Controller
             ], 422);
         }
 
+        if (($adaKonsultasi || $adaTreatment) && !$request->filled('dokter_id')) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Dokter wajib dipilih untuk layanan konsultasi atau treatment',
+            ], 422);
+        }
+
         $pasienId = $this->resolvePasienId($request);
 
         if (!$pasienId) {
@@ -215,8 +223,7 @@ class RegistrasiLayananController extends Controller
             $currentTask = $this->determineCurrentTask(
                 $adaKonsultasi,
                 $adaTreatment,
-                $adaPenjualan,
-                $needNurseStation
+                $adaPenjualan
             );
 
             $registrasi = RegistrasiKunjungan::create([
@@ -237,6 +244,7 @@ class RegistrasiLayananController extends Controller
                 'is_treatment' => $adaTreatment ? 1 : 0,
                 'is_penjualan' => $adaPenjualan ? 1 : 0,
                 'perlu_tindakan_perawat' => $needNurseStation ? 2 : ($adaTreatment ? 1 : 0),
+
                 'current_task' => $currentTask,
                 'status' => RegistrasiKunjungan::STATUS_AKTIF,
 
@@ -268,7 +276,7 @@ class RegistrasiLayananController extends Controller
                 );
             }
 
-            if ($konsultasi && $layanan['channel_konsultasi'] === 'online') {
+            if ($konsultasi && ($layanan['channel_konsultasi'] ?? null) === 'online') {
                 $this->storeKonsultasiFotos($request, $registrasi, $konsultasi);
             }
 
@@ -308,9 +316,98 @@ class RegistrasiLayananController extends Controller
         }
     }
 
+    public function antrianDokter(Request $request)
+    {
+        $query = RegistrasiKunjungan::query()
+            ->with([
+                'toko:id,nama_toko',
+                'pasien:id,no_rm,nama,no_hp',
+                'dokterAwal:id,nama',
+                'perawatAwal:id,nama',
+                'tasks' => function ($q) {
+                    $q->orderBy('task_order');
+                },
+                'tasks.assignedKaryawan:id,nama',
+            ])
+            ->active()
+            ->where('status', RegistrasiKunjungan::STATUS_AKTIF)
+            ->where('current_task', RegistrasiKunjungan::TASK_KONSULTASI)
+            ->where(function ($q) {
+                $q->whereIn('channel_konsultasi', [
+                    RegistrasiKunjungan::CHANNEL_OFFLINE,
+                    RegistrasiKunjungan::CHANNEL_ONLINE,
+                ])
+                    ->orWhere('is_treatment', 1);
+            });
+
+        if ($request->filled('toko_id')) {
+            $query->where('toko_id', $request->toko_id);
+        }
+
+        if ($request->filled('tanggal')) {
+            $query->whereDate('tanggal_kunjungan', $request->tanggal);
+        }
+
+        if ($request->filled('status')) {
+            $taskStatus = $this->mapQueueStatusToTaskStatus($request->status);
+
+            if ($taskStatus !== null) {
+                $query->whereHas('tasks', function ($q) use ($taskStatus) {
+                    $q->where('task_type', RegistrasiTask::TYPE_KONSULTASI)
+                        ->where('status', $taskStatus);
+                });
+            }
+        }
+
+        if ($request->filled('channel')) {
+            if ($request->channel === 'offline') {
+                $query->where('channel_konsultasi', RegistrasiKunjungan::CHANNEL_OFFLINE);
+            }
+
+            if ($request->channel === 'online') {
+                $query->where('channel_konsultasi', RegistrasiKunjungan::CHANNEL_ONLINE);
+            }
+
+            if ($request->channel === 'tanpa_konsultasi') {
+                $query->where('channel_konsultasi', RegistrasiKunjungan::CHANNEL_TIDAK_KONSULTASI);
+            }
+        }
+
+        if ($request->filled('search')) {
+            $search = trim($request->search);
+
+            $query->where(function ($q) use ($search) {
+                $q->where('kode_registrasi', 'like', "%{$search}%")
+                    ->orWhereHas('pasien', function ($p) use ($search) {
+                        $p->where('nama', 'like', "%{$search}%")
+                            ->orWhere('no_rm', 'like', "%{$search}%")
+                            ->orWhere('no_hp', 'like', "%{$search}%");
+                    })
+                    ->orWhereHas('dokterAwal', function ($d) use ($search) {
+                        $d->where('nama', 'like', "%{$search}%");
+                    });
+            });
+        }
+
+        $rows = $query
+            ->orderBy('registered_at')
+            ->orderBy('id')
+            ->paginate($request->get('per_page', 15));
+
+        $rows->getCollection()->transform(function ($row) {
+            return $this->decorateAntrianDokterRow($row);
+        });
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data antrian dokter berhasil diambil',
+            'data' => $rows,
+        ]);
+    }
+
     public function startTask($taskId)
     {
-        $task = RegistrasiTask::findOrFail($taskId);
+        $task = RegistrasiTask::with('registrasi')->findOrFail($taskId);
 
         if ((int) $task->status !== RegistrasiTask::STATUS_MENUNGGU) {
             return response()->json([
@@ -353,6 +450,36 @@ class RegistrasiLayananController extends Controller
         }
     }
 
+    public function startCurrentTask($id)
+    {
+        $registrasi = RegistrasiKunjungan::query()
+            ->with('tasks')
+            ->active()
+            ->findOrFail($id);
+
+        if ((int) $registrasi->status !== RegistrasiKunjungan::STATUS_AKTIF) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Registrasi tidak aktif',
+            ], 422);
+        }
+
+        $task = $registrasi->tasks()
+            ->where('task_type', $registrasi->current_task)
+            ->where('status', RegistrasiTask::STATUS_MENUNGGU)
+            ->orderBy('task_order')
+            ->first();
+
+        if (!$task) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Task aktif tidak ditemukan atau sudah diproses',
+            ], 422);
+        }
+
+        return $this->startTask($task->id);
+    }
+
     public function finishTask($taskId)
     {
         $task = RegistrasiTask::with('registrasi.tasks')->findOrFail($taskId);
@@ -392,7 +519,7 @@ class RegistrasiLayananController extends Controller
                 ]);
             } else {
                 $registrasi->update([
-                    'current_task' => 0,
+                    'current_task' => RegistrasiKunjungan::TASK_DRAFT,
                     'status' => RegistrasiKunjungan::STATUS_SELESAI,
                     'updated_by' => $this->username(),
                     'updated_at' => now(),
@@ -417,16 +544,52 @@ class RegistrasiLayananController extends Controller
         }
     }
 
+    public function finishCurrentTask($id)
+    {
+        $registrasi = RegistrasiKunjungan::query()
+            ->with('tasks')
+            ->active()
+            ->findOrFail($id);
+
+        $task = $registrasi->tasks()
+            ->where('task_type', $registrasi->current_task)
+            ->whereIn('status', [
+                RegistrasiTask::STATUS_MENUNGGU,
+                RegistrasiTask::STATUS_PROSES,
+            ])
+            ->orderBy('task_order')
+            ->first();
+
+        if (!$task) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Task aktif tidak ditemukan',
+            ], 422);
+        }
+
+        return $this->finishTask($task->id);
+    }
+
     public function cancel($id)
     {
-        $registrasi = RegistrasiKunjungan::active()->findOrFail($id);
+        $registrasi = RegistrasiKunjungan::query()
+            ->with('tasks')
+            ->active()
+            ->findOrFail($id);
+
+        if ($this->hasStartedTask($registrasi)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Registrasi tidak bisa dibatalkan karena pasien sudah mulai dilayani',
+            ], 422);
+        }
 
         DB::beginTransaction();
 
         try {
             $registrasi->update([
                 'status' => RegistrasiKunjungan::STATUS_BATAL,
-                'current_task' => 0,
+                'current_task' => RegistrasiKunjungan::TASK_DRAFT,
                 'updated_by' => $this->username(),
                 'updated_at' => now(),
             ]);
@@ -452,6 +615,74 @@ class RegistrasiLayananController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    public function destroyAntrianDokter($id)
+    {
+        $registrasi = RegistrasiKunjungan::query()
+            ->with('tasks')
+            ->active()
+            ->findOrFail($id);
+
+        if ((int) $registrasi->current_task !== RegistrasiKunjungan::TASK_KONSULTASI) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Antrian tidak bisa dihapus karena sudah berpindah proses',
+            ], 422);
+        }
+
+        $doctorTask = $this->getDoctorTask($registrasi);
+
+        if (!$doctorTask) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Task dokter tidak ditemukan',
+            ], 422);
+        }
+
+        if ((int) $doctorTask->status !== RegistrasiTask::STATUS_MENUNGGU) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Antrian tidak bisa dihapus karena pasien sudah mulai dilayani',
+            ], 422);
+        }
+
+        DB::beginTransaction();
+
+        try {
+            $registrasi->update([
+                'status' => RegistrasiKunjungan::STATUS_BATAL,
+                'current_task' => RegistrasiKunjungan::TASK_DRAFT,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+
+            $registrasi->tasks()->update([
+                'status' => RegistrasiTask::STATUS_BATAL,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Antrian dokter berhasil dihapus',
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Gagal menghapus antrian dokter',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function deleteAntrianDokter($id)
+    {
+        return $this->destroyAntrianDokter($id);
     }
 
     private function resolvePasienId(Request $request)
@@ -508,8 +739,8 @@ class RegistrasiLayananController extends Controller
         $tasks = [];
         $order = 1;
 
-        if ($adaKonsultasi) {
-            $tasks['konsultasi'] = RegistrasiTask::create([
+        if ($adaKonsultasi || $adaTreatment) {
+            $tasks['dokter'] = RegistrasiTask::create([
                 'registrasi_id' => $registrasi->id,
                 'task_type' => RegistrasiTask::TYPE_KONSULTASI,
                 'assigned_karyawan_id' => $request->input('dokter_id'),
@@ -520,19 +751,11 @@ class RegistrasiLayananController extends Controller
             ]);
         }
 
-        if ($adaTreatment) {
-            $taskType = $needNurseStation
-                ? RegistrasiTask::TYPE_TINDAKAN_PERAWAT
-                : RegistrasiTask::TYPE_TREATMENT;
-
-            $assignedKaryawanId = $needNurseStation
-                ? $request->input('perawat_id')
-                : $request->input('dokter_id');
-
-            $tasks['treatment'] = RegistrasiTask::create([
+        if ($adaTreatment || $adaPenjualan) {
+            $tasks['pembayaran'] = RegistrasiTask::create([
                 'registrasi_id' => $registrasi->id,
-                'task_type' => $taskType,
-                'assigned_karyawan_id' => $assignedKaryawanId,
+                'task_type' => RegistrasiTask::TYPE_PEMBAYARAN,
+                'assigned_karyawan_id' => null,
                 'task_order' => $order++,
                 'status' => RegistrasiTask::STATUS_MENUNGGU,
                 'created_by' => $this->username(),
@@ -540,11 +763,11 @@ class RegistrasiLayananController extends Controller
             ]);
         }
 
-        if ($adaPenjualan) {
-            $tasks['penjualan'] = RegistrasiTask::create([
+        if ($adaTreatment) {
+            $tasks['perawat'] = RegistrasiTask::create([
                 'registrasi_id' => $registrasi->id,
-                'task_type' => RegistrasiTask::TYPE_PEMBAYARAN,
-                'assigned_karyawan_id' => null,
+                'task_type' => RegistrasiTask::TYPE_TINDAKAN_PERAWAT,
+                'assigned_karyawan_id' => $request->input('perawat_id'),
                 'task_order' => $order++,
                 'status' => RegistrasiTask::STATUS_MENUNGGU,
                 'created_by' => $this->username(),
@@ -670,7 +893,7 @@ class RegistrasiLayananController extends Controller
         array $items,
         array $tasks
     ) {
-        $task = $tasks['treatment'] ?? null;
+        $task = $tasks['dokter'] ?? $tasks['perawat'] ?? null;
 
         foreach ($items as $item) {
             $ids = $this->resolveTreatmentIds($item, $registrasi->toko_id);
@@ -678,7 +901,7 @@ class RegistrasiLayananController extends Controller
             if (empty($ids['treatment_toko_id']) || empty($ids['treatment_id'])) {
                 throw new \Exception(
                     'Mapping treatment toko tidak ditemukan untuk treatment_id: ' .
-                    ($item['treatment_id'] ?? $item['tindakan_id'] ?? '-')
+                    ($item['treatment_id'] ?? $item['tindakan_id'] ?? $item['id'] ?? '-')
                 );
             }
 
@@ -694,7 +917,10 @@ class RegistrasiLayananController extends Controller
 
                 'treatment_toko_id' => $ids['treatment_toko_id'],
                 'treatment_id' => $ids['treatment_id'],
-                'nama_treatment' => $item['nama_treatment'] ?? $item['treatment_nama'] ?? $item['nama_tindakan'] ?? null,
+                'nama_treatment' => $item['nama_treatment']
+                    ?? $item['treatment_nama']
+                    ?? $item['nama_tindakan']
+                    ?? null,
 
                 'harga' => $item['harga'],
                 'jumlah' => $item['jumlah'],
@@ -722,7 +948,7 @@ class RegistrasiLayananController extends Controller
             if (empty($ids['produk_toko_id']) || empty($ids['produk_id'])) {
                 throw new \Exception(
                     'Mapping produk toko tidak ditemukan untuk produk_id: ' .
-                    ($item['produk_id'] ?? $item['obat_id'] ?? '-')
+                    ($item['produk_id'] ?? $item['obat_id'] ?? $item['id'] ?? '-')
                 );
             }
 
@@ -767,10 +993,11 @@ class RegistrasiLayananController extends Controller
                 $item['treatment_id'] ??
                 $item['tindakan_id'] ??
                 $item['master_treatment_id'] ??
-                $item['id'] ??
                 null;
 
-            if (!$treatmentId && !$treatmentTokoId) {
+            $candidateId = $item['id'] ?? null;
+
+            if (!$treatmentId && !$treatmentTokoId && !$candidateId) {
                 continue;
             }
 
@@ -787,6 +1014,7 @@ class RegistrasiLayananController extends Controller
                 ...$item,
                 'treatment_toko_id' => $treatmentTokoId,
                 'treatment_id' => $treatmentId,
+                'candidate_id' => $candidateId,
                 'harga' => $harga,
                 'jumlah' => $jumlah,
                 'total' => $total,
@@ -801,14 +1029,22 @@ class RegistrasiLayananController extends Controller
         $result = [];
 
         foreach ($items as $item) {
-            $produkId = $item['produk_id']
-                ?? $item['obat_id']
-                ?? $item['id']
-                ?? null;
+            $produkTokoId =
+                $item['produk_toko_id'] ??
+                $item['master_produk_toko_id'] ??
+                $item['obat_toko_id'] ??
+                $item['toko_produk_id'] ??
+                null;
 
-            $produkTokoId = $item['produk_toko_id'] ?? null;
+            $produkId =
+                $item['produk_id'] ??
+                $item['obat_id'] ??
+                $item['master_produk_id'] ??
+                null;
 
-            if (!$produkId && !$produkTokoId) {
+            $candidateId = $item['id'] ?? null;
+
+            if (!$produkId && !$produkTokoId && !$candidateId) {
                 continue;
             }
 
@@ -825,6 +1061,7 @@ class RegistrasiLayananController extends Controller
                 ...$item,
                 'produk_id' => $produkId,
                 'produk_toko_id' => $produkTokoId,
+                'candidate_id' => $candidateId,
                 'harga' => $harga,
                 'jumlah' => $jumlah,
                 'subtotal' => $subtotal,
@@ -849,6 +1086,8 @@ class RegistrasiLayananController extends Controller
             $item['master_treatment_id'] ??
             null;
 
+        $candidateId = $item['candidate_id'] ?? $item['id'] ?? null;
+
         $table = (new MasterTreatmentToko())->getTable();
 
         $row = null;
@@ -857,20 +1096,32 @@ class RegistrasiLayananController extends Controller
             $row = MasterTreatmentToko::query()->find($treatmentTokoId);
         }
 
-        if (!$row && $tokoId && $treatmentId) {
+        if (!$row && !$treatmentId && $candidateId) {
+            $row = MasterTreatmentToko::query()->find($candidateId);
+        }
+
+        if (!$row && $tokoId && ($treatmentId || $candidateId)) {
+            $searchId = $treatmentId ?: $candidateId;
+
             $query = MasterTreatmentToko::query();
 
             if (Schema::hasColumn($table, 'toko_id')) {
                 $query->where('toko_id', $tokoId);
             }
 
-            $query->where(function ($q) use ($table, $treatmentId) {
+            if (Schema::hasColumn($table, 'is_delete')) {
+                $query->where(function ($q) {
+                    $q->where('is_delete', 0)->orWhereNull('is_delete');
+                });
+            }
+
+            $query->where(function ($q) use ($table, $searchId) {
                 if (Schema::hasColumn($table, 'treatment_id')) {
-                    $q->orWhere('treatment_id', $treatmentId);
+                    $q->orWhere('treatment_id', $searchId);
                 }
 
                 if (Schema::hasColumn($table, 'master_treatment_id')) {
-                    $q->orWhere('master_treatment_id', $treatmentId);
+                    $q->orWhere('master_treatment_id', $searchId);
                 }
             });
 
@@ -882,7 +1133,8 @@ class RegistrasiLayananController extends Controller
             'treatment_id' =>
                 $row?->treatment_id ??
                 $row?->master_treatment_id ??
-                $treatmentId,
+                $treatmentId ??
+                null,
         ];
     }
 
@@ -901,6 +1153,8 @@ class RegistrasiLayananController extends Controller
             $item['master_produk_id'] ??
             null;
 
+        $candidateId = $item['candidate_id'] ?? $item['id'] ?? null;
+
         $table = (new MasterProdukToko())->getTable();
 
         $row = null;
@@ -909,32 +1163,38 @@ class RegistrasiLayananController extends Controller
             $row = MasterProdukToko::query()->find($produkTokoId);
         }
 
-        if (!$row && $tokoId && $produkId) {
+        if (!$row && !$produkId && $candidateId) {
+            $row = MasterProdukToko::query()->find($candidateId);
+        }
+
+        if (!$row && $tokoId && ($produkId || $candidateId)) {
+            $searchId = $produkId ?: $candidateId;
+
             $query = MasterProdukToko::query();
 
             if (Schema::hasColumn($table, 'toko_id')) {
                 $query->where('toko_id', $tokoId);
             }
 
-            $query->where(function ($q) use ($table, $produkId) {
-                if (Schema::hasColumn($table, 'produk_id')) {
-                    $q->orWhere('produk_id', $produkId);
-                }
-
-                if (Schema::hasColumn($table, 'master_produk_id')) {
-                    $q->orWhere('master_produk_id', $produkId);
-                }
-
-                if (Schema::hasColumn($table, 'obat_id')) {
-                    $q->orWhere('obat_id', $produkId);
-                }
-            });
-
             if (Schema::hasColumn($table, 'is_delete')) {
                 $query->where(function ($q) {
                     $q->where('is_delete', 0)->orWhereNull('is_delete');
                 });
             }
+
+            $query->where(function ($q) use ($table, $searchId) {
+                if (Schema::hasColumn($table, 'produk_id')) {
+                    $q->orWhere('produk_id', $searchId);
+                }
+
+                if (Schema::hasColumn($table, 'master_produk_id')) {
+                    $q->orWhere('master_produk_id', $searchId);
+                }
+
+                if (Schema::hasColumn($table, 'obat_id')) {
+                    $q->orWhere('obat_id', $searchId);
+                }
+            });
 
             $row = $query->first();
         }
@@ -945,24 +1205,18 @@ class RegistrasiLayananController extends Controller
                 $row?->produk_id ??
                 $row?->master_produk_id ??
                 $row?->obat_id ??
-                $produkId,
+                $produkId ??
+                null,
         ];
     }
 
     private function determineCurrentTask(
         bool $adaKonsultasi,
         bool $adaTreatment,
-        bool $adaPenjualan,
-        bool $needNurseStation
+        bool $adaPenjualan
     ) {
-        if ($adaKonsultasi) {
+        if ($adaKonsultasi || $adaTreatment) {
             return RegistrasiKunjungan::TASK_KONSULTASI;
-        }
-
-        if ($adaTreatment) {
-            return $needNurseStation
-                ? RegistrasiKunjungan::TASK_PERAWAT
-                : RegistrasiKunjungan::TASK_TREATMENT;
         }
 
         if ($adaPenjualan) {
@@ -983,6 +1237,85 @@ class RegistrasiLayananController extends Controller
             : RegistrasiKunjungan::CHANNEL_OFFLINE;
     }
 
+    private function decorateAntrianDokterRow(RegistrasiKunjungan $row)
+    {
+        $doctorTask = $this->getDoctorTask($row);
+
+        $row->setAttribute('registrasi_id', $row->id);
+        $row->setAttribute('nomor_antrian', $row->kode_registrasi);
+        $row->setAttribute('nama_pasien', $row->pasien?->nama);
+        $row->setAttribute('no_rm', $row->pasien?->no_rm);
+        $row->setAttribute('no_hp', $row->pasien?->no_hp);
+        $row->setAttribute('nama_dokter', $row->dokterAwal?->nama);
+        $row->setAttribute('nama_perawat', $row->perawatAwal?->nama);
+        $row->setAttribute('waktu_kunjungan', $this->formatTimeValue($row->registered_at));
+        $row->setAttribute('ada_konsultasi', (int) $row->channel_konsultasi > 0);
+        $row->setAttribute('ada_treatment', (int) $row->is_treatment === 1);
+        $row->setAttribute('ada_penjualan', (int) $row->is_penjualan === 1);
+        $row->setAttribute('status_antrian_dokter', $this->mapTaskStatusToQueueStatus($doctorTask?->status));
+        $row->setAttribute('can_delete_antrian', $doctorTask && (int) $doctorTask->status === RegistrasiTask::STATUS_MENUNGGU);
+
+        return $row;
+    }
+
+    private function getDoctorTask(RegistrasiKunjungan $registrasi)
+    {
+        if ($registrasi->relationLoaded('tasks')) {
+            return $registrasi->tasks
+                ->where('task_type', RegistrasiTask::TYPE_KONSULTASI)
+                ->sortBy('task_order')
+                ->first();
+        }
+
+        return $registrasi->tasks()
+            ->where('task_type', RegistrasiTask::TYPE_KONSULTASI)
+            ->orderBy('task_order')
+            ->first();
+    }
+
+    private function hasStartedTask(RegistrasiKunjungan $registrasi)
+    {
+        if ($registrasi->relationLoaded('tasks')) {
+            return $registrasi->tasks->contains(function ($task) {
+                return in_array((int) $task->status, [
+                    RegistrasiTask::STATUS_PROSES,
+                    RegistrasiTask::STATUS_SELESAI,
+                ], true);
+            });
+        }
+
+        return $registrasi->tasks()
+            ->whereIn('status', [
+                RegistrasiTask::STATUS_PROSES,
+                RegistrasiTask::STATUS_SELESAI,
+            ])
+            ->exists();
+    }
+
+    private function mapQueueStatusToTaskStatus($status)
+    {
+        $status = strtolower(trim((string) $status));
+
+        return match ($status) {
+            'menunggu' => RegistrasiTask::STATUS_MENUNGGU,
+            'dipanggil', 'proses', 'diproses' => RegistrasiTask::STATUS_PROSES,
+            'selesai' => RegistrasiTask::STATUS_SELESAI,
+            'batal' => RegistrasiTask::STATUS_BATAL,
+            default => null,
+        };
+    }
+
+    private function mapTaskStatusToQueueStatus($status)
+    {
+        return match ((int) $status) {
+            RegistrasiTask::STATUS_MENUNGGU => 'menunggu',
+            RegistrasiTask::STATUS_PROSES => 'proses',
+            RegistrasiTask::STATUS_SELESAI => 'selesai',
+            RegistrasiTask::STATUS_BATAL => 'batal',
+            default => 'menunggu',
+        };
+    }
+
     private function generateKodeRegistrasi($tokoId, $tanggal)
     {
         $date = Carbon::parse($tanggal)->format('Ymd');
@@ -992,7 +1325,25 @@ class RegistrasiLayananController extends Controller
             ->whereDate('tanggal_kunjungan', $tanggal)
             ->count() + 1;
 
-        return 'REG-' . $date . '-' . str_pad($tokoId, 2, '0', STR_PAD_LEFT) . '-' . str_pad($count, 4, '0', STR_PAD_LEFT);
+        return 'REG-' .
+            $date .
+            '-' .
+            str_pad($tokoId, 2, '0', STR_PAD_LEFT) .
+            '-' .
+            str_pad($count, 4, '0', STR_PAD_LEFT);
+    }
+
+    private function formatTimeValue($value)
+    {
+        if (!$value) {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($value)->format('H:i');
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 
     private function yesNoToTinyint($value)
