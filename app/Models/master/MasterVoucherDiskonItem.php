@@ -43,4 +43,28 @@ class MasterVoucherDiskonItem extends BaseMasterModel
 
         return $map[$this->tipe_diskon_item] ?? '-';
     }
+
+    public function scopeProduk($query)
+    {
+        return $query->where('item_type', 'produk');
+    }
+
+    public function scopeTreatment($query)
+    {
+        return $query->where('item_type', 'treatment');
+    }
+
+    public function scopeByProdukIds($query, array $produkIds)
+    {
+        return $query
+            ->where('item_type', 'produk')
+            ->whereIn('item_id', $produkIds);
+    }
+
+    public function scopeByTreatmentIds($query, array $treatmentIds)
+    {
+        return $query
+            ->where('item_type', 'treatment')
+            ->whereIn('item_id', $treatmentIds);
+    }
 }

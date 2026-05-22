@@ -17,11 +17,13 @@ use App\Models\Master\MasterUnitTreatment;
 use App\Models\Master\MasterTipeTreatment;
 use App\Models\Master\MasterProduk;
 use App\Models\Master\MasterTreatment;
+use App\Models\master\MasterVoucherDiskon;
 use App\Models\master\MasterVoucherDiskonJenis;
 use App\Models\master\MasterVoucherDiskonKategori;
 use App\Models\master\MasterVoucherDiskonTemplate;
 use App\Models\Master\MasterAgama;
 use App\Models\Master\MasterPekerjaan;
+use App\Models\Master\MasterMetodeBayar;
 use App\Models\Pasien;
 
 
@@ -710,5 +712,245 @@ class ReferenceController extends Controller
             'message' => 'Data pasien berhasil diambil',
             'data' => $data,
         ]);
+    }
+
+    public function metodeBayar()
+    {
+        $data = MasterMetodeBayar::query()
+            ->select([
+                'id',
+                'nama',
+            ])
+            ->orderBy('id')
+            ->get();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data metode bayar berhasil diambil',
+            'data' => $data,
+        ]);
+    }
+
+    public function voucherDiskonEligible(Request $request)
+    {
+        $tokoId = $request->input('toko_id');
+
+        $produkIds = $this->normalizeIdArray($request->input('produk_ids', []));
+        $treatmentIds = $this->normalizeIdArray($request->input('treatment_ids', []));
+
+        $hasProduk = count($produkIds) > 0;
+        $hasTreatment = count($treatmentIds) > 0;
+
+        if (!$hasProduk && !$hasTreatment) {
+            return response()->json([
+                'status' => true,
+                'message' => 'Tidak ada item transaksi untuk pengecekan voucher',
+                'data' => [
+                    'treatment' => [],
+                    'produk' => [],
+                    'bundling' => [],
+                    'value' => [],
+                    'all' => [],
+                ],
+            ]);
+        }
+
+        $vouchers = MasterVoucherDiskon::query()
+            ->with('items')
+            ->aktifEligible()
+            ->untukToko($tokoId)
+            ->periodeMasihBerlaku()
+            ->whereIn('jenis_voucher_id', [1, 2, 3, 4])
+            ->orderBy('sort_order')
+            ->orderBy('nama_voucher')
+            ->get()
+            ->filter(function ($voucher) use ($produkIds, $treatmentIds, $hasProduk, $hasTreatment) {
+                return $this->isVoucherEligibleForTransaction(
+                    $voucher,
+                    $produkIds,
+                    $treatmentIds,
+                    $hasProduk,
+                    $hasTreatment
+                );
+            })
+            ->map(function ($voucher) {
+                return $this->formatVoucherEligible($voucher);
+            })
+            ->values();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Voucher eligible berhasil diambil',
+            'data' => [
+                'treatment' => $vouchers->where('jenis_voucher_id', 1)->values(),
+                'produk' => $vouchers->where('jenis_voucher_id', 2)->values(),
+                'bundling' => $vouchers->where('jenis_voucher_id', 3)->values(),
+                'value' => $vouchers->where('jenis_voucher_id', 4)->values(),
+                'all' => $vouchers,
+            ],
+        ]);
+    }
+
+    private function normalizeIdArray($value): array
+    {
+        if (is_string($value)) {
+            $value = explode(',', $value);
+        }
+
+        if (!is_array($value)) {
+            $value = [$value];
+        }
+
+        return collect($value)
+            ->filter(fn ($id) => $id !== null && $id !== '')
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    private function isVoucherEligibleForTransaction(
+        $voucher,
+        array $produkIds,
+        array $treatmentIds,
+        bool $hasProduk,
+        bool $hasTreatment
+    ): bool {
+        $jenisVoucherId = (int) $voucher->jenis_voucher_id;
+
+        $items = $voucher->items ?? collect();
+
+        $produkItems = $items->where('item_type', 'produk');
+        $treatmentItems = $items->where('item_type', 'treatment');
+
+        if ($jenisVoucherId === 1) {
+            if (!$hasTreatment) return false;
+
+            return $treatmentItems->contains(function ($item) use ($treatmentIds) {
+                return in_array((int) $item->item_id, $treatmentIds, true);
+            });
+        }
+
+        if ($jenisVoucherId === 2) {
+            if (!$hasProduk) return false;
+
+            return $produkItems->contains(function ($item) use ($produkIds) {
+                return in_array((int) $item->item_id, $produkIds, true);
+            });
+        }
+
+        if ($jenisVoucherId === 3) {
+            if ($items->isEmpty()) return false;
+
+            $produkMatched = $produkItems->isEmpty()
+                ? true
+                : $produkItems->every(function ($item) use ($produkIds) {
+                    return in_array((int) $item->item_id, $produkIds, true);
+                });
+
+            $treatmentMatched = $treatmentItems->isEmpty()
+                ? true
+                : $treatmentItems->every(function ($item) use ($treatmentIds) {
+                    return in_array((int) $item->item_id, $treatmentIds, true);
+                });
+
+            return $produkMatched && $treatmentMatched;
+        }
+
+        if ($jenisVoucherId === 4) {
+            if ($items->isEmpty()) return true;
+
+            $produkMatched = $produkItems->contains(function ($item) use ($produkIds) {
+                return in_array((int) $item->item_id, $produkIds, true);
+            });
+
+            $treatmentMatched = $treatmentItems->contains(function ($item) use ($treatmentIds) {
+                return in_array((int) $item->item_id, $treatmentIds, true);
+            });
+
+            return $produkMatched || $treatmentMatched;
+        }
+
+        return false;
+    }
+
+    private function formatVoucherEligible($voucher): array
+    {
+        $items = $voucher->items ?? collect();
+
+        return [
+            'id' => $voucher->id,
+            'legacy_id' => $voucher->legacy_id,
+
+            'nama' => $voucher->nama_voucher,
+            'nama_voucher' => $voucher->nama_voucher,
+            'deskripsi' => $voucher->deskripsi,
+
+            'mode_voucher' => $voucher->mode_voucher,
+            'mode_voucher_label' => $voucher->mode_voucher_label,
+
+            'toko_id' => $voucher->toko_id,
+            'is_all_toko' => (int) $voucher->is_all_toko,
+
+            'kategori_voucher_id' => $voucher->kategori_voucher_id,
+            'jenis_voucher_id' => (int) $voucher->jenis_voucher_id,
+            'jenis_voucher_label' => $voucher->jenis_voucher_label,
+
+            'template_voucher_id' => $voucher->template_voucher_id,
+
+            'tipe_diskon' => $voucher->tipe_diskon,
+            'tipe_diskon_label' => $voucher->tipe_diskon_label,
+            'tipe_diskon_kode' => $voucher->tipe_diskon_kode,
+
+            'total_diskon' => (float) $voucher->total_diskon,
+            'value' => (float) $voucher->total_diskon,
+            'mode' => $voucher->tipe_diskon_kode,
+
+            'qty_generate' => (int) $voucher->qty_generate,
+            'kuota' => (int) $voucher->qty_generate > 0
+                ? (int) $voucher->qty_generate
+                : 'Tidak Terbatas',
+
+            'is_bisa_digabung_promo' => (int) $voucher->is_bisa_digabung_promo,
+            'is_unlimited_date' => (int) $voucher->is_unlimited_date,
+
+            'tanggal_mulai' => $voucher->tanggal_mulai,
+            'tanggal_akhir' => $voucher->tanggal_akhir,
+
+            'status_voucher' => (int) $voucher->status_voucher,
+            'status_voucher_label' => $voucher->status_voucher_label,
+
+            'sort_order' => (int) $voucher->sort_order,
+
+            'desc' => $this->buildVoucherDesc($voucher),
+
+            'items' => $items->map(function ($item) {
+                return [
+                    'id' => $item->id,
+                    'voucher_diskon_id' => $item->voucher_diskon_id,
+                    'item_type' => $item->item_type,
+                    'item_type_label' => $item->item_type_label,
+                    'item_id' => $item->item_id,
+                    'harga_snapshot' => (float) $item->harga_snapshot,
+                    'tipe_diskon_item' => $item->tipe_diskon_item,
+                    'tipe_diskon_item_label' => $item->tipe_diskon_item_label,
+                    'nilai_diskon_item' => $item->nilai_diskon_item !== null
+                        ? (float) $item->nilai_diskon_item
+                        : null,
+                ];
+            })->values(),
+        ];
+    }
+
+    private function buildVoucherDesc($voucher): string
+    {
+        $diskon = number_format((float) $voucher->total_diskon, 0, ',', '.');
+
+        if ($voucher->tipe_diskon === 'nominal') {
+            return 'Diskon Rp ' . $diskon;
+        }
+
+        return 'Diskon ' . $diskon . '%';
     }
 }

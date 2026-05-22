@@ -126,6 +126,7 @@ Route::prefix('reference')->group(function () {
     Route::get('voucher-diskon-jenis', [ReferenceController::class, 'voucherDiskonJenis']);
     Route::get('voucher-diskon-kategori', [ReferenceController::class, 'voucherDiskonKategori']);
     Route::get('voucher-diskon-template', [ReferenceController::class, 'voucherDiskonTemplate']);
+    Route::get('voucher-diskon-eligible', [ReferenceController::class, 'voucherDiskonEligible']);
     Route::get('provinces', [ReferenceController::class, 'provinces']);
     Route::get('regencies/{provinceCode}', [ReferenceController::class, 'regencies'])->where('provinceCode', '[0-9]+');
     Route::get('districts/{regencyCode}', [ReferenceController::class, 'districts'])->where('regencyCode', '[0-9.]+');
@@ -133,4 +134,5 @@ Route::prefix('reference')->group(function () {
     Route::get('agama', [ReferenceController::class, 'agama']);
     Route::get('pekerjaan', [ReferenceController::class, 'pekerjaan']);
     Route::get('pasien', [ReferenceController::class, 'pasien']);
+    Route::get('metode-bayar', [ReferenceController::class, 'metodeBayar']);
 });

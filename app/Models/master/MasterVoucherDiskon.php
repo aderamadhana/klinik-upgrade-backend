@@ -68,4 +68,56 @@ class MasterVoucherDiskon extends BaseMasterModel
 
         return $map[$this->tipe_diskon] ?? '-';
     }
+
+    public function scopeAktifEligible($query)
+    {
+        return $query
+            ->where('status_voucher', 1)
+            ->where(function ($q) {
+                $q->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            });
+    }
+
+    public function scopeUntukToko($query, $tokoId = null)
+    {
+        return $query->where(function ($q) use ($tokoId) {
+            $q->where('is_all_toko', 1);
+
+            if (!empty($tokoId)) {
+                $q->orWhere('toko_id', $tokoId);
+            }
+        });
+    }
+
+    public function scopePeriodeMasihBerlaku($query)
+    {
+        $today = now()->toDateString();
+
+        return $query->where(function ($q) use ($today) {
+            $q->where('is_unlimited_date', 1)
+                ->orWhere(function ($dateQuery) use ($today) {
+                    $dateQuery
+                        ->whereDate('tanggal_mulai', '<=', $today)
+                        ->whereDate('tanggal_akhir', '>=', $today);
+                });
+        });
+    }
+
+    public function getJenisVoucherLabelAttribute()
+    {
+        $map = [
+            1 => 'Treatment',
+            2 => 'Produk',
+            3 => 'Bundling',
+            4 => 'Value',
+        ];
+
+        return $map[(int) $this->jenis_voucher_id] ?? '-';
+    }
+
+    public function getTipeDiskonKodeAttribute()
+    {
+        return $this->tipe_diskon === 'nominal' ? 'Rp' : '%';
+    }
 }
