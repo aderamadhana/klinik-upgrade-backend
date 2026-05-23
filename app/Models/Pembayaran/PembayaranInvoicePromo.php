@@ -4,7 +4,7 @@ namespace App\Models\Pembayaran;
 
 use Illuminate\Database\Eloquent\Model;
 
-class PembayaranInvoicePromo extends Model
+class PembayaranInvoicePromo extends BasePembayaranModel
 {
     protected $table = 'pembayaran_invoice_promo';
 

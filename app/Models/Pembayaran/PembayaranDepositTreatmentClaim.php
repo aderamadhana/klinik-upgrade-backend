@@ -5,7 +5,7 @@ namespace App\Models\Pembayaran;
 use App\Models\Registrasi\RegistrasiKunjungan;
 use Illuminate\Database\Eloquent\Model;
 
-class PembayaranDepositTreatmentClaim extends Model
+class PembayaranDepositTreatmentClaim extends BasePembayaranModel
 {
     protected $table = 'pembayaran_deposit_treatment_claim';
 

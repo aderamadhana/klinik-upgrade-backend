@@ -4,7 +4,7 @@ namespace App\Models\Master;
 
 use Illuminate\Database\Eloquent\Model;
 
-class MasterAgama extends Model
+class MasterAgama extends BaseMasterModel
 {
     protected $table = 'master_agama';
 

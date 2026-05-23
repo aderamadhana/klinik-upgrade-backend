@@ -2,10 +2,13 @@
 
 namespace App\Models\Stock;
 
+use App\Models\Concerns\Auditable;
 use Illuminate\Database\Eloquent\Model;
 
 class BaseStockModel extends Model
 {
+    use Auditable;
+
     protected $guarded = [];
 
     public $timestamps = false;

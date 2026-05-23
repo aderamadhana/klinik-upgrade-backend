@@ -7,7 +7,7 @@ use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiTask;
 use Illuminate\Database\Eloquent\Model;
 
-class PembayaranInvoice extends Model
+class PembayaranInvoice extends BasePembayaranModel
 {
     protected $table = 'pembayaran_invoice';
 

@@ -1,12 +1,12 @@
 <?php
 
-namespace App\Models\Master;
+namespace App\Models\Pembayaran;
 
 use App\Models\Concerns\Auditable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
-class BaseMasterModel extends Model
+class BasePembayaranModel extends Model
 {
     use HasFactory;
     use Auditable;

@@ -5,7 +5,7 @@ namespace App\Models\Pembayaran;
 use App\Models\Registrasi\RegistrasiKunjungan;
 use Illuminate\Database\Eloquent\Model;
 
-class PembayaranInvoiceItem extends Model
+class PembayaranInvoiceItem extends BasePembayaranModel
 {
     protected $table = 'pembayaran_invoice_item';
 

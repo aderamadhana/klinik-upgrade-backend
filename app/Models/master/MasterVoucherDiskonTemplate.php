@@ -4,7 +4,7 @@ namespace App\Models\Master;
 
 use Illuminate\Database\Eloquent\Model;
 
-class MasterVoucherDiskonTemplate extends Model
+class MasterVoucherDiskonTemplate extends BaseMasterModel
 {
     protected $table = 'master_voucher_diskon_template';
 

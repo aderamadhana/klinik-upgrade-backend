@@ -4,7 +4,7 @@ namespace App\Models\Master;
 
 use Illuminate\Database\Eloquent\Model;
 
-class MasterVoucherDiskonKategori extends Model
+class MasterVoucherDiskonKategori extends BaseMasterModel
 {
     protected $table = 'master_voucher_diskon_kategori';
 

@@ -4,6 +4,7 @@ use Illuminate\Support\Facades\Route;
 
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ReferenceController;
+use App\Http\Controllers\Api\AuditLogController;
 
 use App\Http\Controllers\Api\Master\MasterKaryawanController;
 use App\Http\Controllers\Api\Master\MasterUserController;
@@ -133,6 +134,13 @@ Route::middleware('auth:api')->group(function () {
         Route::put('penyesuaian/{id}', [StockPenyesuaianController::class, 'update']);
         Route::post('penyesuaian/{id}/post', [StockPenyesuaianController::class, 'post']);
         Route::post('penyesuaian/{id}/cancel', [StockPenyesuaianController::class, 'cancel']);
+    });
+
+    Route::prefix('audit-logs')->group(function () {
+        Route::get('/', [AuditLogController::class, 'index']);
+        Route::get('/filters', [AuditLogController::class, 'filters']);
+        Route::get('/summary', [AuditLogController::class, 'summary']);
+        Route::get('/{id}', [AuditLogController::class, 'show']);
     });
 });
 

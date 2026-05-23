@@ -2,10 +2,13 @@
 
 namespace App\Models\Registrasi;
 
+use App\Models\Concerns\Auditable;
 use Illuminate\Database\Eloquent\Model;
 
 abstract class BaseRegistrasiModel extends Model
 {
+    use Auditable;
+
     protected $guarded = [];
 
     public $timestamps = true;
@@ -49,10 +52,13 @@ abstract class BaseRegistrasiModel extends Model
             return false;
         }
 
-        return $this->update([
-            'is_delete' => 1,
-            'updated_by' => $updatedBy,
-        ]);
+        $this->is_delete = 1;
+
+        if ($updatedBy !== null) {
+            $this->updated_by = $updatedBy;
+        }
+
+        return $this->save();
     }
 
     public function restoreData($updatedBy = null)
@@ -61,9 +67,12 @@ abstract class BaseRegistrasiModel extends Model
             return false;
         }
 
-        return $this->update([
-            'is_delete' => 0,
-            'updated_by' => $updatedBy,
-        ]);
+        $this->is_delete = 0;
+
+        if ($updatedBy !== null) {
+            $this->updated_by = $updatedBy;
+        }
+
+        return $this->save();
     }
 }
