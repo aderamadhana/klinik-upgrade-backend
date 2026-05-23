@@ -239,6 +239,7 @@ class ReferenceController extends Controller
     public function produkByToko(Request $request)
     {
         $tokoId = $request->get('toko_id');
+        $tempatProdukId = $request->get('tempat_produk_id');
 
         if (!$tokoId) {
             return response()->json([
@@ -254,10 +255,23 @@ class ReferenceController extends Controller
                 'golongan',
                 'satuan',
                 'tempatProduk',
-                'hargaToko' => function ($q) use ($tokoId) {
+                'hargaToko' => function ($q) use ($tokoId, $tempatProdukId) {
                     $q->active()
                         ->where('toko_id', $tokoId)
-                        ->with(['toko', 'supplier'])
+                        ->with([
+                            'toko',
+                            'supplier',
+                            'stockProdukToko' => function ($stockQuery) use ($tokoId, $tempatProdukId) {
+                                $stockQuery->active()
+                                    ->where('toko_id', $tokoId);
+
+                                if ($tempatProdukId) {
+                                    $stockQuery->where('tempat_produk_id', $tempatProdukId);
+                                }
+
+                                $stockQuery->orderByDesc('id');
+                            },
+                        ])
                         ->orderBy('sort_order');
                 },
             ])
@@ -265,16 +279,88 @@ class ReferenceController extends Controller
                 $q->active()
                     ->where('toko_id', $tokoId);
             })
+
+            /*
+            * Penting:
+            * Jangan default filter ke Apotek.
+            * Filter tempat hanya jalan kalau FE memang mengirim tempat_produk_id.
+            */
+            ->when($tempatProdukId, function ($q) use ($tempatProdukId) {
+                $q->where(function ($sub) use ($tempatProdukId) {
+                    $sub->where('tempat_produk_id', $tempatProdukId)
+                        ->orWhere('tempat_id', $tempatProdukId);
+
+                    if ((int) $tempatProdukId === 1) {
+                        $sub->orWhereNull('tempat_produk_id')
+                            ->orWhereNull('tempat_id');
+                    }
+                });
+            })
             ->orderBy('nama')
             ->get()
-            ->map(function ($produk) {
+            ->map(function ($produk) use ($tempatProdukId) {
                 $hargaToko = $produk->hargaToko->first();
 
-                $stok = (int) ($hargaToko->stok_awal ?? 0);
-                $stokMinimum = (int) ($hargaToko->stok_minimum ?? 0);
+                if (!$hargaToko) {
+                    return null;
+                }
 
-                $isStokHabis = $stok <= 0 ? 1 : 0;
-                $isStokMinimum = $stok > 0 && $stok <= $stokMinimum ? 1 : 0;
+                $stock = $hargaToko->stockProdukToko
+                    ? $hargaToko->stockProdukToko->first()
+                    : null;
+
+                $resolvedTempatProdukId =
+                    $stock->tempat_produk_id
+                    ?? $produk->tempat_produk_id
+                    ?? $produk->tempat_id
+                    ?? $tempatProdukId
+                    ?? 1;
+
+                $namaTempatProduk =
+                    $produk->tempatProduk->nama_tempat_produk
+                    ?? $produk->tempatProduk->nama
+                    ?? null;
+
+                if ($stock) {
+                    $stokAwal = (float) ($stock->stok_awal ?? 0);
+                    $stokMasuk = (float) ($stock->stok_masuk ?? 0);
+                    $stokKeluar = (float) ($stock->stok_keluar ?? 0);
+                    $stokPenyesuaian = (float) ($stock->stok_penyesuaian ?? 0);
+                    $stokAkhir = (float) ($stock->stok_akhir ?? 0);
+                    $stokReserved = (float) ($stock->stok_reserved ?? 0);
+                    $stokMinimum = (float) ($stock->stok_minimum ?? $hargaToko->stok_minimum ?? 0);
+
+                    $hargaBeliTerakhir = (float) ($stock->harga_beli_terakhir ?? $hargaToko->harga_beli ?? 0);
+                    $hargaJualTerakhir = (float) ($stock->harga_jual_terakhir ?? $hargaToko->harga_jual ?? 0);
+
+                    $sumberStok = 'stock_produk_toko';
+                    $belumAdaSaldoStok = 0;
+                } else {
+                    /*
+                    * Fallback sementara:
+                    * Produk tetap muncul walaupun belum punya saldo di stock_produk_toko.
+                    * Kalau ingin stok awal lama dianggap stok berjalan, gunakan stok_awal.
+                    * Kalau ingin stok baru harus 0 sampai penerimaan/penyesuaian, ubah $stokAkhir = 0.
+                    */
+                    $stokAwal = (float) ($hargaToko->stok_awal ?? 0);
+                    $stokMasuk = 0;
+                    $stokKeluar = 0;
+                    $stokPenyesuaian = 0;
+                    $stokAkhir = $stokAwal;
+                    $stokReserved = 0;
+                    $stokMinimum = (float) ($hargaToko->stok_minimum ?? 0);
+
+                    $hargaBeliTerakhir = (float) ($hargaToko->harga_beli ?? 0);
+                    $hargaJualTerakhir = (float) ($hargaToko->harga_jual ?? 0);
+
+                    $sumberStok = 'master_produk_toko';
+                    $belumAdaSaldoStok = 1;
+                }
+
+                $stokTersedia = $stokAkhir - $stokReserved;
+
+                $isStokHabis = $stokTersedia <= 0 ? 1 : 0;
+                $isStokMinimum = $stokTersedia > 0 && $stokTersedia <= $stokMinimum ? 1 : 0;
 
                 if ($isStokHabis) {
                     $statusStok = 'HABIS';
@@ -284,11 +370,27 @@ class ReferenceController extends Controller
                     $statusStok = 'TERSEDIA';
                 }
 
+                $kodeProduk = $produk->kode_accurate ?? $produk->kode ?? '-';
+                $namaProduk = $produk->nama ?? '-';
+
+                $labelDropdown = trim(
+                    $kodeProduk .
+                    ' - ' .
+                    $namaProduk .
+                    ' | ' .
+                    ($namaTempatProduk ?? '-') .
+                    ' | Stok: ' .
+                    $stokTersedia
+                );
+
                 return [
                     'produk_id' => $produk->id,
                     'kode' => $produk->kode,
                     'kode_accurate' => $produk->kode_accurate,
-                    'nama' => $produk->nama,
+                    'nama' => $namaProduk,
+
+                    'label_produk' => trim($kodeProduk . ' - ' . $namaProduk),
+                    'label_dropdown' => $labelDropdown,
 
                     'satuan_id' => $produk->satuan_id,
                     'nama_satuan' => $produk->satuan->nama ?? $produk->satuan->nama_satuan ?? null,
@@ -299,24 +401,38 @@ class ReferenceController extends Controller
                     'golongan_produk_id' => $produk->golongan_produk_id,
                     'nama_golongan_produk' => $produk->golongan->nama_golongan_produk ?? null,
 
-                    'tempat_produk_id' => $produk->tempat_produk_id,
-                    'nama_tempat_produk' => $produk->tempatProduk->nama_tempat_produk ?? null,
+                    'tempat_produk_id' => $resolvedTempatProdukId,
+                    'nama_tempat_produk' => $namaTempatProduk,
 
                     'is_obat_resep' => (int) ($produk->is_obat_resep ?? 0),
                     'is_obat_bebas' => (int) ($produk->is_obat_bebas ?? 0),
 
                     'produk_toko_id' => $hargaToko->id ?? null,
                     'toko_id' => $hargaToko->toko_id ?? null,
-                    'nama_toko' => $hargaToko->toko->nama_toko ?? null,
+                    'nama_toko' => $hargaToko->toko->nama_toko ?? $hargaToko->toko->nama ?? null,
 
                     'supplier_id' => $hargaToko->supplier_id ?? null,
-                    'nama_supplier' => $hargaToko->supplier->nama ?? null,
+                    'nama_supplier' => $hargaToko->supplier->nama ?? $hargaToko->supplier->nama_supplier ?? null,
 
                     'harga_jual' => (float) ($hargaToko->harga_jual ?? 0),
                     'harga_beli' => (float) ($hargaToko->harga_beli ?? 0),
 
-                    'stok_awal' => $stok,
+                    'harga_jual_terakhir' => $hargaJualTerakhir,
+                    'harga_beli_terakhir' => $hargaBeliTerakhir,
+
+                    'stock_produk_toko_id' => $stock->id ?? null,
+
+                    'stok_awal' => $stokAwal,
+                    'stok_masuk' => $stokMasuk,
+                    'stok_keluar' => $stokKeluar,
+                    'stok_penyesuaian' => $stokPenyesuaian,
+                    'stok_akhir' => $stokAkhir,
+                    'stok_reserved' => $stokReserved,
+                    'stok_tersedia' => $stokTersedia,
                     'stok_minimum' => $stokMinimum,
+
+                    'sumber_stok' => $sumberStok,
+                    'belum_ada_saldo_stok' => $belumAdaSaldoStok,
 
                     'fee_dokter' => (float) ($hargaToko->fee_dokter ?? 0),
                     'fee_beautician' => (float) ($hargaToko->fee_beautician ?? 0),
@@ -324,8 +440,21 @@ class ReferenceController extends Controller
                     'is_stok_habis' => $isStokHabis,
                     'is_stok_minimum' => $isStokMinimum,
                     'status_stok' => $statusStok,
+
+                    /*
+                    * Untuk Vuetify dropdown:
+                    * Produk tetap muncul, tapi tidak bisa dipilih kalau stok kosong.
+                    */
+                    'disabled' => $isStokHabis === 1,
+                    'item_props' => [
+                        'disabled' => $isStokHabis === 1,
+                        'title' => $labelDropdown,
+                        'subtitle' => 'Stok tersedia: ' . $stokTersedia,
+                    ],
                 ];
-            });
+            })
+            ->filter()
+            ->values();
 
         return response()->json([
             'status' => true,

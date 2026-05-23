@@ -9,12 +9,12 @@ class MasterTreatment extends BaseMasterModel
 
     public function tipe()
     {
-        return $this->belongsTo(MasterTipeTreatment::class, 'tipe_treatment_id', 'id');
+        return $this->belongsTo(MasterTipeTreatment::class, 'tipe_id', 'id');
     }
 
     public function unit()
     {
-        return $this->belongsTo(MasterUnitTreatment::class, 'unit_treatment_id', 'id');
+        return $this->belongsTo(MasterUnitTreatment::class, 'unit_id', 'id');
     }
 
     public function hargaToko()

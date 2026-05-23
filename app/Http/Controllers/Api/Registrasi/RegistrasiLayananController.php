@@ -12,6 +12,7 @@ use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiPenjualanDetail;
 use App\Models\Registrasi\RegistrasiTask;
 use App\Models\Registrasi\RegistrasiTreatmentDetail;
+use App\Services\Stock\StockTransactionService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -21,6 +22,13 @@ use Illuminate\Support\Facades\Validator;
 
 class RegistrasiLayananController extends Controller
 {
+    protected StockTransactionService $stockTransactionService;
+
+    public function __construct(StockTransactionService $stockTransactionService)
+    {
+        $this->stockTransactionService = $stockTransactionService;
+    }
+
     public function index(Request $request)
     {
         $query = RegistrasiKunjungan::query()
@@ -284,8 +292,11 @@ class RegistrasiLayananController extends Controller
                 $this->createTreatmentDetails($registrasi, $treatmentItems, $tasks);
             }
 
+            $createdPenjualanDetails = [];
+
             if ($adaPenjualan) {
-                $this->createPenjualanDetails($registrasi, $penjualanItems, $tasks);
+                $createdPenjualanDetails = $this->createPenjualanDetails($registrasi, $penjualanItems, $tasks);
+                $this->reservePenjualanStock($registrasi, $createdPenjualanDetails);
             }
 
             DB::commit();
@@ -587,6 +598,8 @@ class RegistrasiLayananController extends Controller
         DB::beginTransaction();
 
         try {
+            $this->releasePenjualanReserve($registrasi, 'Release stok karena registrasi dibatalkan');
+
             $registrasi->update([
                 'status' => RegistrasiKunjungan::STATUS_BATAL,
                 'current_task' => RegistrasiKunjungan::TASK_DRAFT,
@@ -650,6 +663,8 @@ class RegistrasiLayananController extends Controller
         DB::beginTransaction();
 
         try {
+            $this->releasePenjualanReserve($registrasi, 'Release stok karena registrasi dibatalkan');
+
             $registrasi->update([
                 'status' => RegistrasiKunjungan::STATUS_BATAL,
                 'current_task' => RegistrasiKunjungan::TASK_DRAFT,
@@ -940,7 +955,8 @@ class RegistrasiLayananController extends Controller
         array $items,
         array $tasks
     ) {
-        $task = $tasks['penjualan'] ?? null;
+        $task = $tasks['penjualan'] ?? $tasks['pembayaran'] ?? null;
+        $createdDetails = [];
 
         foreach ($items as $item) {
             $ids = $this->resolveProdukIds($item, $registrasi->toko_id);
@@ -952,7 +968,7 @@ class RegistrasiLayananController extends Controller
                 );
             }
 
-            RegistrasiPenjualanDetail::create([
+            $detail = RegistrasiPenjualanDetail::create([
                 'registrasi_id' => $registrasi->id,
                 'source_type' => RegistrasiPenjualanDetail::SOURCE_FO,
                 'source_task_id' => $task?->id,
@@ -974,7 +990,138 @@ class RegistrasiLayananController extends Controller
                 'created_by' => $this->username(),
                 'created_at' => now(),
             ]);
+
+            $createdDetails[] = [
+                'detail_id' => $detail->id,
+                'produk_toko_id' => $ids['produk_toko_id'],
+                'produk_id' => $ids['produk_id'],
+                'tempat_produk_id' => $this->resolveTempatProdukId($item, $ids),
+                'jumlah' => (float) $item['jumlah'],
+                'harga' => (float) $item['harga'],
+            ];
         }
+
+        return $createdDetails;
+    }
+
+    private function reservePenjualanStock(RegistrasiKunjungan $registrasi, array $createdPenjualanDetails)
+    {
+        if (empty($createdPenjualanDetails)) {
+            return;
+        }
+
+        $items = [];
+
+        foreach ($createdPenjualanDetails as $detail) {
+            $items[] = [
+                'produk_toko_id' => $detail['produk_toko_id'],
+                'produk_id' => $detail['produk_id'],
+                'tempat_produk_id' => $detail['tempat_produk_id'],
+                'qty' => $detail['jumlah'],
+                'harga_jual' => $detail['harga'],
+                'source_detail_id' => $detail['detail_id'],
+            ];
+        }
+
+        $this->stockTransactionService->reserveProduk($items, [
+            'toko_id' => $registrasi->toko_id,
+            'source_type' => 'REGISTRASI_LAYANAN',
+            'source_table' => 'registrasi_kunjungan',
+            'source_id' => $registrasi->id,
+
+            'kode_reservasi' => $registrasi->kode_registrasi,
+            'tanggal' => now(),
+            'expired_at' => Carbon::parse($registrasi->registered_at ?? now())->addHours(6),
+
+            'keterangan' => 'Reserve stok dari registrasi layanan',
+            'created_by' => $this->username(),
+        ]);
+    }
+
+    private function releasePenjualanReserve(RegistrasiKunjungan $registrasi, string $keterangan)
+    {
+        $this->stockTransactionService->releaseReservasiBySource(
+            'REGISTRASI_LAYANAN',
+            $registrasi->id,
+            [
+                'kode_mutasi' => $registrasi->kode_registrasi,
+                'tanggal' => now(),
+                'source_table' => 'registrasi_kunjungan',
+                'keterangan' => $keterangan,
+                'created_by' => $this->username(),
+            ]
+        );
+    }
+
+    private function resolveTempatProdukId(array $item, array $ids)
+    {
+        $explicitTempatId = $item['tempat_produk_id']
+            ?? $item['tempat_produk_id']
+            ?? null;
+
+        if (!empty($explicitTempatId)) {
+            return (int) $explicitTempatId;
+        }
+
+        $produkId = $ids['produk_id'] ?? null;
+
+        if (!empty($ids['produk_toko_id'])) {
+            $produkTokoTable = (new MasterProdukToko())->getTable();
+
+            if (Schema::hasTable($produkTokoTable)) {
+                $produkToko = DB::table($produkTokoTable)
+                    ->where('id', $ids['produk_toko_id'])
+                    ->first();
+
+                if ($produkToko) {
+                    if (Schema::hasColumn($produkTokoTable, 'tempat_produk_id') && !empty($produkToko->tempat_produk_id)) {
+                        return (int) $produkToko->tempat_produk_id;
+                    }
+
+                    if (Schema::hasColumn($produkTokoTable, 'tempat_produk_id') && !empty($produkToko->tempat_produk_id)) {
+                        return (int) $produkToko->tempat_produk_id;
+                    }
+
+                    $produkId = $produkToko->produk_id
+                        ?? $produkToko->master_produk_id
+                        ?? $produkToko->obat_id
+                        ?? $produkId;
+                }
+            }
+        }
+
+        $tempatProdukId = $this->getTempatProdukIdFromMasterProduk($produkId);
+
+        if ($tempatProdukId) {
+            return $tempatProdukId;
+        }
+
+        return 1;
+    }
+
+    private function getTempatProdukIdFromMasterProduk($produkId)
+    {
+        if (empty($produkId) || !Schema::hasTable('master_produk')) {
+            return null;
+        }
+
+        $produk = DB::table('master_produk')
+            ->where('id', $produkId)
+            ->first();
+
+        if (!$produk) {
+            return null;
+        }
+
+        if (Schema::hasColumn('master_produk', 'tempat_produk_id') && !empty($produk->tempat_produk_id)) {
+            return (int) $produk->tempat_produk_id;
+        }
+
+        if (Schema::hasColumn('master_produk', 'tempat_produk_id') && !empty($produk->tempat_produk_id)) {
+            return (int) $produk->tempat_produk_id;
+        }
+
+        return null;
     }
 
     private function normalizeTreatmentItems(array $items)

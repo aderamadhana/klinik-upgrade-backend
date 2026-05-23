@@ -94,21 +94,6 @@ class MasterTreatmentController extends Controller
         $this->normalizeRequestField($request);
 
         $validator = Validator::make($request->all(), [
-            'legacy_id' => 'nullable|integer',
-
-            'kode' => [
-                'required',
-                'string',
-                'max:30',
-                Rule::unique('master_treatment', 'kode')
-                    ->where(function ($query) {
-                        $query->where(function ($q) {
-                            $q->where('is_delete', 0)
-                                ->orWhereNull('is_delete');
-                        });
-                    }),
-            ],
-
             'kode_accurate' => 'nullable|string|max:50',
             'nama' => 'required|string|max:255',
             'kategori_sales' => 'nullable|string|max:100',
@@ -167,8 +152,6 @@ class MasterTreatmentController extends Controller
             $actor = auth('api')->user()->username ?? 'system';
 
             $treatment = MasterTreatment::create([
-                'legacy_id' => $request->legacy_id,
-                'kode' => $request->kode,
                 'kode_accurate' => $request->kode_accurate,
                 'nama' => $request->nama,
                 'kategori_sales' => $request->kategori_sales,
@@ -240,22 +223,6 @@ class MasterTreatmentController extends Controller
         }
 
         $validator = Validator::make($request->all(), [
-            'legacy_id' => 'nullable|integer',
-
-            'kode' => [
-                'required',
-                'string',
-                'max:30',
-                Rule::unique('master_treatment', 'kode')
-                    ->where(function ($query) {
-                        $query->where(function ($q) {
-                            $q->where('is_delete', 0)
-                                ->orWhereNull('is_delete');
-                        });
-                    })
-                    ->ignore($id),
-            ],
-
             'kode_accurate' => 'nullable|string|max:50',
             'nama' => 'required|string|max:255',
             'kategori_sales' => 'nullable|string|max:100',
@@ -314,8 +281,6 @@ class MasterTreatmentController extends Controller
             $actor = auth('api')->user()->username ?? 'system';
 
             $treatment->update([
-                'legacy_id' => $request->legacy_id,
-                'kode' => $request->kode,
                 'kode_accurate' => $request->kode_accurate,
                 'nama' => $request->nama,
                 'kategori_sales' => $request->kategori_sales,

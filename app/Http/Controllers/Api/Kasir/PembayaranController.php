@@ -11,13 +11,23 @@ use App\Models\Pembayaran\PembayaranInvoiceMetode;
 use App\Models\Pembayaran\PembayaranInvoicePromo;
 use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiTask;
+use App\Models\Stock\StockReservasiProduk;
+use App\Services\Stock\StockTransactionService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
 
 class PembayaranController extends Controller
 {
+    protected StockTransactionService $stockTransactionService;
+
+    public function __construct(StockTransactionService $stockTransactionService)
+    {
+        $this->stockTransactionService = $stockTransactionService;
+    }
+    
     public function index(Request $request)
     {
         $this->syncPendingInvoices($request);
@@ -349,6 +359,8 @@ class PembayaranController extends Controller
 
         try {
             $this->replaceInvoiceMetode($invoice, $metode);
+
+            $this->processStockKeluarPembayaran($invoice, $registrasi);
 
             $invoice->update([
                 'tanggal_lunas' => now(),
@@ -1092,6 +1104,142 @@ class PembayaranController extends Controller
 
             'items_count' => $invoice->items->where('is_delete', 0)->count(),
         ];
+    }
+
+    private function processStockKeluarPembayaran(
+        PembayaranInvoice $invoice,
+        RegistrasiKunjungan $registrasi
+    ) {
+        $invoice->loadMissing(['items']);
+
+        $productItems = $invoice->items
+            ->where('is_delete', 0)
+            ->where('status', PembayaranInvoiceItem::STATUS_AKTIF)
+            ->where('item_type', PembayaranInvoiceItem::ITEM_PRODUK)
+            ->values();
+
+        if ($productItems->isEmpty()) {
+            return;
+        }
+
+        $hasActiveReserve = StockReservasiProduk::query()
+            ->where('source_type', 'REGISTRASI_LAYANAN')
+            ->where('source_id', $registrasi->id)
+            ->where('status', 'ACTIVE')
+            ->exists();
+
+        if ($hasActiveReserve) {
+            $this->stockTransactionService->consumeReservasiUntukPenjualan(
+                'REGISTRASI_LAYANAN',
+                $registrasi->id,
+                [
+                    'kode_mutasi' => $invoice->no_invoice,
+                    'tanggal' => now(),
+
+                    'ref_type' => 'PEMBAYARAN',
+                    'ref_table' => 'pembayaran_invoice',
+                    'ref_id' => $invoice->id,
+
+                    'keterangan' => 'Stok keluar dari pembayaran registrasi layanan',
+                    'created_by' => $this->username(),
+                ]
+            );
+
+            return;
+        }
+
+        $items = [];
+
+        foreach ($productItems as $item) {
+            if (empty($item->produk_toko_id) || empty($item->produk_id)) {
+                throw new \Exception('Produk invoice belum memiliki mapping produk_toko_id / produk_id pada item: ' . ($item->nama_item ?? '-'));
+            }
+
+            $items[] = [
+                'produk_toko_id' => $item->produk_toko_id,
+                'produk_id' => $item->produk_id,
+                'tempat_produk_id' => $this->resolveTempatProdukIdFromInvoiceItem($item),
+                'qty' => (float) ($item->qty ?? 0),
+                'harga_jual' => (float) ($item->harga ?? 0),
+                'ref_detail_id' => $item->id,
+            ];
+        }
+
+        $this->stockTransactionService->keluarPenjualanTanpaReservasi($items, [
+            'toko_id' => $invoice->toko_id,
+            'kode_mutasi' => $invoice->no_invoice,
+            'tanggal' => now(),
+
+            'ref_type' => 'PEMBAYARAN',
+            'ref_table' => 'pembayaran_invoice',
+            'ref_id' => $invoice->id,
+
+            'keterangan' => 'Stok keluar dari pembayaran penjualan tanpa reservasi',
+            'created_by' => $this->username(),
+        ]);
+    }
+
+    private function resolveTempatProdukIdFromInvoiceItem(PembayaranInvoiceItem $item)
+    {
+        if (isset($item->tempat_produk_id) && !empty($item->tempat_produk_id)) {
+            return (int) $item->tempat_produk_id;
+        }
+
+        $produkId = $item->produk_id;
+
+        if (!empty($item->produk_toko_id) && Schema::hasTable('master_produk_toko')) {
+            $produkToko = DB::table('master_produk_toko')
+                ->where('id', $item->produk_toko_id)
+                ->first();
+
+            if ($produkToko) {
+                if (Schema::hasColumn('master_produk_toko', 'tempat_produk_id') && !empty($produkToko->tempat_produk_id)) {
+                    return (int) $produkToko->tempat_produk_id;
+                }
+
+                if (Schema::hasColumn('master_produk_toko', 'tempat_produk_id') && !empty($produkToko->tempat_produk_id)) {
+                    return (int) $produkToko->tempat_produk_id;
+                }
+
+                $produkId = $produkToko->produk_id
+                    ?? $produkToko->master_produk_id
+                    ?? $produkToko->obat_id
+                    ?? $produkId;
+            }
+        }
+
+        $tempatProdukId = $this->getTempatProdukIdFromMasterProduk($produkId);
+
+        if ($tempatProdukId) {
+            return $tempatProdukId;
+        }
+
+        return 1;
+    }
+
+    private function getTempatProdukIdFromMasterProduk($produkId)
+    {
+        if (empty($produkId) || !Schema::hasTable('master_produk')) {
+            return null;
+        }
+
+        $row = DB::table('master_produk')
+            ->where('id', $produkId)
+            ->first();
+
+        if (!$row) {
+            return null;
+        }
+
+        if (Schema::hasColumn('master_produk', 'tempat_produk_id') && !empty($row->tempat_produk_id)) {
+            return (int) $row->tempat_produk_id;
+        }
+
+        if (Schema::hasColumn('master_produk', 'tempat_produk_id') && !empty($row->tempat_produk_id)) {
+            return (int) $row->tempat_produk_id;
+        }
+
+        return null;
     }
 
     private function getPaymentTask(RegistrasiKunjungan $registrasi)

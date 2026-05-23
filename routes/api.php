@@ -25,6 +25,10 @@ use App\Http\Controllers\Api\PelayananMedis\RiwayatPelayananController;
 
 use App\Http\Controllers\Api\Kasir\PembayaranController;
 
+use App\Http\Controllers\Api\Stock\StockProdukTokoController;
+use App\Http\Controllers\Api\Stock\StockPenerimaanController;
+use App\Http\Controllers\Api\Stock\StockPenyesuaianController;
+
 
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/auth/refresh', [AuthController::class, 'refresh']);
@@ -107,6 +111,28 @@ Route::middleware('auth:api')->group(function () {
             Route::post('/{id}/recalculate', [PembayaranController::class, 'recalculate'])->whereNumber('id');
             Route::post('/{id}/cancel', [PembayaranController::class, 'cancel'])->whereNumber('id');
         });
+    });
+
+    Route::prefix('stock')->group(function () {
+        Route::get('produk-toko', [StockProdukTokoController::class, 'index']);
+        Route::get('produk-toko/stock-hari-ini', [StockProdukTokoController::class, 'stockHariIni']);
+        Route::get('produk-toko/stok-tersedia', [StockProdukTokoController::class, 'stokTersedia']);
+        Route::get('produk-toko/kartu-stok', [StockProdukTokoController::class, 'kartuStok']);
+        Route::get('produk-toko/{id}', [StockProdukTokoController::class, 'show']);
+
+        Route::get('penerimaan', [StockPenerimaanController::class, 'index']);
+        Route::post('penerimaan', [StockPenerimaanController::class, 'store']);
+        Route::get('penerimaan/{id}', [StockPenerimaanController::class, 'show']);
+        Route::put('penerimaan/{id}', [StockPenerimaanController::class, 'update']);
+        Route::post('penerimaan/{id}/post', [StockPenerimaanController::class, 'post']);
+        Route::post('penerimaan/{id}/cancel', [StockPenerimaanController::class, 'cancel']);
+
+        Route::get('penyesuaian', [StockPenyesuaianController::class, 'index']);
+        Route::post('penyesuaian', [StockPenyesuaianController::class, 'store']);
+        Route::get('penyesuaian/{id}', [StockPenyesuaianController::class, 'show']);
+        Route::put('penyesuaian/{id}', [StockPenyesuaianController::class, 'update']);
+        Route::post('penyesuaian/{id}/post', [StockPenyesuaianController::class, 'post']);
+        Route::post('penyesuaian/{id}/cancel', [StockPenyesuaianController::class, 'cancel']);
     });
 });
 

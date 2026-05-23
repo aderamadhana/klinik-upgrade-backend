@@ -18,7 +18,7 @@ class MasterProdukController extends Controller
 
         $kategoriProdukId = $request->get('kategori_produk_id');
         $golonganProdukId = $request->get('golongan_produk_id');
-        $tempatProdukId = $request->get('tempat_produk_id') ?? $request->get('tempat_id');
+        $tempatProdukId = $request->get('tempat_produk_id') ?? $request->get('tempat_produk_id');
         $satuanId = $request->get('satuan_id');
         $tokoId = $request->get('toko_id');
         $supplierId = $request->get('supplier_id');
@@ -31,8 +31,7 @@ class MasterProdukController extends Controller
             ->with($this->produkRelations())
             ->when($search !== '', function ($q) use ($search) {
                 $q->where(function ($qq) use ($search) {
-                    $qq->where('kode', 'like', "%{$search}%")
-                        ->orWhere('kode_accurate', 'like', "%{$search}%")
+                    $qq->where('kode_accurate', 'like', "%{$search}%")
                         ->orWhere('nama', 'like', "%{$search}%")
                         ->orWhereHas('kategori', function ($kategori) use ($search) {
                             $kategori->where('nama_kategori_produk', 'like', "%{$search}%");
@@ -63,7 +62,7 @@ class MasterProdukController extends Controller
                 $q->where('golongan_produk_id', $golonganProdukId);
             })
             ->when($tempatProdukId, function ($q) use ($tempatProdukId) {
-                $q->where('tempat_id', $tempatProdukId);
+                $q->where('tempat_produk_id', $tempatProdukId);
             })
             ->when($satuanId, function ($q) use ($satuanId) {
                 $q->where('satuan_id', $satuanId);
@@ -101,21 +100,6 @@ class MasterProdukController extends Controller
         $this->normalizeRequestField($request);
 
         $validator = Validator::make($request->all(), [
-            'legacy_id' => 'nullable|integer',
-
-            'kode' => [
-                'required',
-                'string',
-                'max:30',
-                Rule::unique('master_produk', 'kode')
-                    ->where(function ($query) {
-                        $query->where(function ($q) {
-                            $q->where('is_delete', 0)
-                                ->orWhereNull('is_delete');
-                        });
-                    }),
-            ],
-
             'kode_accurate' => 'nullable|string|max:100',
             'nama' => 'required|string|max:150',
 
@@ -164,12 +148,10 @@ class MasterProdukController extends Controller
             $actor = auth('api')->user()->username ?? 'system';
 
             $produk = MasterProduk::create([
-                'legacy_id' => $request->legacy_id,
-                'kode' => $request->kode,
                 'kode_accurate' => $request->kode_accurate,
                 'nama' => $request->nama,
 
-                'tempat_id' => $request->tempat_produk_id,
+                'tempat_produk_id' => $request->tempat_produk_id,
                 'satuan_id' => $request->satuan_id,
                 'kategori_produk_id' => $request->kategori_produk_id,
                 'golongan_produk_id' => $request->golongan_produk_id,
@@ -239,22 +221,6 @@ class MasterProdukController extends Controller
         }
 
         $validator = Validator::make($request->all(), [
-            'legacy_id' => 'nullable|integer',
-
-            'kode' => [
-                'required',
-                'string',
-                'max:30',
-                Rule::unique('master_produk', 'kode')
-                    ->where(function ($query) {
-                        $query->where(function ($q) {
-                            $q->where('is_delete', 0)
-                                ->orWhereNull('is_delete');
-                        });
-                    })
-                    ->ignore($id),
-            ],
-
             'kode_accurate' => 'nullable|string|max:100',
             'nama' => 'required|string|max:150',
 
@@ -303,12 +269,10 @@ class MasterProdukController extends Controller
             $actor = auth('api')->user()->username ?? 'system';
 
             $produk->update([
-                'legacy_id' => $request->legacy_id,
-                'kode' => $request->kode,
                 'kode_accurate' => $request->kode_accurate,
                 'nama' => $request->nama,
 
-                'tempat_id' => $request->tempat_produk_id,
+                'tempat_produk_id' => $request->tempat_produk_id,
                 'satuan_id' => $request->satuan_id,
                 'kategori_produk_id' => $request->kategori_produk_id,
                 'golongan_produk_id' => $request->golongan_produk_id,
@@ -407,9 +371,9 @@ class MasterProdukController extends Controller
             ]);
         }
 
-        if (!$request->has('tempat_produk_id') && $request->has('tempat_id')) {
+        if (!$request->has('tempat_produk_id') && $request->has('tempat_produk_id')) {
             $request->merge([
-                'tempat_produk_id' => $request->tempat_id,
+                'tempat_produk_id' => $request->tempat_produk_id,
             ]);
         }
 
