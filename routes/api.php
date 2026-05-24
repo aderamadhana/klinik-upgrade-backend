@@ -15,6 +15,8 @@ use App\Http\Controllers\Api\Master\MasterTokoController;
 use App\Http\Controllers\Api\Master\MasterProdukController;
 use App\Http\Controllers\Api\Master\MasterTreatmentController;
 use App\Http\Controllers\Api\Master\MasterVoucherDiskonController;
+use App\Http\Controllers\Api\Master\MasterAntrianKategoriController;
+use App\Http\Controllers\Api\Master\MasterAntrianCounterController;
 
 use App\Http\Controllers\Api\Administrasi\PasienController;
 
@@ -30,6 +32,8 @@ use App\Http\Controllers\Api\Stock\StockProdukTokoController;
 use App\Http\Controllers\Api\Stock\StockPenerimaanController;
 use App\Http\Controllers\Api\Stock\StockPenyesuaianController;
 
+use App\Http\Controllers\Api\Antrian\AntrianController;
+use App\Http\Controllers\Api\Antrian\BookingLayananController;
 
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/auth/refresh', [AuthController::class, 'refresh']);
@@ -51,6 +55,10 @@ Route::middleware('auth:api')->group(function () {
         Route::apiResource('treatment', MasterTreatmentController::class);
         Route::apiResource('voucher-diskon', MasterVoucherDiskonController::class);
         Route::post('user/{id}/reset-password', [MasterUserController::class, 'resetPassword']);
+        Route::apiResource('antrian-kategori', MasterAntrianKategoriController::class);
+        Route::post('antrian-kategori/sync-from-branch', [MasterAntrianKategoriController::class, 'syncFromBranch']);
+        Route::apiResource('antrian-counter', MasterAntrianCounterController::class);
+        Route::post('antrian-counter/sync-from-branch', [MasterAntrianCounterController::class, 'syncFromBranch']);
     });
     
     Route::prefix('administrasi')->group(function () {
@@ -169,4 +177,36 @@ Route::prefix('reference')->group(function () {
     Route::get('pekerjaan', [ReferenceController::class, 'pekerjaan']);
     Route::get('pasien', [ReferenceController::class, 'pasien']);
     Route::get('metode-bayar', [ReferenceController::class, 'metodeBayar']);
+});
+
+Route::prefix('antrian')->group(function () {
+    Route::get('/kategori', [AntrianController::class, 'kategori']);
+    Route::get('/counter', [AntrianController::class, 'counter']);
+
+    Route::post('/ambil-nomor', [AntrianController::class, 'ambilNomor']);
+    Route::get('/display', [AntrianController::class, 'display']);
+
+    Route::get('/operator', [AntrianController::class, 'operatorList']);
+    Route::post('/operator/panggil-berikutnya', [AntrianController::class, 'panggilBerikutnya']);
+
+    Route::post('/{id}/panggil', [AntrianController::class, 'panggil']);
+    Route::post('/{id}/panggil-ulang', [AntrianController::class, 'panggilUlang']);
+    Route::post('/{id}/mulai-layanan', [AntrianController::class, 'mulaiLayanan']);
+    Route::post('/{id}/lewati', [AntrianController::class, 'lewati']);
+    Route::post('/{id}/selesai', [AntrianController::class, 'selesai']);
+    Route::post('/{id}/batal', [AntrianController::class, 'batal']);
+    Route::post('/{id}/hubungkan-registrasi', [AntrianController::class, 'hubungkanRegistrasi']);
+
+    Route::get('/booking/cari-hari-ini', [AntrianController::class, 'cariBookingHariIni']);
+    Route::post('/booking/{bookingId}/check-in', [AntrianController::class, 'checkInBooking']);
+});
+
+Route::prefix('booking-layanan')->group(function () {
+    Route::get('/', [BookingLayananController::class, 'index']);
+    Route::post('/', [BookingLayananController::class, 'store']);
+    Route::get('/{id}', [BookingLayananController::class, 'show']);
+    Route::put('/{id}', [BookingLayananController::class, 'update']);
+    Route::post('/{id}/cancel', [BookingLayananController::class, 'cancel']);
+    Route::post('/{id}/no-show', [BookingLayananController::class, 'noShow']);
+    Route::post('/{id}/late', [BookingLayananController::class, 'markLate']);
 });

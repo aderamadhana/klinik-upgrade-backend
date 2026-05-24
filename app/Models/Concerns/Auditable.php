@@ -35,6 +35,10 @@ trait Auditable
     protected function writeAuditLog(string $action): void
     {
         try {
+            if ($this->shouldSkipAudit()) {
+                return;
+            }
+
             if ($this->getTable() === 'audit_logs') {
                 return;
             }
@@ -54,6 +58,11 @@ trait Auditable
                 $oldValues = $this->filterAuditValues($this->getOriginal());
             } else {
                 $changedKeys = array_keys($this->getChanges());
+                $changedKeys = $this->filterAuditChangedKeys($changedKeys);
+
+                if (empty($changedKeys)) {
+                    return;
+                }
 
                 $oldValues = $this->filterAuditValues(
                     $this->onlyOriginalKeys($changedKeys)
@@ -68,7 +77,7 @@ trait Auditable
                 return;
             }
 
-            DB::table('audit_logs')->insert([
+            $payload = [
                 'module_name' => $this->getAuditModuleName(),
                 'table_name'  => $this->getTable(),
                 'record_id'   => $this->getKey(),
@@ -79,19 +88,60 @@ trait Auditable
                 'new_values'  => $this->toAuditJson($newValues),
 
                 'toko_id'     => $this->getAuditTokoId($user),
-                'user_id'     => $user ? $user->id : null,
+                'user_id'     => $user ? ($user->id ?? null) : null,
                 'username'    => $user ? ($user->username ?? $user->name ?? null) : null,
                 'role_name'   => $this->getAuditRoleName($user),
 
-                'ip_address'  => request() ? request()->ip() : null,
-                'user_agent'  => request() ? request()->userAgent() : null,
+                'ip_address'  => $this->getAuditIpAddress(),
+                'user_agent'  => $this->getAuditUserAgent(),
                 'reason'      => $this->getAuditReason(),
 
                 'created_at'  => now(),
-            ]);
+            ];
+
+            if (Schema::hasColumn('audit_logs', 'updated_at')) {
+                $payload['updated_at'] = now();
+            }
+
+            DB::table('audit_logs')->insert($payload);
         } catch (Throwable $e) {
-            report($e);
+            $this->logAuditFailure($e);
         }
+    }
+
+    protected function shouldSkipAudit(): bool
+    {
+        if (app()->runningInConsole()) {
+            return true;
+        }
+
+        if (!app()->bound('request')) {
+            return true;
+        }
+
+        try {
+            $request = request();
+
+            if ($request->is('docs') || $request->is('docs/*')) {
+                return true;
+            }
+
+            if ($request->is('api/docs') || $request->is('api/docs/*')) {
+                return true;
+            }
+
+            if ($request->is('docs/api') || $request->is('docs/api/*')) {
+                return true;
+            }
+
+            if ($request->is('docs/api.json')) {
+                return true;
+            }
+        } catch (Throwable $e) {
+            return true;
+        }
+
+        return false;
     }
 
     protected function getCurrentAuditUser()
@@ -121,6 +171,10 @@ trait Auditable
             if (isset($user->role) && isset($user->role->name)) {
                 return $user->role->name;
             }
+
+            if (isset($user->role) && isset($user->role->role_name)) {
+                return $user->role->role_name;
+            }
         } catch (Throwable $e) {
             return null;
         }
@@ -136,20 +190,24 @@ trait Auditable
 
         $classParts = explode('\\', get_class($this));
 
-        if (in_array('Master', $classParts)) {
+        if (in_array('Master', $classParts, true)) {
             return 'Master';
         }
 
-        if (in_array('Registrasi', $classParts)) {
+        if (in_array('Registrasi', $classParts, true)) {
             return 'Registrasi';
         }
 
-        if (in_array('Stock', $classParts)) {
+        if (in_array('Stock', $classParts, true)) {
             return 'Stock';
         }
 
-        if (in_array('Pembayaran', $classParts)) {
+        if (in_array('Pembayaran', $classParts, true)) {
             return 'Pembayaran';
+        }
+
+        if (in_array('PelayananMedis', $classParts, true)) {
+            return 'Pelayanan Medis';
         }
 
         return 'General';
@@ -193,24 +251,36 @@ trait Auditable
             return $this->getAttribute('cabang_id');
         }
 
-        if (request() && request()->filled('toko_id')) {
-            return request()->input('toko_id');
-        }
+        try {
+            if (app()->bound('request')) {
+                $request = request();
 
-        if (request() && request()->filled('cabang_id')) {
-            return request()->input('cabang_id');
-        }
+                if ($request->filled('toko_id')) {
+                    return $request->input('toko_id');
+                }
 
-        if (request() && request()->header('X-Toko-Id')) {
-            return request()->header('X-Toko-Id');
-        }
+                if ($request->filled('cabang_id')) {
+                    return $request->input('cabang_id');
+                }
 
-        if (request() && request()->header('X-Cabang-Id')) {
-            return request()->header('X-Cabang-Id');
+                if ($request->header('X-Toko-Id')) {
+                    return $request->header('X-Toko-Id');
+                }
+
+                if ($request->header('X-Cabang-Id')) {
+                    return $request->header('X-Cabang-Id');
+                }
+            }
+        } catch (Throwable $e) {
+            //
         }
 
         if ($user && isset($user->toko_id)) {
             return $user->toko_id;
+        }
+
+        if ($user && isset($user->cabang_id)) {
+            return $user->cabang_id;
         }
 
         return null;
@@ -218,13 +288,45 @@ trait Auditable
 
     protected function getAuditReason()
     {
-        if (!request()) {
+        try {
+            if (!app()->bound('request')) {
+                return null;
+            }
+
+            $request = request();
+
+            return $request->input('audit_reason')
+                ?: $request->input('reason')
+                ?: $request->header('X-Audit-Reason');
+        } catch (Throwable $e) {
             return null;
         }
+    }
 
-        return request()->input('audit_reason')
-            ?: request()->input('reason')
-            ?: request()->header('X-Audit-Reason');
+    protected function getAuditIpAddress()
+    {
+        try {
+            if (!app()->bound('request')) {
+                return null;
+            }
+
+            return request()->ip();
+        } catch (Throwable $e) {
+            return null;
+        }
+    }
+
+    protected function getAuditUserAgent()
+    {
+        try {
+            if (!app()->bound('request')) {
+                return null;
+            }
+
+            return request()->userAgent();
+        } catch (Throwable $e) {
+            return null;
+        }
     }
 
     protected function onlyOriginalKeys(array $keys): array
@@ -247,6 +349,21 @@ trait Auditable
         }
 
         return $data;
+    }
+
+    protected function filterAuditChangedKeys(array $keys): array
+    {
+        $ignored = [
+            'updated_at',
+        ];
+
+        if (property_exists($this, 'auditIgnored') && is_array($this->auditIgnored)) {
+            $ignored = array_merge($ignored, $this->auditIgnored);
+        }
+
+        return array_values(array_filter($keys, function ($key) use ($ignored) {
+            return !in_array($key, $ignored, true);
+        }));
     }
 
     protected function filterAuditValues(?array $values): ?array
@@ -289,5 +406,20 @@ trait Auditable
             $values,
             JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR
         );
+    }
+
+    protected function logAuditFailure(Throwable $e): void
+    {
+        try {
+            logger()->warning('Audit log failed', [
+                'model'   => get_class($this),
+                'table'   => method_exists($this, 'getTable') ? $this->getTable() : null,
+                'message' => $e->getMessage(),
+                'file'    => $e->getFile(),
+                'line'    => $e->getLine(),
+            ]);
+        } catch (Throwable $logException) {
+            //
+        }
     }
 }
