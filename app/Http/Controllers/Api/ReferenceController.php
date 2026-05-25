@@ -25,6 +25,7 @@ use App\Models\Master\MasterAgama;
 use App\Models\Master\MasterPekerjaan;
 use App\Models\Master\MasterMetodeBayar;    
 use App\Models\Master\MasterProdukToko;
+use App\Models\Master\MasterMerchandise;
 use App\Models\Pasien;
 
 class ReferenceController extends Controller
@@ -1087,5 +1088,74 @@ class ReferenceController extends Controller
         }
 
         return 'Diskon ' . $diskon . '%';
+    }
+    
+    public function merchandise(Request $request)
+    {
+        $keyword = trim((string) $request->query('q', ''));
+        $limit = (int) $request->query('limit', 50);
+
+        if ($limit <= 0) {
+            $limit = 50;
+        }
+
+        if ($limit > 100) {
+            $limit = 100;
+        }
+
+        $query = MasterMerchandise::query()
+            ->active();
+
+        if ($keyword !== '') {
+            $query->where(function ($q) use ($keyword) {
+                $q->where('kode', 'LIKE', "%{$keyword}%")
+                    ->orWhere('nama', 'LIKE', "%{$keyword}%")
+                    ->orWhere('jenis_reward', 'LIKE', "%{$keyword}%");
+            });
+        }
+
+        $rows = $query
+            ->orderBy('sort_order', 'asc')
+            ->orderBy('nama', 'asc')
+            ->limit($limit)
+            ->get([
+                'id',
+                'kode',
+                'nama',
+                'jenis_reward',
+                'nilai_diskon_persen',
+                'nilai_diskon_nominal',
+                'harga_poin',
+                'stok',
+                'deskripsi',
+            ]);
+
+        $data = $rows->map(function ($item) {
+            $label = trim(($item->kode ? $item->kode . ' - ' : '') . $item->nama);
+
+            return [
+                'id' => $item->id,
+                'value' => $item->id,
+                'title' => $label,
+                'text' => $label,
+
+                'kode' => $item->kode,
+                'nama' => $item->nama,
+                'jenis_reward' => $item->jenis_reward,
+                'nilai_diskon_persen' => (float) $item->nilai_diskon_persen,
+                'nilai_diskon_nominal' => (float) $item->nilai_diskon_nominal,
+                'harga_poin' => (int) $item->harga_poin,
+                'stok' => (int) $item->stok,
+                'deskripsi' => $item->deskripsi,
+
+                'is_stok_kosong' => (int) $item->stok <= 0,
+            ];
+        })->values();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data merchandise berhasil diambil',
+            'data' => $data,
+        ]);
     }
 }

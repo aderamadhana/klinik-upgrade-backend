@@ -351,25 +351,25 @@ class MasterVoucherDiskonController extends Controller
             ]);
         }
 
-        if (!$request->has('nama_voucher') && $request->has('nama')) {
+        if (!$request->filled('nama_voucher') && $request->filled('nama')) {
             $request->merge([
                 'nama_voucher' => $request->nama,
             ]);
         }
 
-        if (!$request->has('total_diskon') && $request->has('nilai_diskon')) {
+        if (!$request->filled('total_diskon') && $request->filled('nilai_diskon')) {
             $request->merge([
                 'total_diskon' => $request->nilai_diskon,
             ]);
         }
 
-        if (!$request->has('total_diskon_maksimal') && $request->has('maksimal_diskon')) {
+        if (!$request->filled('total_diskon_maksimal') && $request->filled('maksimal_diskon')) {
             $request->merge([
                 'total_diskon_maksimal' => $request->maksimal_diskon,
             ]);
         }
 
-        if (!$request->has('tipe_diskon') && $request->has('diskon_type')) {
+        if (!$request->filled('tipe_diskon') && $request->filled('diskon_type')) {
             $request->merge([
                 'tipe_diskon' => $request->diskon_type,
             ]);
@@ -380,7 +380,10 @@ class MasterVoucherDiskonController extends Controller
             : 'direct';
 
         $tipeDiskon = $this->normalizeTipeDiskonValue($request->input('tipe_diskon'));
+
         $isGenerateMode = $modeVoucher === 'generate';
+
+        $totalDiskonMaksimal = $request->input('total_diskon_maksimal');
 
         $request->merge([
             'mode_voucher' => $modeVoucher,
@@ -389,7 +392,7 @@ class MasterVoucherDiskonController extends Controller
                 : $this->normalizeKodeVoucher($request->input('kode_voucher')),
             'tipe_diskon' => $tipeDiskon,
             'total_diskon_maksimal' => $tipeDiskon === 'percent'
-                ? (float) $request->input('total_diskon_maksimal', 0)
+                ? $this->toNullableNumber($totalDiskonMaksimal)
                 : null,
             'is_all_toko' => $this->toIntBool($request->input('is_all_toko')),
             'is_unlimited_date' => $this->toIntBool($request->input('is_unlimited_date')),
@@ -558,14 +561,17 @@ class MasterVoucherDiskonController extends Controller
 
         return collect($rows)
             ->map(function ($item) {
+                $tipeDiskonItem = $item['tipe_diskon_item'] ?? null;
+                $nilaiDiskonItem = $item['nilai_diskon_item'] ?? null;
+
                 return [
                     'item_type' => $item['item_type'] ?? null,
                     'item_id' => $item['item_id'] ?? null,
-                    'harga_snapshot' => $item['harga_snapshot'] ?? null,
-                    'tipe_diskon_item' => isset($item['tipe_diskon_item'])
-                        ? $this->normalizeTipeDiskonValue($item['tipe_diskon_item'])
-                        : null,
-                    'nilai_diskon_item' => $item['nilai_diskon_item'] ?? null,
+                    'harga_snapshot' => $this->toNullableNumber($item['harga_snapshot'] ?? null),
+                    'tipe_diskon_item' => $this->isBlankValue($tipeDiskonItem)
+                        ? null
+                        : $this->normalizeTipeDiskonValue($tipeDiskonItem),
+                    'nilai_diskon_item' => $this->toNullableNumber($nilaiDiskonItem),
                 ];
             })
             ->filter(function ($item) {
@@ -611,15 +617,32 @@ class MasterVoucherDiskonController extends Controller
         ]);
 
         foreach ($items as $item) {
+            $existingItem = MasterVoucherDiskonItem::where('voucher_diskon_id', $voucherId)
+                ->where('item_type', $item['item_type'])
+                ->where('item_id', $item['item_id'])
+                ->first();
+
+            $payload = [
+                'harga_snapshot' => $item['harga_snapshot'],
+                'tipe_diskon_item' => $item['tipe_diskon_item'],
+                'nilai_diskon_item' => $item['nilai_diskon_item'],
+                'is_delete' => 0,
+                'updated_by' => $actor,
+                'updated_at' => now(),
+            ];
+
+            if ($existingItem) {
+                $existingItem->update($payload);
+                continue;
+            }
+
             MasterVoucherDiskonItem::create([
                 'voucher_diskon_id' => $voucherId,
                 'item_type' => $item['item_type'],
                 'item_id' => $item['item_id'],
-
                 'harga_snapshot' => $item['harga_snapshot'],
                 'tipe_diskon_item' => $item['tipe_diskon_item'],
                 'nilai_diskon_item' => $item['nilai_diskon_item'],
-
                 'is_delete' => 0,
                 'created_by' => $actor,
                 'created_at' => now(),
@@ -672,5 +695,37 @@ class MasterVoucherDiskonController extends Controller
                 $q->where('id', '!=', $ignoreId);
             })
             ->exists();
+    }
+
+    private function isBlankValue($value): bool
+    {
+        return $value === null || (is_string($value) && trim($value) === '');
+    }
+
+    private function toNullableNumber($value): ?float
+    {
+        if ($this->isBlankValue($value)) {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            return (float) $value;
+        }
+
+        $value = trim((string) $value);
+
+        $value = str_replace('Rp', '', $value);
+        $value = str_replace(' ', '', $value);
+
+        if (str_contains($value, ',') && str_contains($value, '.')) {
+            $value = str_replace('.', '', $value);
+            $value = str_replace(',', '.', $value);
+        } elseif (str_contains($value, ',') && !str_contains($value, '.')) {
+            $value = str_replace(',', '.', $value);
+        } elseif (substr_count($value, '.') > 1) {
+            $value = str_replace('.', '', $value);
+        }
+
+        return is_numeric($value) ? (float) $value : null;
     }
 }

@@ -181,6 +181,7 @@ Route::prefix('reference')->group(function () {
     Route::get('pekerjaan', [ReferenceController::class, 'pekerjaan']);
     Route::get('pasien', [ReferenceController::class, 'pasien']);
     Route::get('metode-bayar', [ReferenceController::class, 'metodeBayar']);
+    Route::get('merchandise', [ReferenceController::class, 'merchandise']);
 });
 
 Route::prefix('antrian')->group(function () {
