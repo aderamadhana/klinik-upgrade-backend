@@ -17,6 +17,8 @@ use App\Http\Controllers\Api\Master\MasterTreatmentController;
 use App\Http\Controllers\Api\Master\MasterVoucherDiskonController;
 use App\Http\Controllers\Api\Master\MasterAntrianKategoriController;
 use App\Http\Controllers\Api\Master\MasterAntrianCounterController;
+use App\Http\Controllers\Api\Master\MasterPoinRuleController;
+use App\Http\Controllers\Api\Master\MasterMemberTierController;
 
 use App\Http\Controllers\Api\Administrasi\PasienController;
 
@@ -59,6 +61,8 @@ Route::middleware('auth:api')->group(function () {
         Route::post('antrian-kategori/sync-from-branch', [MasterAntrianKategoriController::class, 'syncFromBranch']);
         Route::apiResource('antrian-counter', MasterAntrianCounterController::class);
         Route::post('antrian-counter/sync-from-branch', [MasterAntrianCounterController::class, 'syncFromBranch']);
+        Route::apiResource('poin-rule', MasterPoinRuleController::class);
+        Route::apiResource('member-tier', MasterMemberTierController::class);
     });
     
     Route::prefix('administrasi')->group(function () {
