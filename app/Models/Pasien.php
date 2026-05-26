@@ -4,10 +4,12 @@ namespace App\Models;
 
 use App\Models\Master\MasterAgama;
 use App\Models\Master\MasterPekerjaan;
+use App\Models\Concerns\Auditable;
 use Illuminate\Database\Eloquent\Model;
 
 class Pasien extends Model
 {
+    use Auditable;
     protected $table = 'pasien';
 
     protected $guarded = [];

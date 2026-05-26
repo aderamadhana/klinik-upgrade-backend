@@ -189,20 +189,21 @@ trait Auditable
         }
 
         $classParts = explode('\\', get_class($this));
+        $table = method_exists($this, 'getTable') ? $this->getTable() : '';
 
-        if (in_array('Master', $classParts, true)) {
+        if (in_array('Master', $classParts, true) || $this->auditTableStartsWith($table, 'master_')) {
             return 'Master';
         }
 
-        if (in_array('Registrasi', $classParts, true)) {
+        if (in_array('Registrasi', $classParts, true) || $this->auditTableStartsWith($table, 'registrasi_')) {
             return 'Registrasi';
         }
 
-        if (in_array('Stock', $classParts, true)) {
+        if (in_array('Stock', $classParts, true) || $this->auditTableStartsWith($table, 'stock_')) {
             return 'Stock';
         }
 
-        if (in_array('Pembayaran', $classParts, true)) {
+        if (in_array('Pembayaran', $classParts, true) || $this->auditTableStartsWith($table, 'pembayaran_')) {
             return 'Pembayaran';
         }
 
@@ -210,7 +211,36 @@ trait Auditable
             return 'Pelayanan Medis';
         }
 
+        if (
+            in_array('Poin', $classParts, true) ||
+            in_array($table, [
+                'member_point_ledger',
+                'pasien_poin_ledger',
+            ], true)
+        ) {
+            return 'Poin';
+        }
+
+        if (
+            in_array('Pasien', $classParts, true) ||
+            in_array($table, [
+                'pasien',
+                'pasien_member',
+            ], true)
+        ) {
+            return 'Pasien';
+        }
+
         return 'General';
+    }
+
+    protected function auditTableStartsWith(string $table, string $prefix): bool
+    {
+        if ($table === '') {
+            return false;
+        }
+
+        return substr($table, 0, strlen($prefix)) === $prefix;
     }
 
     protected function getAuditDescription(string $action): string
