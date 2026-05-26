@@ -26,6 +26,7 @@ use App\Models\Master\MasterPekerjaan;
 use App\Models\Master\MasterMetodeBayar;    
 use App\Models\Master\MasterProdukToko;
 use App\Models\Master\MasterMerchandise;
+use App\Models\Master\MasterAccurateItemMapping;
 use App\Models\Pasien;
 
 class ReferenceController extends Controller
@@ -1156,6 +1157,45 @@ class ReferenceController extends Controller
             'status' => true,
             'message' => 'Data merchandise berhasil diambil',
             'data' => $data,
+        ]);
+    }
+
+    public function accurateItemMapping(Request $request)
+    {
+        $query = MasterAccurateItemMapping::query()
+            ->active();
+
+        if ($request->filled('source_type')) {
+            $query->where('source_type', $request->source_type);
+        }
+
+        if ($request->filled('source_code')) {
+            $query->where('source_code', $request->source_code);
+        }
+
+        $rows = $query
+            ->orderBy('sort_order', 'asc')
+            ->orderBy('source_name', 'asc')
+            ->get([
+                'id',
+                'source_type',
+                'source_code',
+                'source_name',
+                'legacy_treatment_id',
+                'legacy_treatment_name',
+                'kode_accurate',
+                'nama_accurate',
+                'default_harga',
+                'is_billable',
+                'is_send_to_accurate',
+                'send_when_zero',
+                'sort_order',
+            ]);
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data mapping Accurate berhasil diambil.',
+            'data' => $rows,
         ]);
     }
 }

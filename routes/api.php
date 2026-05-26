@@ -182,6 +182,7 @@ Route::prefix('reference')->group(function () {
     Route::get('pasien', [ReferenceController::class, 'pasien']);
     Route::get('metode-bayar', [ReferenceController::class, 'metodeBayar']);
     Route::get('merchandise', [ReferenceController::class, 'merchandise']);
+    Route::get('accurate-item-mapping', [ReferenceController::class, 'accurateItemMapping']);
 });
 
 Route::prefix('antrian')->group(function () {

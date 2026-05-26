@@ -3,9 +3,9 @@
 namespace App\Http\Controllers\Api\Registrasi;
 
 use App\Http\Controllers\Controller;
+use App\Models\Master\MasterAccurateItemMapping;
 use App\Models\Master\MasterProdukToko;
 use App\Models\Master\MasterTreatmentToko;
-use App\Models\Stock\StockProdukToko;
 use App\Models\Pasien;
 use App\Models\Registrasi\RegistrasiKonsultasiFoto;
 use App\Models\Registrasi\RegistrasiKonsultasiIntake;
@@ -13,6 +13,7 @@ use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiPenjualanDetail;
 use App\Models\Registrasi\RegistrasiTask;
 use App\Models\Registrasi\RegistrasiTreatmentDetail;
+use App\Models\Stock\StockProdukToko;
 use App\Services\Stock\StockTransactionService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -130,8 +131,22 @@ class RegistrasiLayananController extends Controller
             'layanan' => 'required|array',
             'layanan.ada_konsultasi' => 'nullable|boolean',
             'layanan.channel_konsultasi' => 'nullable|string|in:offline,online',
+            'layanan.konsultasi_source_code' => 'nullable|string|max:100',
+            'layanan.konsultasi_source_name' => 'nullable|string|max:150',
+            'layanan.konsultasi_mapping_id' => 'nullable|integer',
             'layanan.ada_treatment' => 'nullable|boolean',
             'layanan.ada_penjualan' => 'nullable|boolean',
+            'layanan.route_treatment' => 'nullable|string|max:100',
+            'layanan.is_pembelian_online' => 'nullable|boolean',
+
+            'konsultasi_source_code' => 'nullable|string|max:100',
+            'konsultasi_source_name' => 'nullable|string|max:150',
+            'konsultasi_mapping_id' => 'nullable|integer',
+            'total_konsultasi' => 'nullable|numeric|min:0',
+            'rule_biaya_konsultasi' => 'nullable|integer',
+            'is_pembelian_online' => 'nullable|boolean',
+
+            'catatan_registrasi' => 'nullable|string',
 
             'konsultasi_offline' => 'nullable|array',
             'konsultasi_offline.keluhan_awal' => 'nullable|string',
@@ -173,11 +188,121 @@ class RegistrasiLayananController extends Controller
             ], 422);
         }
 
-        if ($adaKonsultasi && empty($layanan['channel_konsultasi'])) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Channel konsultasi wajib dipilih',
-            ], 422);
+        $channelKonsultasiInput = $layanan['channel_konsultasi'] ?? null;
+
+        $konsultasiSourceCode = $layanan['konsultasi_source_code']
+            ?? $request->input('konsultasi_source_code')
+            ?? null;
+
+        if ($adaKonsultasi && !$konsultasiSourceCode) {
+            $konsultasiSourceCode = $channelKonsultasiInput === 'online'
+                ? 'KONSULTASI_ONLINE'
+                : 'KONSULTASI_OFFLINE';
+        }
+
+        $konsultasiMapping = null;
+
+        if ($adaKonsultasi) {
+            $konsultasiMapping = MasterAccurateItemMapping::findActiveBySourceCode(
+                $konsultasiSourceCode
+            );
+
+            if (!$konsultasiMapping) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Mapping Accurate untuk layanan konsultasi belum diset.',
+                    'errors' => [
+                        'accurate_mapping' => [
+                            "Mapping {$konsultasiSourceCode} belum ada atau belum aktif di master_accurate_item_mapping.",
+                        ],
+                    ],
+                ], 422);
+            }
+
+            if (strtolower((string) $konsultasiMapping->source_type) !== 'konsultasi') {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Source type mapping konsultasi tidak valid.',
+                    'errors' => [
+                        'accurate_mapping' => [
+                            "Source code {$konsultasiSourceCode} harus memiliki source_type konsultasi.",
+                        ],
+                    ],
+                ], 422);
+            }
+
+            if (
+                $this->toBool($konsultasiMapping->is_send_to_accurate ?? false)
+                && empty($konsultasiMapping->kode_accurate)
+            ) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Kode Accurate konsultasi belum diisi.',
+                    'errors' => [
+                        'accurate_mapping' => [
+                            "Kode Accurate untuk {$konsultasiSourceCode} masih kosong.",
+                        ],
+                    ],
+                ], 422);
+            }
+        }
+
+        $channelKonsultasi = $this->resolveChannelKonsultasiFromMapping(
+            $adaKonsultasi,
+            $channelKonsultasiInput,
+            $konsultasiSourceCode
+        );
+
+        $isPembelianOnline = $this->toBool(
+            $layanan['is_pembelian_online']
+                ?? $request->input('is_pembelian_online', false)
+        );
+
+        $pembelianOnlineMapping = null;
+
+        if ($isPembelianOnline) {
+            $pembelianOnlineMapping = MasterAccurateItemMapping::findActiveBySourceCode(
+                'PEMBELIAN_ONLINE'
+            );
+
+            if (!$pembelianOnlineMapping) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Mapping Accurate untuk pembelian online belum diset.',
+                    'errors' => [
+                        'accurate_mapping' => [
+                            'Mapping PEMBELIAN_ONLINE belum ada atau belum aktif di master_accurate_item_mapping.',
+                        ],
+                    ],
+                ], 422);
+            }
+
+            if (strtolower((string) $pembelianOnlineMapping->source_type) !== 'channel') {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Source type mapping pembelian online tidak valid.',
+                    'errors' => [
+                        'accurate_mapping' => [
+                            'PEMBELIAN_ONLINE harus memiliki source_type channel.',
+                        ],
+                    ],
+                ], 422);
+            }
+
+            if (
+                $this->toBool($pembelianOnlineMapping->is_send_to_accurate ?? false)
+                && empty($pembelianOnlineMapping->kode_accurate)
+            ) {
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Kode Accurate pembelian online belum diisi.',
+                    'errors' => [
+                        'accurate_mapping' => [
+                            'Kode Accurate untuk PEMBELIAN_ONLINE masih kosong.',
+                        ],
+                    ],
+                ], 422);
+            }
         }
 
         if (($adaKonsultasi || $adaTreatment) && !$request->filled('dokter_id')) {
@@ -217,11 +342,6 @@ class RegistrasiLayananController extends Controller
                 throw new \Exception('Minimal satu produk harus dipilih');
             }
 
-            /*
-            * FIX STOK:
-            * Jika stock_produk_toko belum ada, buat otomatis dari master_produk_toko.stok_awal.
-            * Setelah itu validasi stok tersedia memakai stock_produk_toko.
-            */
             if ($adaPenjualan) {
                 $penjualanItems = $this->ensureAndValidatePenjualanStockFromMaster(
                     $penjualanItems,
@@ -236,12 +356,14 @@ class RegistrasiLayananController extends Controller
 
             $totalTreatment = collect($treatmentItems)->sum('total');
             $totalPenjualan = collect($penjualanItems)->sum('subtotal');
-            $grandTotal = $totalTreatment + $totalPenjualan;
 
-            $channelKonsultasi = $this->mapChannelKonsultasi(
+            $totalKonsultasi = $this->resolveTotalKonsultasi(
                 $adaKonsultasi,
-                $layanan['channel_konsultasi'] ?? null
+                $adaTreatment,
+                $konsultasiMapping
             );
+
+            $grandTotal = $totalTreatment + $totalPenjualan + $totalKonsultasi;
 
             $currentTask = $this->determineCurrentTask(
                 $adaKonsultasi,
@@ -249,7 +371,11 @@ class RegistrasiLayananController extends Controller
                 $adaPenjualan
             );
 
-            $registrasi = RegistrasiKunjungan::create([
+            $needPembayaran = $adaTreatment || $adaPenjualan || $totalKonsultasi > 0;
+
+            $registrasiTable = (new RegistrasiKunjungan())->getTable();
+
+            $registrasiPayload = [
                 'kode_registrasi' => $this->generateKodeRegistrasi(
                     $request->toko_id,
                     $request->tanggal
@@ -259,26 +385,52 @@ class RegistrasiLayananController extends Controller
                 'tanggal_kunjungan' => $request->tanggal,
                 'registered_at' => now(),
                 'catatan_registrasi' => $request->input('catatan_registrasi'),
-
                 'dokter_awal_id' => $request->input('dokter_id'),
                 'perawat_awal_id' => $request->input('perawat_id'),
-
                 'channel_konsultasi' => $channelKonsultasi,
                 'is_treatment' => $adaTreatment ? 1 : 0,
                 'is_penjualan' => $adaPenjualan ? 1 : 0,
                 'perlu_tindakan_perawat' => $needNurseStation ? 2 : ($adaTreatment ? 1 : 0),
-
                 'current_task' => $currentTask,
                 'status' => RegistrasiKunjungan::STATUS_AKTIF,
-
                 'total_treatment' => $totalTreatment,
                 'total_penjualan' => $totalPenjualan,
                 'grand_total' => $grandTotal,
-
                 'is_delete' => 0,
                 'created_by' => $this->username(),
                 'created_at' => now(),
-            ]);
+            ];
+
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'is_konsultasi', $adaKonsultasi ? 1 : 0);
+
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'konsultasi_source_code', $konsultasiMapping?->source_code);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'konsultasi_source_name', $konsultasiMapping?->source_name);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'konsultasi_mapping_id', $konsultasiMapping?->id);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'konsultasi_accurate_mapping_id', $konsultasiMapping?->id);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'kode_accurate_konsultasi', $konsultasiMapping?->kode_accurate);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'nama_accurate_konsultasi', $konsultasiMapping?->nama_accurate);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'total_konsultasi', $totalKonsultasi);
+            $this->putIfColumn(
+                $registrasiPayload,
+                $registrasiTable,
+                'rule_biaya_konsultasi',
+                $this->resolveRuleBiayaKonsultasi($adaKonsultasi, $adaTreatment, $totalKonsultasi)
+            );
+            $this->putIfColumn(
+                $registrasiPayload,
+                $registrasiTable,
+                'catatan_biaya_konsultasi',
+                $this->resolveCatatanBiayaKonsultasi($adaKonsultasi, $adaTreatment, $totalKonsultasi, $konsultasiMapping)
+            );
+
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'is_pembelian_online', $isPembelianOnline ? 1 : 0);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'pembelian_online_source_code', $pembelianOnlineMapping?->source_code);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'pembelian_online_source_name', $pembelianOnlineMapping?->source_name);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'pembelian_online_mapping_id', $pembelianOnlineMapping?->id);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'kode_accurate_pembelian_online', $pembelianOnlineMapping?->kode_accurate);
+            $this->putIfColumn($registrasiPayload, $registrasiTable, 'nama_accurate_pembelian_online', $pembelianOnlineMapping?->nama_accurate);
+
+            $registrasi = RegistrasiKunjungan::create($registrasiPayload);
 
             $tasks = $this->createTasks(
                 $registrasi,
@@ -286,6 +438,7 @@ class RegistrasiLayananController extends Controller
                 $adaTreatment,
                 $adaPenjualan,
                 $needNurseStation,
+                $needPembayaran,
                 $request
             );
 
@@ -295,11 +448,11 @@ class RegistrasiLayananController extends Controller
                 $konsultasi = $this->createKonsultasiIntake(
                     $registrasi,
                     $request,
-                    $layanan['channel_konsultasi']
+                    $channelKonsultasi
                 );
             }
 
-            if ($konsultasi && ($layanan['channel_konsultasi'] ?? null) === 'online') {
+            if ($konsultasi && $channelKonsultasi === RegistrasiKunjungan::CHANNEL_ONLINE) {
                 $this->storeKonsultasiFotos($request, $registrasi, $konsultasi);
             }
 
@@ -350,17 +503,14 @@ class RegistrasiLayananController extends Controller
     private function ensureAndValidatePenjualanStockFromMaster(array $items, int $tokoId): array
     {
         $qtyByStockId = [];
-        $stockRows = [];
 
         foreach ($items as $index => $item) {
-            $produkTokoId =
-                $item['produk_toko_id']
+            $produkTokoId = $item['produk_toko_id']
                 ?? $item['master_produk_toko_id']
                 ?? $item['obat_toko_id']
                 ?? null;
 
-            $produkId =
-                $item['produk_id']
+            $produkId = $item['produk_id']
                 ?? $item['obat_id']
                 ?? $item['master_produk_id']
                 ?? null;
@@ -385,9 +535,7 @@ class RegistrasiLayananController extends Controller
             }
 
             $produkId = $produkId ?: $produkToko->produk_id;
-
-            $tempatProdukId =
-                $item['tempat_produk_id']
+            $tempatProdukId = $item['tempat_produk_id']
                 ?? $produkToko->produk->tempat_produk_id
                 ?? 1;
 
@@ -404,16 +552,11 @@ class RegistrasiLayananController extends Controller
                 ->first();
 
             if (!$stock) {
-                /*
-                * Kalau belum ada saldo resmi,
-                * buat stock_produk_toko dari master_produk_toko.stok_awal.
-                */
                 $stock = StockProdukToko::create([
                     'produk_toko_id' => $produkToko->id,
                     'produk_id' => $produkId,
                     'toko_id' => $tokoId,
                     'tempat_produk_id' => $tempatProdukId,
-
                     'stok_awal' => (float) ($produkToko->stok_awal ?? 0),
                     'stok_masuk' => 0,
                     'stok_keluar' => 0,
@@ -421,10 +564,8 @@ class RegistrasiLayananController extends Controller
                     'stok_akhir' => (float) ($produkToko->stok_awal ?? 0),
                     'stok_reserved' => 0,
                     'stok_minimum' => (float) ($produkToko->stok_minimum ?? 0),
-
                     'harga_beli_terakhir' => (float) ($produkToko->harga_beli ?? 0),
                     'harga_jual_terakhir' => (float) ($produkToko->harga_jual ?? 0),
-
                     'last_mutation_at' => now(),
                     'is_delete' => 0,
                     'created_at' => now(),
@@ -445,7 +586,6 @@ class RegistrasiLayananController extends Controller
 
             if (!isset($qtyByStockId[$stock->id])) {
                 $qtyByStockId[$stock->id] = 0;
-                $stockRows[$stock->id] = $stock;
             }
 
             $qtyByStockId[$stock->id] += $qty;
@@ -897,6 +1037,7 @@ class RegistrasiLayananController extends Controller
         bool $adaTreatment,
         bool $adaPenjualan,
         bool $needNurseStation,
+        bool $needPembayaran,
         Request $request
     ) {
         $tasks = [];
@@ -914,7 +1055,7 @@ class RegistrasiLayananController extends Controller
             ]);
         }
 
-        if ($adaTreatment || $adaPenjualan) {
+        if ($needPembayaran) {
             $tasks['pembayaran'] = RegistrasiTask::create([
                 'registrasi_id' => $registrasi->id,
                 'task_type' => RegistrasiTask::TYPE_PEMBAYARAN,
@@ -948,7 +1089,7 @@ class RegistrasiLayananController extends Controller
     ) {
         $payload = [
             'registrasi_id' => $registrasi->id,
-            'jenis_konsultasi' => $channel === 'online'
+            'jenis_konsultasi' => $channel === RegistrasiKunjungan::CHANNEL_ONLINE
                 ? RegistrasiKonsultasiIntake::JENIS_ONLINE
                 : RegistrasiKonsultasiIntake::JENIS_OFFLINE,
             'status' => RegistrasiKonsultasiIntake::STATUS_MENUNGGU,
@@ -956,14 +1097,14 @@ class RegistrasiLayananController extends Controller
             'created_at' => now(),
         ];
 
-        if ($channel === 'offline') {
+        if ($channel === RegistrasiKunjungan::CHANNEL_OFFLINE) {
             $offline = $request->input('konsultasi_offline', []);
 
             $payload['keluhan_awal'] = $offline['keluhan_awal'] ?? null;
             $payload['catatan_awal'] = $offline['catatan'] ?? null;
         }
 
-        if ($channel === 'online') {
+        if ($channel === RegistrasiKunjungan::CHANNEL_ONLINE) {
             $online = $request->input('konsultasi_online', []);
 
             $payload['alergi'] = $online['alergi'] ?? null;
@@ -1073,23 +1214,19 @@ class RegistrasiLayananController extends Controller
                 'source_type' => RegistrasiTreatmentDetail::SOURCE_FO,
                 'source_task_id' => $task?->id,
                 'source_karyawan_id' => null,
-
                 'is_deposit_claim' => $this->toBool($item['is_deposit_claim'] ?? false) ? 1 : 0,
                 'deposit_treatment_id' => $item['deposit_treatment_id'] ?? null,
                 'deposit_claim_id' => $item['deposit_claim_id'] ?? null,
-
                 'treatment_toko_id' => $ids['treatment_toko_id'],
                 'treatment_id' => $ids['treatment_id'],
                 'nama_treatment' => $item['nama_treatment']
                     ?? $item['treatment_nama']
                     ?? $item['nama_tindakan']
                     ?? null,
-
                 'harga' => $item['harga'],
                 'jumlah' => $item['jumlah'],
                 'total' => $item['total'],
                 'catatan' => $item['catatan'] ?? null,
-
                 'status' => RegistrasiTreatmentDetail::STATUS_BELUM_DIKERJAKAN,
                 'is_delete' => 0,
                 'created_by' => $this->username(),
@@ -1122,18 +1259,15 @@ class RegistrasiLayananController extends Controller
                 'source_task_id' => $task?->id,
                 'source_resep_id' => $item['source_resep_id'] ?? null,
                 'source_karyawan_id' => null,
-
                 'produk_toko_id' => $ids['produk_toko_id'],
                 'produk_id' => $ids['produk_id'],
                 'nama_produk' => $item['nama_produk'] ?? $item['produk_nama'] ?? null,
-
                 'harga' => $item['harga'],
                 'jumlah' => $item['jumlah'],
                 'diskon_tipe' => $item['diskon_tipe'] ?? $item['diskon_type'] ?? 0,
                 'diskon_nilai' => $item['diskon_nilai'] ?? $item['diskon_value'] ?? 0,
                 'diskon_referral' => $item['diskon_referral'] ?? 0,
                 'subtotal' => $item['subtotal'],
-
                 'is_delete' => 0,
                 'created_by' => $this->username(),
                 'created_at' => now(),
@@ -1176,11 +1310,9 @@ class RegistrasiLayananController extends Controller
             'source_type' => 'REGISTRASI_LAYANAN',
             'source_table' => 'registrasi_kunjungan',
             'source_id' => $registrasi->id,
-
             'kode_reservasi' => $registrasi->kode_registrasi,
             'tanggal' => now(),
             'expired_at' => Carbon::parse($registrasi->registered_at ?? now())->addHours(6),
-
             'keterangan' => 'Reserve stok dari registrasi layanan',
             'created_by' => $this->username(),
         ]);
@@ -1203,9 +1335,7 @@ class RegistrasiLayananController extends Controller
 
     private function resolveTempatProdukId(array $item, array $ids)
     {
-        $explicitTempatId = $item['tempat_produk_id']
-            ?? $item['tempat_produk_id']
-            ?? null;
+        $explicitTempatId = $item['tempat_produk_id'] ?? null;
 
         if (!empty($explicitTempatId)) {
             return (int) $explicitTempatId;
@@ -1222,11 +1352,10 @@ class RegistrasiLayananController extends Controller
                     ->first();
 
                 if ($produkToko) {
-                    if (Schema::hasColumn($produkTokoTable, 'tempat_produk_id') && !empty($produkToko->tempat_produk_id)) {
-                        return (int) $produkToko->tempat_produk_id;
-                    }
-
-                    if (Schema::hasColumn($produkTokoTable, 'tempat_produk_id') && !empty($produkToko->tempat_produk_id)) {
+                    if (
+                        Schema::hasColumn($produkTokoTable, 'tempat_produk_id')
+                        && !empty($produkToko->tempat_produk_id)
+                    ) {
                         return (int) $produkToko->tempat_produk_id;
                     }
 
@@ -1261,11 +1390,10 @@ class RegistrasiLayananController extends Controller
             return null;
         }
 
-        if (Schema::hasColumn('master_produk', 'tempat_produk_id') && !empty($produk->tempat_produk_id)) {
-            return (int) $produk->tempat_produk_id;
-        }
-
-        if (Schema::hasColumn('master_produk', 'tempat_produk_id') && !empty($produk->tempat_produk_id)) {
+        if (
+            Schema::hasColumn('master_produk', 'tempat_produk_id')
+            && !empty($produk->tempat_produk_id)
+        ) {
             return (int) $produk->tempat_produk_id;
         }
 
@@ -1277,18 +1405,16 @@ class RegistrasiLayananController extends Controller
         $result = [];
 
         foreach ($items as $item) {
-            $treatmentTokoId =
-                $item['treatment_toko_id'] ??
-                $item['master_treatment_toko_id'] ??
-                $item['tindakan_toko_id'] ??
-                $item['toko_treatment_id'] ??
-                null;
+            $treatmentTokoId = $item['treatment_toko_id']
+                ?? $item['master_treatment_toko_id']
+                ?? $item['tindakan_toko_id']
+                ?? $item['toko_treatment_id']
+                ?? null;
 
-            $treatmentId =
-                $item['treatment_id'] ??
-                $item['tindakan_id'] ??
-                $item['master_treatment_id'] ??
-                null;
+            $treatmentId = $item['treatment_id']
+                ?? $item['tindakan_id']
+                ?? $item['master_treatment_id']
+                ?? null;
 
             $candidateId = $item['id'] ?? null;
 
@@ -1324,18 +1450,16 @@ class RegistrasiLayananController extends Controller
         $result = [];
 
         foreach ($items as $item) {
-            $produkTokoId =
-                $item['produk_toko_id'] ??
-                $item['master_produk_toko_id'] ??
-                $item['obat_toko_id'] ??
-                $item['toko_produk_id'] ??
-                null;
+            $produkTokoId = $item['produk_toko_id']
+                ?? $item['master_produk_toko_id']
+                ?? $item['obat_toko_id']
+                ?? $item['toko_produk_id']
+                ?? null;
 
-            $produkId =
-                $item['produk_id'] ??
-                $item['obat_id'] ??
-                $item['master_produk_id'] ??
-                null;
+            $produkId = $item['produk_id']
+                ?? $item['obat_id']
+                ?? $item['master_produk_id']
+                ?? null;
 
             $candidateId = $item['id'] ?? null;
 
@@ -1368,18 +1492,16 @@ class RegistrasiLayananController extends Controller
 
     private function resolveTreatmentIds(array $item, $tokoId = null)
     {
-        $treatmentTokoId =
-            $item['treatment_toko_id'] ??
-            $item['master_treatment_toko_id'] ??
-            $item['tindakan_toko_id'] ??
-            $item['toko_treatment_id'] ??
-            null;
+        $treatmentTokoId = $item['treatment_toko_id']
+            ?? $item['master_treatment_toko_id']
+            ?? $item['tindakan_toko_id']
+            ?? $item['toko_treatment_id']
+            ?? null;
 
-        $treatmentId =
-            $item['treatment_id'] ??
-            $item['tindakan_id'] ??
-            $item['master_treatment_id'] ??
-            null;
+        $treatmentId = $item['treatment_id']
+            ?? $item['tindakan_id']
+            ?? $item['master_treatment_id']
+            ?? null;
 
         $candidateId = $item['candidate_id'] ?? $item['id'] ?? null;
 
@@ -1425,28 +1547,25 @@ class RegistrasiLayananController extends Controller
 
         return [
             'treatment_toko_id' => $row?->id ?? $treatmentTokoId,
-            'treatment_id' =>
-                $row?->treatment_id ??
-                $row?->master_treatment_id ??
-                $treatmentId ??
-                null,
+            'treatment_id' => $row?->treatment_id
+                ?? $row?->master_treatment_id
+                ?? $treatmentId
+                ?? null,
         ];
     }
 
     private function resolveProdukIds(array $item, $tokoId = null)
     {
-        $produkTokoId =
-            $item['produk_toko_id'] ??
-            $item['master_produk_toko_id'] ??
-            $item['obat_toko_id'] ??
-            $item['toko_produk_id'] ??
-            null;
+        $produkTokoId = $item['produk_toko_id']
+            ?? $item['master_produk_toko_id']
+            ?? $item['obat_toko_id']
+            ?? $item['toko_produk_id']
+            ?? null;
 
-        $produkId =
-            $item['produk_id'] ??
-            $item['obat_id'] ??
-            $item['master_produk_id'] ??
-            null;
+        $produkId = $item['produk_id']
+            ?? $item['obat_id']
+            ?? $item['master_produk_id']
+            ?? null;
 
         $candidateId = $item['candidate_id'] ?? $item['id'] ?? null;
 
@@ -1496,12 +1615,11 @@ class RegistrasiLayananController extends Controller
 
         return [
             'produk_toko_id' => $row?->id ?? $produkTokoId,
-            'produk_id' =>
-                $row?->produk_id ??
-                $row?->master_produk_id ??
-                $row?->obat_id ??
-                $produkId ??
-                null,
+            'produk_id' => $row?->produk_id
+                ?? $row?->master_produk_id
+                ?? $row?->obat_id
+                ?? $produkId
+                ?? null,
         ];
     }
 
@@ -1611,6 +1729,99 @@ class RegistrasiLayananController extends Controller
         };
     }
 
+    private function putIfColumn(array &$payload, string $table, string $column, $value): void
+    {
+        if (Schema::hasColumn($table, $column)) {
+            $payload[$column] = $value;
+        }
+    }
+
+    private function resolveChannelKonsultasiFromMapping(
+        bool $adaKonsultasi,
+        ?string $channelKonsultasi,
+        ?string $sourceCode
+    ): string {
+        if (!$adaKonsultasi) {
+            return RegistrasiKunjungan::CHANNEL_TIDAK_KONSULTASI;
+        }
+
+        if ($channelKonsultasi === 'online') {
+            return RegistrasiKunjungan::CHANNEL_ONLINE;
+        }
+
+        if ($channelKonsultasi === 'offline') {
+            return RegistrasiKunjungan::CHANNEL_OFFLINE;
+        }
+
+        if (str_contains(strtoupper((string) $sourceCode), 'ONLINE')) {
+            return RegistrasiKunjungan::CHANNEL_ONLINE;
+        }
+
+        return RegistrasiKunjungan::CHANNEL_OFFLINE;
+    }
+
+    private function resolveTotalKonsultasi(
+        bool $adaKonsultasi,
+        bool $adaTreatment,
+        ?MasterAccurateItemMapping $mapping
+    ): float {
+        if (!$adaKonsultasi || !$mapping) {
+            return 0;
+        }
+
+        if ($adaTreatment) {
+            return 0;
+        }
+
+        if (!$this->toBool($mapping->is_billable ?? false)) {
+            return 0;
+        }
+
+        return (float) ($mapping->default_harga ?? 0);
+    }
+
+    private function resolveRuleBiayaKonsultasi(
+        bool $adaKonsultasi,
+        bool $adaTreatment,
+        float $totalKonsultasi
+    ): int {
+        if (!$adaKonsultasi) {
+            return 0;
+        }
+
+        if ($adaTreatment) {
+            return 2;
+        }
+
+        if ($totalKonsultasi > 0) {
+            return 1;
+        }
+
+        return 3;
+    }
+
+    private function resolveCatatanBiayaKonsultasi(
+        bool $adaKonsultasi,
+        bool $adaTreatment,
+        float $totalKonsultasi,
+        ?MasterAccurateItemMapping $mapping
+    ): ?string {
+        if (!$adaKonsultasi) {
+            return null;
+        }
+
+        if ($adaTreatment) {
+            return 'Biaya konsultasi Rp 0 karena konsultasi digabung dengan treatment.';
+        }
+
+        if ($totalKonsultasi > 0) {
+            return 'Biaya konsultasi mengikuti master mapping: '
+                . ($mapping?->source_name ?? $mapping?->source_code ?? '-');
+        }
+
+        return 'Biaya konsultasi Rp 0 sesuai master mapping.';
+    }
+
     private function generateKodeRegistrasi($tokoId, $tanggal)
     {
         $date = Carbon::parse($tanggal)->format('Ymd');
@@ -1621,10 +1832,8 @@ class RegistrasiLayananController extends Controller
             ->count() + 1;
 
         return 'REG-' .
-            $date .
-            '-' .
-            str_pad($tokoId, 2, '0', STR_PAD_LEFT) .
-            '-' .
+            $date . '-' .
+            str_pad($tokoId, 2, '0', STR_PAD_LEFT) . '-' .
             str_pad($count, 4, '0', STR_PAD_LEFT);
     }
 

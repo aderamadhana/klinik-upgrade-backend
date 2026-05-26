@@ -48,4 +48,16 @@ class MasterAccurateItemMapping extends BaseMasterModel
         return $query->where('source_type', $sourceType)
             ->where('source_code', $sourceCode);
     }
+
+    public static function findActiveBySourceCode(?string $sourceCode): ?self
+    {
+        if (!$sourceCode) {
+            return null;
+        }
+
+        return static::query()
+            ->active()
+            ->where('source_code', $sourceCode)
+            ->first();
+    }
 }
