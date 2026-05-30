@@ -1,6 +1,7 @@
 <?php
 
 namespace App\Models\Registrasi;
+use App\Models\Pembayaran\PembayaranInvoice;
 
 class RegistrasiKunjungan extends BaseRegistrasiModel
 {
@@ -96,6 +97,17 @@ class RegistrasiKunjungan extends BaseRegistrasiModel
     public function penjualanDetails()
     {
         return $this->hasMany(RegistrasiPenjualanDetail::class, 'registrasi_id');
+    }
+
+    public function pembayaranInvoices()
+    {
+        return $this->hasMany(PembayaranInvoice::class, 'registrasi_id');
+    }
+
+    public function pembayaranInvoiceAktif()
+    {
+        return $this->hasOne(PembayaranInvoice::class, 'registrasi_id')
+            ->where('is_delete', 0);
     }
 
     public function perawatCppts()
