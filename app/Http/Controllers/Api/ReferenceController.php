@@ -837,8 +837,7 @@ class ReferenceController extends Controller
 
                     'label' => trim(
                         ($item->no_rm ? $item->no_rm . ' - ' : '') .
-                        $item->nama .
-                        ($item->no_hp ? ' - ' . $item->no_hp : '')
+                        $item->nama
                     ),
                     'value' => $item->id,
                 ];
@@ -1163,19 +1162,30 @@ class ReferenceController extends Controller
     public function accurateItemMapping(Request $request)
     {
         $query = MasterAccurateItemMapping::query()
-            ->active();
+            ->where(function ($q) {
+                $q->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            })
+            ->where(function ($q) {
+                $q->where('is_active', 1)
+                    ->orWhereNull('is_active');
+            });
 
         if ($request->filled('source_type')) {
-            $query->where('source_type', $request->source_type);
+            $sourceTypes = collect(explode(',', (string) $request->source_type))
+                ->map(fn ($item) => trim(strtolower($item)))
+                ->filter()
+                ->values()
+                ->all();
+
+            if (!empty($sourceTypes)) {
+                $query->whereIn('source_type', $sourceTypes);
+            }
         }
 
-        if ($request->filled('source_code')) {
-            $query->where('source_code', $request->source_code);
-        }
-
-        $rows = $query
-            ->orderBy('sort_order', 'asc')
-            ->orderBy('source_name', 'asc')
+        $data = $query
+            ->orderBy('sort_order')
+            ->orderBy('id')
             ->get([
                 'id',
                 'source_type',
@@ -1190,12 +1200,13 @@ class ReferenceController extends Controller
                 'is_send_to_accurate',
                 'send_when_zero',
                 'sort_order',
+                'is_active',
             ]);
 
         return response()->json([
             'status' => true,
-            'message' => 'Data mapping Accurate berhasil diambil.',
-            'data' => $rows,
+            'message' => 'Data mapping Accurate berhasil diambil',
+            'data' => $data,
         ]);
     }
 }

@@ -33,12 +33,29 @@ class RegistrasiLayananController extends Controller
 
     public function index(Request $request)
     {
+        $perPage = (int) $request->get('per_page', 15);
+
+        if ($perPage <= 0) {
+            $perPage = 15;
+        }
+
+        if ($perPage > 100) {
+            $perPage = 100;
+        }
+
+        $registrasiTable = (new RegistrasiKunjungan())->getTable();
+
         $query = RegistrasiKunjungan::query()
             ->with([
                 'toko:id,nama_toko',
                 'pasien:id,no_rm,nama,no_hp',
                 'dokterAwal:id,nama',
                 'perawatAwal:id,nama',
+            ])
+            ->withCount([
+                'tasks',
+                'treatmentDetails',
+                'penjualanDetails',
             ])
             ->active();
 
@@ -50,6 +67,14 @@ class RegistrasiLayananController extends Controller
             $query->whereDate('tanggal_kunjungan', $request->tanggal);
         }
 
+        if ($request->filled('tanggal_mulai')) {
+            $query->whereDate('tanggal_kunjungan', '>=', $request->tanggal_mulai);
+        }
+
+        if ($request->filled('tanggal_akhir')) {
+            $query->whereDate('tanggal_kunjungan', '<=', $request->tanggal_akhir);
+        }
+
         if ($request->filled('status')) {
             $query->where('status', $request->status);
         }
@@ -58,11 +83,43 @@ class RegistrasiLayananController extends Controller
             $query->where('current_task', $request->current_task);
         }
 
+        if ($request->filled('layanan')) {
+            $layanan = strtolower(trim((string) $request->layanan));
+
+            $query->where(function ($q) use ($layanan, $registrasiTable) {
+                if ($layanan === 'konsultasi') {
+                    if (Schema::hasColumn($registrasiTable, 'is_konsultasi')) {
+                        $q->orWhere('is_konsultasi', 1);
+                    }
+
+                    $q->orWhereNotNull('konsultasi_source_code')
+                        ->orWhere(function ($sub) {
+                            $sub->whereNotNull('channel_konsultasi')
+                                ->where('channel_konsultasi', '<>', 0);
+                        });
+                }
+
+                if ($layanan === 'treatment') {
+                    $q->where('is_treatment', 1);
+                }
+
+                if ($layanan === 'penjualan') {
+                    $q->where('is_penjualan', 1);
+                }
+
+                if ($layanan === 'pembelian_online') {
+                    $q->where('is_pembelian_online', 1);
+                }
+            });
+        }
+
         if ($request->filled('search')) {
-            $search = trim($request->search);
+            $search = trim((string) $request->search);
 
             $query->where(function ($q) use ($search) {
                 $q->where('kode_registrasi', 'like', "%{$search}%")
+                    ->orWhere('konsultasi_source_code', 'like', "%{$search}%")
+                    ->orWhere('konsultasi_source_name', 'like', "%{$search}%")
                     ->orWhereHas('pasien', function ($p) use ($search) {
                         $p->where('nama', 'like', "%{$search}%")
                             ->orWhere('no_rm', 'like', "%{$search}%")
@@ -70,6 +127,9 @@ class RegistrasiLayananController extends Controller
                     })
                     ->orWhereHas('dokterAwal', function ($d) use ($search) {
                         $d->where('nama', 'like', "%{$search}%");
+                    })
+                    ->orWhereHas('perawatAwal', function ($p) use ($search) {
+                        $p->where('nama', 'like', "%{$search}%");
                     });
             });
         }
@@ -77,7 +137,265 @@ class RegistrasiLayananController extends Controller
         $rows = $query
             ->orderByDesc('registered_at')
             ->orderByDesc('id')
-            ->paginate($request->get('per_page', 15));
+            ->paginate($perPage);
+
+        $sourceCodes = collect($rows->items())
+            ->pluck('konsultasi_source_code')
+            ->filter()
+            ->map(fn ($value) => strtoupper(trim((string) $value)))
+            ->unique()
+            ->values()
+            ->all();
+
+        $mappingCodes = collect($sourceCodes)
+            ->push('PEMBELIAN_ONLINE')
+            ->unique()
+            ->values()
+            ->all();
+
+        $accurateMappings = MasterAccurateItemMapping::query()
+            ->whereIn('source_code', $mappingCodes)
+            ->where(function ($q) {
+                $q->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            })
+            ->where(function ($q) {
+                $q->where('is_active', 1)
+                    ->orWhereNull('is_active');
+            })
+            ->get()
+            ->keyBy(fn ($item) => strtoupper((string) $item->source_code));
+
+        $toBool = function ($value): bool {
+            return $value === true
+                || $value === 1
+                || $value === '1'
+                || strtolower((string) $value) === 'true';
+        };
+
+        $channelLabel = function ($channel, ?string $sourceCode = null): string {
+            $normalized = strtolower((string) $channel);
+            $source = strtoupper((string) $sourceCode);
+
+            if ($normalized === '2' || $normalized === 'online' || str_contains($source, 'ONLINE')) {
+                return 'Konsultasi Online';
+            }
+
+            if ($normalized === '1' || $normalized === 'offline' || $source) {
+                if (str_contains($source, 'SPPG')) {
+                    return 'Konsultasi SPPG';
+                }
+
+                if (str_contains($source, 'SPKK')) {
+                    return 'Konsultasi SPKK';
+                }
+
+                return 'Konsultasi Offline';
+            }
+
+            return '-';
+        };
+
+        $statusLabel = function ($status): array {
+            return match ((int) $status) {
+                1 => [
+                    'value' => 1,
+                    'label' => 'Aktif',
+                    'color' => 'primary',
+                    'icon' => 'mdi-progress-clock',
+                ],
+                2 => [
+                    'value' => 2,
+                    'label' => 'Selesai',
+                    'color' => 'success',
+                    'icon' => 'mdi-check-circle-outline',
+                ],
+                9 => [
+                    'value' => 9,
+                    'label' => 'Batal',
+                    'color' => 'error',
+                    'icon' => 'mdi-close-circle-outline',
+                ],
+                default => [
+                    'value' => (int) $status,
+                    'label' => 'Draft',
+                    'color' => 'grey',
+                    'icon' => 'mdi-file-outline',
+                ],
+            };
+        };
+
+        $taskLabel = function ($task): array {
+            return match ((int) $task) {
+                1 => [
+                    'value' => 1,
+                    'label' => 'Konsultasi',
+                    'color' => 'primary',
+                    'icon' => 'mdi-stethoscope',
+                ],
+                2 => [
+                    'value' => 2,
+                    'label' => 'Treatment',
+                    'color' => 'success',
+                    'icon' => 'mdi-face-woman-shimmer-outline',
+                ],
+                3 => [
+                    'value' => 3,
+                    'label' => 'Nurse Station',
+                    'color' => 'teal',
+                    'icon' => 'mdi-account-heart-outline',
+                ],
+                4 => [
+                    'value' => 4,
+                    'label' => 'Pembayaran',
+                    'color' => 'info',
+                    'icon' => 'mdi-cash-register',
+                ],
+                5 => [
+                    'value' => 5,
+                    'label' => 'Selesai',
+                    'color' => 'success',
+                    'icon' => 'mdi-check-all',
+                ],
+                default => [
+                    'value' => (int) $task,
+                    'label' => 'Draft',
+                    'color' => 'grey',
+                    'icon' => 'mdi-file-outline',
+                ],
+            };
+        };
+
+        $mappingPayload = function ($mapping) {
+            if (!$mapping) {
+                return null;
+            }
+
+            return [
+                'id' => $mapping->id,
+                'source_type' => $mapping->source_type,
+                'source_code' => $mapping->source_code,
+                'source_name' => $mapping->source_name,
+                'legacy_treatment_id' => $mapping->legacy_treatment_id,
+                'legacy_treatment_name' => $mapping->legacy_treatment_name,
+                'kode_accurate' => $mapping->kode_accurate,
+                'nama_accurate' => $mapping->nama_accurate,
+                'default_harga' => (float) ($mapping->default_harga ?? 0),
+                'is_billable' => (int) ($mapping->is_billable ?? 0),
+                'is_send_to_accurate' => (int) ($mapping->is_send_to_accurate ?? 0),
+                'send_when_zero' => (int) ($mapping->send_when_zero ?? 0),
+            ];
+        };
+
+        $rows->getCollection()->transform(function ($row) use (
+            $accurateMappings,
+            $toBool,
+            $channelLabel,
+            $statusLabel,
+            $taskLabel,
+            $mappingPayload
+        ) {
+            $sourceCode = strtoupper(trim((string) $row->konsultasi_source_code));
+            $konsultasiMapping = $sourceCode
+                ? ($accurateMappings[$sourceCode] ?? null)
+                : null;
+
+            $isPembelianOnline = $toBool($row->is_pembelian_online ?? false);
+            $pembelianOnlineMapping = $isPembelianOnline
+                ? ($accurateMappings['PEMBELIAN_ONLINE'] ?? null)
+                : null;
+
+            $hasConsultation = !empty($row->konsultasi_source_code)
+                || !empty($row->konsultasi_source_name)
+                || !empty($row->channel_konsultasi);
+
+            $status = $statusLabel($row->status);
+            $currentTask = $taskLabel($row->current_task);
+
+            return [
+                'id' => $row->id,
+                'kode_registrasi' => $row->kode_registrasi,
+                'toko_id' => $row->toko_id,
+                'toko_nama' => $row->toko?->nama_toko,
+
+                'tanggal_kunjungan' => $row->tanggal_kunjungan,
+                'registered_at' => $row->registered_at,
+                'created_at' => $row->created_at,
+                'updated_at' => $row->updated_at,
+
+                'pasien_id' => $row->pasien_id,
+                'pasien' => $row->pasien ? [
+                    'id' => $row->pasien->id,
+                    'no_rm' => $row->pasien->no_rm,
+                    'nama' => $row->pasien->nama,
+                    'no_hp' => $row->pasien->no_hp,
+                ] : null,
+
+                'dokter_awal_id' => $row->dokter_awal_id,
+                'dokter_awal' => $row->dokterAwal ? [
+                    'id' => $row->dokterAwal->id,
+                    'nama' => $row->dokterAwal->nama,
+                ] : null,
+
+                'perawat_awal_id' => $row->perawat_awal_id,
+                'perawat_awal' => $row->perawatAwal ? [
+                    'id' => $row->perawatAwal->id,
+                    'nama' => $row->perawatAwal->nama,
+                ] : null,
+
+                'channel_konsultasi' => $row->channel_konsultasi,
+                'channel_konsultasi_label' => $channelLabel(
+                    $row->channel_konsultasi,
+                    $row->konsultasi_source_code
+                ),
+
+                'konsultasi_source_code' => $row->konsultasi_source_code,
+                'konsultasi_source_name' => $row->konsultasi_source_name,
+                'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
+
+                'is_konsultasi' => $hasConsultation ? 1 : 0,
+                'is_treatment' => (int) ($row->is_treatment ?? 0),
+                'is_penjualan' => (int) ($row->is_penjualan ?? 0),
+                'is_pembelian_online' => $isPembelianOnline ? 1 : 0,
+                'pembelian_online_mapping' => $mappingPayload($pembelianOnlineMapping),
+
+                'perlu_tindakan_perawat' => (int) ($row->perlu_tindakan_perawat ?? 0),
+                'current_task' => (int) ($row->current_task ?? 0),
+                'current_task_label' => $currentTask,
+                'status' => (int) ($row->status ?? 0),
+                'status_label' => $status,
+
+                'total_treatment' => (float) ($row->total_treatment ?? 0),
+                'total_penjualan' => (float) ($row->total_penjualan ?? 0),
+                'total_konsultasi' => (float) ($row->total_konsultasi ?? 0),
+                'grand_total' => (float) ($row->grand_total ?? 0),
+                'rule_biaya_konsultasi' => (int) ($row->rule_biaya_konsultasi ?? 0),
+                'catatan_biaya_konsultasi' => $row->catatan_biaya_konsultasi,
+                'catatan_registrasi' => $row->catatan_registrasi,
+
+                'tasks_count' => (int) ($row->tasks_count ?? 0),
+                'treatment_details_count' => (int) ($row->treatment_details_count ?? 0),
+                'penjualan_details_count' => (int) ($row->penjualan_details_count ?? 0),
+
+                'layanan' => [
+                    'ada_konsultasi' => $hasConsultation ? 1 : 0,
+                    'channel_konsultasi' => $row->channel_konsultasi,
+                    'channel_label' => $channelLabel(
+                        $row->channel_konsultasi,
+                        $row->konsultasi_source_code
+                    ),
+                    'konsultasi_source_code' => $row->konsultasi_source_code,
+                    'konsultasi_source_name' => $row->konsultasi_source_name,
+                    'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
+
+                    'ada_treatment' => (int) ($row->is_treatment ?? 0),
+                    'ada_penjualan' => (int) ($row->is_penjualan ?? 0),
+
+                    'is_pembelian_online' => $isPembelianOnline ? 1 : 0,
+                    'pembelian_online_mapping' => $mappingPayload($pembelianOnlineMapping),
+                ],
+            ];
+        });
 
         return response()->json([
             'status' => true,
@@ -90,29 +408,302 @@ class RegistrasiLayananController extends Controller
     {
         $row = RegistrasiKunjungan::query()
             ->with([
-                'toko',
-                'pasien',
-                'dokterAwal',
-                'perawatAwal',
-                'tasks.assignedKaryawan',
-                'konsultasiIntake.fotos',
-                'konsultasiFotos',
-                'dokterSoap.resepDetails',
-                'treatmentDetails.treatment',
-                'treatmentDetails.treatmentToko',
-                'penjualanDetails.produk',
-                'penjualanDetails.produkToko',
-                'perawatCppts',
-                'beforeAfterFotos',
-                'bahanTreatmentDetails',
+                'toko:id,nama_toko',
+                'pasien:id,no_rm,nama,no_hp',
+                'dokterAwal:id,nama',
+                'perawatAwal:id,nama',
+                'tasks',
+                'treatmentDetails',
+                'penjualanDetails',
             ])
             ->active()
             ->findOrFail($id);
 
+        $sourceCodes = collect([
+                $row->konsultasi_source_code,
+                $row->is_pembelian_online ? 'PEMBELIAN_ONLINE' : null,
+            ])
+            ->filter()
+            ->map(fn ($value) => strtoupper(trim((string) $value)))
+            ->unique()
+            ->values()
+            ->all();
+
+        $accurateMappings = MasterAccurateItemMapping::query()
+            ->whereIn('source_code', $sourceCodes)
+            ->where(function ($q) {
+                $q->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            })
+            ->where(function ($q) {
+                $q->where('is_active', 1)
+                    ->orWhereNull('is_active');
+            })
+            ->get()
+            ->keyBy(fn ($item) => strtoupper((string) $item->source_code));
+
+        $toBool = function ($value): bool {
+            return $value === true
+                || $value === 1
+                || $value === '1'
+                || strtolower((string) $value) === 'true';
+        };
+
+        $channelLabel = function ($channel, ?string $sourceCode = null): string {
+            $normalized = strtolower((string) $channel);
+            $source = strtoupper((string) $sourceCode);
+
+            if ($normalized === '2' || $normalized === 'online' || str_contains($source, 'ONLINE')) {
+                return 'Konsultasi Online';
+            }
+
+            if ($normalized === '1' || $normalized === 'offline' || $source) {
+                if (str_contains($source, 'SPPG')) {
+                    return 'Konsultasi SPPG';
+                }
+
+                if (str_contains($source, 'SPKK')) {
+                    return 'Konsultasi SPKK';
+                }
+
+                return 'Konsultasi Offline';
+            }
+
+            return '-';
+        };
+
+        $statusLabel = function ($status): array {
+            return match ((int) $status) {
+                1 => [
+                    'value' => 1,
+                    'label' => 'Aktif',
+                    'color' => 'primary',
+                    'icon' => 'mdi-progress-clock',
+                ],
+                2 => [
+                    'value' => 2,
+                    'label' => 'Selesai',
+                    'color' => 'success',
+                    'icon' => 'mdi-check-circle-outline',
+                ],
+                9 => [
+                    'value' => 9,
+                    'label' => 'Batal',
+                    'color' => 'error',
+                    'icon' => 'mdi-close-circle-outline',
+                ],
+                default => [
+                    'value' => (int) $status,
+                    'label' => 'Draft',
+                    'color' => 'grey',
+                    'icon' => 'mdi-file-outline',
+                ],
+            };
+        };
+
+        $taskLabel = function ($task): array {
+            return match ((int) $task) {
+                1 => [
+                    'value' => 1,
+                    'label' => 'Konsultasi',
+                    'color' => 'primary',
+                    'icon' => 'mdi-stethoscope',
+                ],
+                2 => [
+                    'value' => 2,
+                    'label' => 'Treatment',
+                    'color' => 'success',
+                    'icon' => 'mdi-face-woman-shimmer-outline',
+                ],
+                3 => [
+                    'value' => 3,
+                    'label' => 'Nurse Station',
+                    'color' => 'teal',
+                    'icon' => 'mdi-account-heart-outline',
+                ],
+                4 => [
+                    'value' => 4,
+                    'label' => 'Pembayaran',
+                    'color' => 'info',
+                    'icon' => 'mdi-cash-register',
+                ],
+                5 => [
+                    'value' => 5,
+                    'label' => 'Selesai',
+                    'color' => 'success',
+                    'icon' => 'mdi-check-all',
+                ],
+                default => [
+                    'value' => (int) $task,
+                    'label' => 'Draft',
+                    'color' => 'grey',
+                    'icon' => 'mdi-file-outline',
+                ],
+            };
+        };
+
+        $mappingPayload = function ($mapping) {
+            if (!$mapping) {
+                return null;
+            }
+
+            return [
+                'id' => $mapping->id,
+                'source_type' => $mapping->source_type,
+                'source_code' => $mapping->source_code,
+                'source_name' => $mapping->source_name,
+                'legacy_treatment_id' => $mapping->legacy_treatment_id,
+                'legacy_treatment_name' => $mapping->legacy_treatment_name,
+                'kode_accurate' => $mapping->kode_accurate,
+                'nama_accurate' => $mapping->nama_accurate,
+                'default_harga' => (float) ($mapping->default_harga ?? 0),
+                'is_billable' => (int) ($mapping->is_billable ?? 0),
+                'is_send_to_accurate' => (int) ($mapping->is_send_to_accurate ?? 0),
+                'send_when_zero' => (int) ($mapping->send_when_zero ?? 0),
+            ];
+        };
+
+        $sourceCode = strtoupper(trim((string) $row->konsultasi_source_code));
+
+        $konsultasiMapping = $sourceCode
+            ? ($accurateMappings[$sourceCode] ?? null)
+            : null;
+
+        $isPembelianOnline = $toBool($row->is_pembelian_online ?? false);
+
+        $pembelianOnlineMapping = $isPembelianOnline
+            ? ($accurateMappings['PEMBELIAN_ONLINE'] ?? null)
+            : null;
+
+        $hasConsultation = !empty($row->konsultasi_source_code)
+            || !empty($row->konsultasi_source_name)
+            || !empty($row->channel_konsultasi);
+
+        $payload = [
+            'id' => $row->id,
+            'kode_registrasi' => $row->kode_registrasi,
+            'toko_id' => $row->toko_id,
+            'toko_nama' => $row->toko?->nama_toko,
+            'toko' => $row->toko ? [
+                'id' => $row->toko->id,
+                'nama_toko' => $row->toko->nama_toko,
+            ] : null,
+
+            'tanggal_kunjungan' => $row->tanggal_kunjungan,
+            'registered_at' => $row->registered_at,
+            'created_at' => $row->created_at,
+            'updated_at' => $row->updated_at,
+
+            'pasien_id' => $row->pasien_id,
+            'pasien_new_id' => $row->pasien_id,
+            'pasien' => $row->pasien ? [
+                'id' => $row->pasien->id,
+                'no_rm' => $row->pasien->no_rm,
+                'nama' => $row->pasien->nama,
+                'no_hp' => $row->pasien->no_hp,
+            ] : null,
+
+            'dokter_awal_id' => $row->dokter_awal_id,
+            'dokter_awal' => $row->dokterAwal ? [
+                'id' => $row->dokterAwal->id,
+                'nama' => $row->dokterAwal->nama,
+            ] : null,
+
+            'perawat_awal_id' => $row->perawat_awal_id,
+            'perawat_awal' => $row->perawatAwal ? [
+                'id' => $row->perawatAwal->id,
+                'nama' => $row->perawatAwal->nama,
+            ] : null,
+
+            'channel_konsultasi' => $row->channel_konsultasi,
+            'channel_konsultasi_label' => $channelLabel(
+                $row->channel_konsultasi,
+                $row->konsultasi_source_code
+            ),
+
+            'konsultasi_source_code' => $row->konsultasi_source_code,
+            'konsultasi_source_name' => $row->konsultasi_source_name,
+            'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
+
+            'is_konsultasi' => $hasConsultation ? 1 : 0,
+            'is_treatment' => (int) ($row->is_treatment ?? 0),
+            'is_penjualan' => (int) ($row->is_penjualan ?? 0),
+            'is_pembelian_online' => $isPembelianOnline ? 1 : 0,
+            'pembelian_online_mapping' => $mappingPayload($pembelianOnlineMapping),
+
+            'perlu_tindakan_perawat' => (int) ($row->perlu_tindakan_perawat ?? 0),
+            'current_task' => (int) ($row->current_task ?? 0),
+            'current_task_label' => $taskLabel($row->current_task),
+            'status' => (int) ($row->status ?? 0),
+            'status_label' => $statusLabel($row->status),
+
+            'total_treatment' => (float) ($row->total_treatment ?? 0),
+            'total_penjualan' => (float) ($row->total_penjualan ?? 0),
+            'total_konsultasi' => (float) ($row->total_konsultasi ?? 0),
+            'grand_total' => (float) ($row->grand_total ?? 0),
+            'rule_biaya_konsultasi' => (int) ($row->rule_biaya_konsultasi ?? 0),
+            'catatan_biaya_konsultasi' => $row->catatan_biaya_konsultasi,
+            'catatan_registrasi' => $row->catatan_registrasi,
+
+            'layanan' => [
+                'ada_konsultasi' => $hasConsultation ? 1 : 0,
+                'channel_konsultasi' => $row->channel_konsultasi,
+                'channel_label' => $channelLabel(
+                    $row->channel_konsultasi,
+                    $row->konsultasi_source_code
+                ),
+                'konsultasi_source_code' => $row->konsultasi_source_code,
+                'konsultasi_source_name' => $row->konsultasi_source_name,
+                'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
+
+                'ada_treatment' => (int) ($row->is_treatment ?? 0),
+                'ada_penjualan' => (int) ($row->is_penjualan ?? 0),
+
+                'is_pembelian_online' => $isPembelianOnline ? 1 : 0,
+                'pembelian_online_mapping' => $mappingPayload($pembelianOnlineMapping),
+            ],
+
+            'tasks' => $row->tasks->map(function ($task) use ($taskLabel) {
+                return [
+                    'id' => $task->id,
+                    'task_type' => $task->task_type ?? $task->current_task ?? null,
+                    'task_label' => $task->task_label ?? $taskLabel($task->task_type ?? $task->current_task ?? null)['label'],
+                    'status' => $task->status ?? null,
+                    'started_at' => $task->started_at ?? null,
+                    'finished_at' => $task->finished_at ?? null,
+                ];
+            })->values(),
+
+            'treatment_details' => $row->treatmentDetails->map(function ($item) {
+                return [
+                    'id' => $item->id,
+                    'treatment_id' => $item->treatment_id ?? $item->master_treatment_id ?? null,
+                    'treatment_toko_id' => $item->treatment_toko_id ?? $item->master_treatment_toko_id ?? null,
+                    'nama_treatment' => $item->nama_treatment ?? $item->treatment_nama ?? $item->nama ?? null,
+                    'harga' => (float) ($item->harga ?? $item->harga_treatment ?? $item->treatment_harga ?? 0),
+                    'jumlah' => (float) ($item->jumlah ?? $item->qty ?? 1),
+                    'total' => (float) ($item->total ?? $item->subtotal ?? $item->total_harga ?? 0),
+                ];
+            })->values(),
+
+            'penjualan_details' => $row->penjualanDetails->map(function ($item) {
+                return [
+                    'id' => $item->id,
+                    'produk_id' => $item->produk_id ?? $item->obat_id ?? $item->master_produk_id ?? null,
+                    'produk_toko_id' => $item->produk_toko_id ?? $item->master_produk_toko_id ?? null,
+                    'nama_produk' => $item->nama_produk ?? $item->produk_nama ?? $item->nama_obat_bahan ?? $item->nama ?? null,
+                    'harga' => (float) ($item->harga ?? $item->harga_jual ?? 0),
+                    'jumlah' => (float) ($item->jumlah ?? $item->qty ?? 1),
+                    'diskon_nilai' => (float) ($item->diskon_nilai ?? $item->diskon ?? 0),
+                    'subtotal' => (float) ($item->subtotal ?? $item->total ?? $item->total_harga ?? 0),
+                ];
+            })->values(),
+        ];
+
         return response()->json([
             'status' => true,
             'message' => 'Detail registrasi berhasil diambil',
-            'data' => $row,
+            'data' => $payload,
         ]);
     }
 
@@ -277,7 +868,7 @@ class RegistrasiLayananController extends Controller
                 ], 422);
             }
 
-            if (strtolower((string) $pembelianOnlineMapping->source_type) !== 'channel') {
+            if (strtolower((string) $pembelianOnlineMapping->source_type) !== 'pembelian') {
                 return response()->json([
                     'status' => false,
                     'message' => 'Source type mapping pembelian online tidak valid.',

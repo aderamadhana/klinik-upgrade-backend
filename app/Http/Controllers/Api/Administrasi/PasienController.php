@@ -354,6 +354,40 @@ class PasienController extends Controller
             ) {
                 $validator->errors()->add('status_pernikahan', 'Status pernikahan tidak valid');
             }
+
+            $this->validateDigitsField(
+                $validator,
+                'no_identitas',
+                $request->input('no_identitas'),
+                16,
+                'KTP/SIM/Passport',
+                true
+            );
+
+            $this->validateDigitsField(
+                $validator,
+                'no_telp',
+                $request->input('no_telp'),
+                10,
+                'No. Telp',
+                false
+            );
+
+            $this->validateMobilePhone62(
+                $validator,
+                'no_hp',
+                $request->input('no_hp'),
+                'No. HP',
+                true
+            );
+
+            $this->validateMobilePhone62(
+                $validator,
+                'no_wa',
+                $request->input('no_wa'),
+                'No. WA',
+                false
+            );
         });
     }
 
@@ -366,7 +400,7 @@ class PasienController extends Controller
 
             'toko_id' => $request->toko_id,
 
-            'no_identitas' => $request->no_identitas,
+            'no_identitas' => $this->cleanDigits($request->no_identitas),
 
             'jenis_kelamin' => $request->jenis_kelamin,
 
@@ -379,9 +413,9 @@ class PasienController extends Controller
             'tempat_lahir' => $request->tempat_lahir,
             'tanggal_lahir' => $request->tanggal_lahir,
 
-            'no_telp' => $this->cleanPhone($request->no_telp),
-            'no_hp' => $this->cleanPhone($request->no_hp),
-            'no_wa' => $this->cleanPhone($request->no_wa),
+            'no_telp' => $this->cleanNullableDigits($request->no_telp),
+            'no_hp' => $this->normalizePhone62($request->no_hp),
+            'no_wa' => $this->normalizePhone62($request->no_wa),
             'email' => $request->email,
 
             'provinsi_kode' => $request->provinsi_kode ?? $this->extractCode($request->provinsi),
@@ -399,6 +433,98 @@ class PasienController extends Controller
 
             'is_delete' => 0,
         ];
+    }
+
+    private function validateDigitsField($validator, $field, $value, $maxLength, $label, $required = false)
+    {
+        $value = trim((string) $value);
+
+        if ($value === '') {
+            if ($required) {
+                $validator->errors()->add($field, "{$label} wajib diisi");
+            }
+
+            return;
+        }
+
+        if (!preg_match('/^[0-9]+$/', $value)) {
+            $validator->errors()->add($field, "{$label} hanya boleh angka");
+            return;
+        }
+
+        if (strlen($value) > $maxLength) {
+            $validator->errors()->add($field, "{$label} maksimal {$maxLength} digit");
+        }
+    }
+
+    private function validateMobilePhone62($validator, $field, $value, $label, $required = false)
+    {
+        $value = trim((string) $value);
+
+        if ($value === '') {
+            if ($required) {
+                $validator->errors()->add($field, "{$label} wajib diisi");
+            }
+
+            return;
+        }
+
+        if (!preg_match('/^[0-9]+$/', $value)) {
+            $validator->errors()->add($field, "{$label} hanya boleh angka");
+            return;
+        }
+
+        $normalized = $this->normalizePhone62($value);
+
+        if (!$normalized || !str_starts_with($normalized, '62')) {
+            $validator->errors()->add($field, "{$label} harus menggunakan format nomor Indonesia");
+            return;
+        }
+
+        if (strlen($normalized) > 13) {
+            $validator->errors()->add($field, "{$label} maksimal 13 digit termasuk kode negara 62");
+        }
+    }
+
+    private function cleanDigits($value)
+    {
+        return preg_replace('/[^0-9]/', '', (string) $value);
+    }
+
+    private function cleanNullableDigits($value)
+    {
+        if ($value === null || trim((string) $value) === '') {
+            return null;
+        }
+
+        return $this->cleanDigits($value);
+    }
+
+    private function normalizePhone62($value)
+    {
+        if ($value === null || trim((string) $value) === '') {
+            return null;
+        }
+
+        $digits = $this->cleanDigits($value);
+
+        if ($digits === '') {
+            return null;
+        }
+
+        if (str_starts_with($digits, '62')) {
+            return $digits;
+        }
+
+        if (str_starts_with($digits, '0')) {
+            return '62' . substr($digits, 1);
+        }
+
+        if (str_starts_with($digits, '8')) {
+            return '62' . $digits;
+        }
+
+        return $digits;
     }
 
     private function formatPasien($pasien)
@@ -562,15 +688,6 @@ class PasienController extends Controller
             'cerai' => 3,
             default => null,
         };
-    }
-
-    private function cleanPhone($value)
-    {
-        if ($value === null || $value === '') {
-            return null;
-        }
-
-        return preg_replace('/[^0-9]/', '', (string) $value);
     }
 
     private function extractId($value)
