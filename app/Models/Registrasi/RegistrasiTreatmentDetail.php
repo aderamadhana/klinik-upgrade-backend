@@ -33,6 +33,7 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
         'is_delete' => 'boolean',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
+        'is_saran_dokter' => 'integer',
     ];
 
     public function registrasi()

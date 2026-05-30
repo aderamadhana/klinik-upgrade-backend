@@ -40,6 +40,7 @@ class RegistrasiKunjungan extends BaseRegistrasiModel
         'is_delete' => 'boolean',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
+        'has_saran_dokter' => 'integer',
     ];
 
     public function toko()

@@ -711,6 +711,9 @@ class PembayaranController extends Controller
         PembayaranInvoice $invoice,
         RegistrasiKunjungan $registrasi
     ) {
+
+        $this->insertConsultationInvoiceItem($invoice, $registrasi);
+
         foreach ($registrasi->treatmentDetails as $item) {
             if (isset($item->is_delete) && (int) $item->is_delete === 1) {
                 continue;
@@ -839,6 +842,57 @@ class PembayaranController extends Controller
                 'created_at' => now(),
             ]);
         }
+    }
+
+    private function insertConsultationInvoiceItem(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi)
+    {
+        $hasConsultation =
+            in_array((int) $registrasi->channel_konsultasi, [
+                RegistrasiKunjungan::CHANNEL_OFFLINE,
+                RegistrasiKunjungan::CHANNEL_ONLINE,
+            ], true)
+            || (int) ($registrasi->is_konsultasi_tambahan_dokter ?? 0) === 1
+            || (float) ($registrasi->total_konsultasi ?? 0) > 0;
+
+        if (!$hasConsultation) {
+            return;
+        }
+
+        $subtotal = (float) ($registrasi->total_konsultasi ?? 0);
+
+        PembayaranInvoiceItem::create([
+            'pembayaran_id' => $invoice->id,
+            'registrasi_id' => $registrasi->id,
+            'item_type' => PembayaranInvoiceItem::ITEM_KONSULTASI,
+            'source_type' => PembayaranInvoiceItem::SOURCE_REGISTRASI_KONSULTASI,
+            'source_detail_id' => $registrasi->id,
+            'deposit_treatment_id' => null,
+            'deposit_claim_id' => null,
+            'expired_at' => null,
+            'treatment_id' => null,
+            'treatment_toko_id' => null,
+            'produk_id' => null,
+            'produk_toko_id' => null,
+            'nama_item' => $subtotal > 0 ? 'Konsultasi Dokter' : 'Konsultasi Dokter - Gratis Treatment',
+            'satuan' => 'Konsultasi',
+            'qty' => 1,
+            'harga' => $subtotal,
+            'diskon_tipe' => 0,
+            'diskon_nilai' => 0,
+            'diskon_amount' => 0,
+            'diskon_referral' => 0,
+            'subtotal' => $subtotal,
+            'dokter_id' => $registrasi->dokter_awal_id,
+            'perawat_id' => null,
+            'frekuensi' => null,
+            'waktu_pakai' => null,
+            'instruksi_pemakaian' => null,
+            'send_when_zero' => $subtotal <= 0 ? 1 : 0,
+            'status' => PembayaranInvoiceItem::STATUS_AKTIF,
+            'is_delete' => 0,
+            'created_by' => $this->username(),
+            'created_at' => now(),
+        ]);
     }
 
     private function recalculateInvoice(PembayaranInvoice $invoice)

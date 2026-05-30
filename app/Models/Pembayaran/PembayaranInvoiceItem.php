@@ -19,6 +19,8 @@ class PembayaranInvoiceItem extends BasePembayaranModel
     public const SOURCE_MANUAL = 0;
     public const SOURCE_REGISTRASI_TREATMENT = 1;
     public const SOURCE_REGISTRASI_PENJUALAN = 2;
+    public const SOURCE_RESEP_DOKTER = 3;
+    public const SOURCE_REGISTRASI_KONSULTASI = 4;
 
     public const STATUS_AKTIF = 1;
     public const STATUS_BATAL = 9;
@@ -37,6 +39,7 @@ class PembayaranInvoiceItem extends BasePembayaranModel
         'diskon_tipe' => 'integer',
         'status' => 'integer',
         'is_delete' => 'integer',
+        'is_saran_dokter' => 'integer',
     ];
 
     public function scopeActive($query)
