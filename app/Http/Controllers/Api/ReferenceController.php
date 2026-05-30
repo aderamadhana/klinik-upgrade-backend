@@ -27,6 +27,8 @@ use App\Models\Master\MasterMetodeBayar;
 use App\Models\Master\MasterProdukToko;
 use App\Models\Master\MasterMerchandise;
 use App\Models\Master\MasterAccurateItemMapping;
+use App\Models\Master\MasterSubjective;
+use App\Models\Master\MasterAssessment;
 use App\Models\Pasien;
 
 class ReferenceController extends Controller
@@ -1207,6 +1209,118 @@ class ReferenceController extends Controller
             'status' => true,
             'message' => 'Data mapping Accurate berhasil diambil',
             'data' => $data,
+        ]);
+    }
+
+    public function subjective(Request $request)
+    {
+        $keyword = trim((string) $request->query('q', $request->query('search', '')));
+        $limit = (int) $request->query('limit', 50);
+
+        if ($limit <= 0) {
+            $limit = 50;
+        }
+
+        if ($limit > 100) {
+            $limit = 100;
+        }
+
+        $query = MasterSubjective::query()
+            ->active()
+            ->where('is_active', 1);
+
+        if ($keyword !== '') {
+            $query->where(function ($q) use ($keyword) {
+                $q->where('kode', 'LIKE', "%{$keyword}%")
+                    ->orWhere('nama', 'LIKE', "%{$keyword}%");
+            });
+        }
+
+        $rows = $query
+            ->orderBy('sort_order', 'asc')
+            ->orderBy('nama', 'asc')
+            ->limit($limit)
+            ->get([
+                'id',
+                'kode',
+                'nama',
+                'deskripsi',
+                'sort_order',
+                'is_active',
+            ])
+            ->map(function ($item) {
+                return [
+                    'id' => $item->id,
+                    'value' => $item->id,
+                    'label' => $item->nama,
+                    'kode' => $item->kode,
+                    'nama' => $item->nama,
+                    'deskripsi' => $item->deskripsi,
+                    'sort_order' => $item->sort_order,
+                    'is_active' => (int) $item->is_active,
+                ];
+            });
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data subjective berhasil diambil',
+            'data' => $rows,
+        ]);
+    }
+
+    public function assessment(Request $request)
+    {
+        $keyword = trim((string) $request->query('q', $request->query('search', '')));
+        $limit = (int) $request->query('limit', 50);
+
+        if ($limit <= 0) {
+            $limit = 50;
+        }
+
+        if ($limit > 100) {
+            $limit = 100;
+        }
+
+        $query = MasterAssessment::query()
+            ->active()
+            ->where('is_active', 1);
+
+        if ($keyword !== '') {
+            $query->where(function ($q) use ($keyword) {
+                $q->where('kode', 'LIKE', "%{$keyword}%")
+                    ->orWhere('nama', 'LIKE', "%{$keyword}%");
+            });
+        }
+
+        $rows = $query
+            ->orderBy('sort_order', 'asc')
+            ->orderBy('nama', 'asc')
+            ->limit($limit)
+            ->get([
+                'id',
+                'kode',
+                'nama',
+                'deskripsi',
+                'sort_order',
+                'is_active',
+            ])
+            ->map(function ($item) {
+                return [
+                    'id' => $item->id,
+                    'value' => $item->id,
+                    'label' => trim($item->kode . ' - ' . $item->nama),
+                    'kode' => $item->kode,
+                    'nama' => $item->nama,
+                    'deskripsi' => $item->deskripsi,
+                    'sort_order' => $item->sort_order,
+                    'is_active' => (int) $item->is_active,
+                ];
+            });
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data assessment berhasil diambil',
+            'data' => $rows,
         ]);
     }
 }
