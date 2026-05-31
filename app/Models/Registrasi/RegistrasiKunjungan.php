@@ -1,6 +1,7 @@
 <?php
 
 namespace App\Models\Registrasi;
+
 use App\Models\Pembayaran\PembayaranInvoice;
 
 class RegistrasiKunjungan extends BaseRegistrasiModel
@@ -35,6 +36,7 @@ class RegistrasiKunjungan extends BaseRegistrasiModel
         'perlu_tindakan_perawat' => 'integer',
         'current_task' => 'integer',
         'status' => 'integer',
+        'total_konsultasi' => 'decimal:2',
         'total_treatment' => 'decimal:2',
         'total_penjualan' => 'decimal:2',
         'grand_total' => 'decimal:2',
@@ -43,6 +45,55 @@ class RegistrasiKunjungan extends BaseRegistrasiModel
         'updated_at' => 'datetime',
         'has_saran_dokter' => 'integer',
     ];
+
+    protected $appends = [
+        'channel_konsultasi_label',
+        'jenis_konsultasi_label',
+    ];
+
+    public function getChannelKonsultasiLabelAttribute(): string
+    {
+        return match ((int) $this->channel_konsultasi) {
+            self::CHANNEL_ONLINE => 'Online',
+            self::CHANNEL_OFFLINE => 'Offline',
+            default => 'Tidak Konsultasi',
+        };
+    }
+
+    public function getJenisKonsultasiLabelAttribute(): ?string
+    {
+        if ((int) $this->channel_konsultasi === self::CHANNEL_TIDAK_KONSULTASI) {
+            return null;
+        }
+
+        if (!empty($this->konsultasi_source_name)) {
+            return $this->konsultasi_source_name;
+        }
+
+        $sourceCode = strtoupper((string) $this->konsultasi_source_code);
+
+        if (str_contains($sourceCode, 'ONLINE')) {
+            return 'Konsultasi Online';
+        }
+
+        if (str_contains($sourceCode, 'SPPG')) {
+            return 'Konsultasi SPPG';
+        }
+
+        if (str_contains($sourceCode, 'SPKK')) {
+            return 'Konsultasi SPKK';
+        }
+
+        if (str_contains($sourceCode, 'OFFLINE') || str_contains($sourceCode, 'DOKTER')) {
+            return 'Konsultasi Dokter';
+        }
+
+        return match ((int) $this->channel_konsultasi) {
+            self::CHANNEL_ONLINE => 'Konsultasi Online',
+            self::CHANNEL_OFFLINE => 'Konsultasi Dokter',
+            default => null,
+        };
+    }
 
     public function toko()
     {

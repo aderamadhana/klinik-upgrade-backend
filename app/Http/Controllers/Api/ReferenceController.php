@@ -29,6 +29,8 @@ use App\Models\Master\MasterMerchandise;
 use App\Models\Master\MasterAccurateItemMapping;
 use App\Models\Master\MasterSubjective;
 use App\Models\Master\MasterAssessment;
+use App\Models\Master\MasterJenisTransaksi;
+use App\Models\Master\MasterSumberInformasi;
 use App\Models\Pasien;
 
 class ReferenceController extends Controller
@@ -1321,6 +1323,143 @@ class ReferenceController extends Controller
             'status' => true,
             'message' => 'Data assessment berhasil diambil',
             'data' => $rows,
+        ]);
+    }
+
+    public function jenisTransaksi(Request $request)
+    {
+        $keyword = trim((string) $request->query('q', $request->query('search', '')));
+        $limit = (int) $request->query('limit', 50);
+
+        if ($limit <= 0) {
+            $limit = 50;
+        }
+
+        if ($limit > 100) {
+            $limit = 100;
+        }
+
+        $query = MasterJenisTransaksi::query()
+            ->active();
+
+        if ($keyword !== '') {
+            $query->where(function ($q) use ($keyword) {
+                $q->where('kode_jenis_transaksi', 'LIKE', "%{$keyword}%")
+                    ->orWhere('nama_jenis_transaksi', 'LIKE', "%{$keyword}%")
+                    ->orWhere('deskripsi', 'LIKE', "%{$keyword}%");
+
+                if (is_numeric($keyword)) {
+                    $q->orWhere('id', (int) $keyword);
+                }
+            });
+        }
+
+        $data = $query
+            ->orderBy('sort_order', 'asc')
+            ->orderBy('id', 'asc')
+            ->limit($limit)
+            ->get([
+                'id',
+                'kode_jenis_transaksi',
+                'nama_jenis_transaksi',
+                'deskripsi',
+                'sort_order',
+                'is_active',
+            ])
+            ->map(function ($item) {
+                return [
+                    'id' => (int) $item->id,
+                    'id_jenis_transaksi' => (int) $item->id,
+
+                    'kode_jenis_transaksi' => $item->kode_jenis_transaksi,
+                    'nama_jenis_transaksi' => $item->nama_jenis_transaksi,
+
+                    'deskripsi' => $item->deskripsi,
+                    'deskripsi_jenis' => $item->nama_jenis_transaksi,
+
+                    'sort_order' => (int) $item->sort_order,
+                    'is_active' => (int) $item->is_active,
+
+                    'label' => $item->nama_jenis_transaksi,
+                    'value' => (int) $item->id,
+                    'value_text' => $item->nama_jenis_transaksi,
+                ];
+            });
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data jenis transaksi berhasil diambil',
+            'data' => $data,
+        ]);
+    }
+
+    public function sumberInformasi(Request $request)
+    {
+        $keyword = trim((string) $request->query('q', $request->query('search', '')));
+        $kategoriSumber = trim((string) $request->query('kategori_sumber', ''));
+        $limit = (int) $request->query('limit', 100);
+
+        if ($limit <= 0) {
+            $limit = 100;
+        }
+
+        if ($limit > 200) {
+            $limit = 200;
+        }
+
+        $query = MasterSumberInformasi::query()
+            ->active();
+
+        if ($kategoriSumber !== '') {
+            $query->where('kategori_sumber', $kategoriSumber);
+        }
+
+        if ($keyword !== '') {
+            $query->where(function ($q) use ($keyword) {
+                $q->where('kode_sumber_informasi', 'LIKE', "%{$keyword}%")
+                    ->orWhere('nama_sumber_informasi', 'LIKE', "%{$keyword}%")
+                    ->orWhere('kategori_sumber', 'LIKE', "%{$keyword}%")
+                    ->orWhere('deskripsi', 'LIKE', "%{$keyword}%");
+            });
+        }
+
+        $data = $query
+            ->orderBy('sort_order', 'asc')
+            ->orderBy('nama_sumber_informasi', 'asc')
+            ->limit($limit)
+            ->get([
+                'id',
+                'kode_sumber_informasi',
+                'nama_sumber_informasi',
+                'kategori_sumber',
+                'deskripsi',
+                'sort_order',
+                'is_active',
+            ])
+            ->map(function ($item) {
+                return [
+                    'id' => (int) $item->id,
+                    'kode_sumber_informasi' => $item->kode_sumber_informasi,
+                    'nama_sumber_informasi' => $item->nama_sumber_informasi,
+                    'kategori_sumber' => $item->kategori_sumber,
+                    'deskripsi' => $item->deskripsi,
+                    'sort_order' => (int) $item->sort_order,
+                    'is_active' => (int) $item->is_active,
+
+                    'sumber' => $item->nama_sumber_informasi,
+                    'nama_sumber' => $item->nama_sumber_informasi,
+
+                    'label' => $item->nama_sumber_informasi,
+                    'value' => (int) $item->id,
+                    'value_text' => $item->nama_sumber_informasi,
+                ];
+            })
+            ->values();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data sumber informasi berhasil diambil',
+            'data' => $data,
         ]);
     }
 }
