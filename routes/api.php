@@ -117,15 +117,13 @@ Route::middleware('auth:api')->group(function () {
         Route::prefix('pembayaran')->group(function () {
             Route::get('/', [PembayaranController::class, 'index']);
             Route::get('/{id}', [PembayaranController::class, 'show'])->whereNumber('id');
-            Route::post('/generate/{registrasiId}', [PembayaranController::class, 'generate'])
-                ->whereNumber('registrasiId');
+            Route::post('/generate/{registrasiId}', [PembayaranController::class, 'generate'])->whereNumber('registrasiId');
             Route::post('/{id}/start', [PembayaranController::class, 'start'])->whereNumber('id');
             Route::post('/{id}/finish', [PembayaranController::class, 'finish'])->whereNumber('id');
             Route::post('/{id}/recalculate', [PembayaranController::class, 'recalculate'])->whereNumber('id');
             Route::post('/{id}/cancel', [PembayaranController::class, 'cancel'])->whereNumber('id');
         });
     });
-
     Route::prefix('stock')->group(function () {
         Route::get('produk-toko', [StockProdukTokoController::class, 'index']);
         Route::get('produk-toko/stock-hari-ini', [StockProdukTokoController::class, 'stockHariIni']);
