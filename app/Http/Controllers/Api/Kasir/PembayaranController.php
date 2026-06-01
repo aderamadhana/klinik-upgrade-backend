@@ -5,12 +5,9 @@ namespace App\Http\Controllers\Api\Kasir;
 use App\Http\Controllers\Controller;
 use App\Models\Pembayaran\PembayaranDepositTreatmentClaim;
 use App\Models\Pembayaran\PembayaranInvoice;
-use App\Models\Pembayaran\PembayaranInvoiceItem;
 use App\Models\Pembayaran\PembayaranInvoiceMetode;
 use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiTask;
-use App\Models\Stock\StockProdukToko;
-use App\Models\Stock\StockReservasiProduk;
 use App\Services\Stock\StockTransactionService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
@@ -18,6 +15,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\ValidationException;
+use Throwable;
 
 class PembayaranController extends Controller
 {
@@ -35,11 +34,9 @@ class PembayaranController extends Controller
         }
 
         $perPage = (int) $request->get('per_page', 15);
-
         if ($perPage <= 0) {
             $perPage = 15;
         }
-
         if ($perPage > 50) {
             $perPage = 50;
         }
@@ -139,22 +136,21 @@ class PembayaranController extends Controller
 
     public function generate($registrasiId)
     {
-        $registrasi = RegistrasiKunjungan::query()
-            ->with([
-                'pasien',
-                'tasks',
-                'treatmentDetails',
-                'penjualanDetails',
-            ])
-            ->active()
-            ->findOrFail($registrasiId);
-
-        DB::beginTransaction();
-
         try {
-            $invoice = $this->generateInvoiceFromRegistrasi($registrasi, true);
+            $invoice = DB::transaction(function () use ($registrasiId) {
+                $registrasi = RegistrasiKunjungan::query()
+                    ->with([
+                        'pasien',
+                        'tasks',
+                        'treatmentDetails',
+                        'penjualanDetails',
+                    ])
+                    ->active()
+                    ->lockForUpdate()
+                    ->findOrFail($registrasiId);
 
-            DB::commit();
+                return $this->generateInvoiceFromRegistrasi($registrasi, true);
+            }, 3);
 
             return response()->json([
                 'status' => true,
@@ -172,8 +168,8 @@ class PembayaranController extends Controller
                     ])
                 ),
             ]);
-        } catch (\Throwable $e) {
-            DB::rollBack();
+        } catch (Throwable $e) {
+            report($e);
 
             return response()->json([
                 'status' => false,
@@ -185,58 +181,67 @@ class PembayaranController extends Controller
 
     public function start($id)
     {
-        $invoice = $this->resolveOrGenerateInvoice($id);
-
-        if (!$invoice) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invoice tidak ditemukan atau belum bisa dibuat dari registrasi',
-            ], 404);
-        }
-
-        if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invoice sudah lunas',
-            ], 422);
-        }
-
-        $registrasi = $invoice->registrasi()->with('tasks')->first();
-
-        if (!$registrasi) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Data registrasi invoice tidak ditemukan',
-            ], 422);
-        }
-
-        $task = $this->getPaymentTask($registrasi);
-
-        DB::beginTransaction();
-
         try {
-            $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-                'status' => PembayaranInvoice::STATUS_PROSES,
-                'updated_by' => $this->username(),
-                'updated_at' => now(),
-            ]));
+            $invoice = DB::transaction(function () use ($id) {
+                $invoice = $this->resolveOrGenerateInvoice($id);
 
-            if ($task && (int) $task->status === RegistrasiTask::STATUS_MENUNGGU) {
-                $task->update([
-                    'status' => RegistrasiTask::STATUS_PROSES,
-                    'started_at' => now(),
+                if (!$invoice) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice tidak ditemukan atau belum bisa dibuat dari registrasi.',
+                    ]);
+                }
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->where(function ($q) {
+                        $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                    })
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice sudah lunas.',
+                    ]);
+                }
+
+                $registrasi = RegistrasiKunjungan::query()
+                    ->with('tasks')
+                    ->whereKey($invoice->registrasi_id)
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$registrasi) {
+                    throw ValidationException::withMessages([
+                        'registrasi' => 'Data registrasi invoice tidak ditemukan.',
+                    ]);
+                }
+
+                $task = $this->getPaymentTask($registrasi);
+
+                $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+                    'status' => PembayaranInvoice::STATUS_PROSES,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+
+                if ($task && (int) $task->status === RegistrasiTask::STATUS_MENUNGGU) {
+                    $task->update([
+                        'status' => RegistrasiTask::STATUS_PROSES,
+                        'started_at' => now(),
+                        'updated_by' => $this->username(),
+                        'updated_at' => now(),
+                    ]);
+                }
+
+                $registrasi->update([
+                    'current_task' => RegistrasiTask::TYPE_PEMBAYARAN,
                     'updated_by' => $this->username(),
                     'updated_at' => now(),
                 ]);
-            }
 
-            $registrasi->update([
-                'current_task' => RegistrasiTask::TYPE_PEMBAYARAN,
-                'updated_by' => $this->username(),
-                'updated_at' => now(),
-            ]);
-
-            DB::commit();
+                return $invoice;
+            }, 3);
 
             return response()->json([
                 'status' => true,
@@ -252,8 +257,14 @@ class PembayaranController extends Controller
                     'depositClaims',
                 ])),
             ]);
-        } catch (\Throwable $e) {
-            DB::rollBack();
+        } catch (ValidationException $e) {
+            return response()->json([
+                'status' => false,
+                'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
+        } catch (Throwable $e) {
+            report($e);
 
             return response()->json([
                 'status' => false,
@@ -290,107 +301,111 @@ class PembayaranController extends Controller
             ], 422);
         }
 
-        $invoice = $this->resolveInvoice($id);
+        try {
+            $result = DB::transaction(function () use ($request, $id) {
+                $invoice = $this->resolveInvoiceForUpdate($id);
 
-        if (!$invoice) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invoice tidak ditemukan',
-            ], 404);
-        }
+                if (!$invoice) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice tidak ditemukan.',
+                    ]);
+                }
 
-        if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invoice sudah lunas',
-            ], 422);
-        }
+                if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice sudah lunas.',
+                    ]);
+                }
 
-        $registrasi = $invoice->registrasi()->with('tasks')->first();
+                $registrasi = RegistrasiKunjungan::query()
+                    ->with(['tasks'])
+                    ->whereKey($invoice->registrasi_id)
+                    ->where(function ($q) {
+                        $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                    })
+                    ->lockForUpdate()
+                    ->first();
 
-        if (!$registrasi) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Data registrasi invoice tidak ditemukan',
-            ], 422);
-        }
+                if (!$registrasi) {
+                    throw ValidationException::withMessages([
+                        'registrasi' => 'Data registrasi invoice tidak ditemukan.',
+                    ]);
+                }
 
-        $metode = $this->normalizeMetodePayload($request, $invoice);
-        $totalBayar = collect($metode)->sum('nominal_dialokasikan');
-        $grandTotal = (float) ($request->input('grand_total', $invoice->grand_total) ?: 0);
+                $invoice->load([
+                    'items',
+                    'metode',
+                    'promos',
+                    'depositClaims',
+                ]);
 
-        if ($totalBayar < $grandTotal) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Jumlah bayar kurang dari grand total',
-                'data' => [
+                $metode = $this->normalizeMetodePayload($request, $invoice);
+                $totalBayar = collect($metode)->sum('nominal_dialokasikan');
+                $grandTotal = (float) ($invoice->grand_total ?? 0);
+
+                $this->validatePaymentAmount($grandTotal, $totalBayar);
+
+                $this->replaceInvoiceMetode($invoice, $metode);
+
+                $this->processStockKeluarPembayaran($invoice, $registrasi);
+
+                $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+                    'tanggal_lunas' => now(),
+                    'jenis_transaksi' => (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0),
+                    'sumber_informasi_id' => $request->input('sumber_informasi_id', $invoice->sumber_informasi_id ?? null),
+                    'sumber_kedatangan' => $request->input('sumber_kedatangan', $invoice->sumber_kedatangan ?? null),
+                    'catatan' => $request->input('catatan_pembayaran', $invoice->catatan ?? null),
                     'grand_total' => $grandTotal,
                     'total_bayar' => $totalBayar,
-                    'kurang' => $grandTotal - $totalBayar,
-                ],
-            ], 422);
-        }
-
-        DB::beginTransaction();
-
-        try {
-            $this->replaceInvoiceMetode($invoice, $metode);
-            $this->processStockKeluarPembayaran($invoice, $registrasi);
-
-            $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-                'tanggal_lunas' => now(),
-                'jenis_transaksi' => (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0),
-                'sumber_informasi_id' => $request->input('sumber_informasi_id', $invoice->sumber_informasi_id ?? null),
-                'sumber_kedatangan' => $request->input('sumber_kedatangan', $invoice->sumber_kedatangan ?? null),
-                'catatan' => $request->input('catatan_pembayaran', $invoice->catatan ?? null),
-                'subtotal_obat' => $request->input('subtotal_obat', $invoice->subtotal_obat ?? 0),
-                'subtotal_treatment' => $request->input('subtotal_treatment', $invoice->subtotal_treatment ?? 0),
-                'subtotal' => $request->input('subtotal', $invoice->subtotal ?? 0),
-                'diskon_subtotal' => $request->input('diskon_subtotal', $invoice->diskon_subtotal ?? 0),
-                'diskon_promo' => $request->input('diskon_promo', $invoice->diskon_promo ?? 0),
-                'grand_total' => $grandTotal,
-                'total_bayar' => $totalBayar,
-                'sisa_tagihan' => 0,
-                'total_kembalian' => max(0, $totalBayar - $grandTotal),
-                'status' => PembayaranInvoice::STATUS_LUNAS,
-                'updated_by' => $this->username(),
-                'updated_at' => now(),
-            ]));
-
-            $paymentTask = $this->getPaymentTask($registrasi);
-
-            if ($paymentTask) {
-                $paymentTask->update([
-                    'status' => RegistrasiTask::STATUS_SELESAI,
-                    'started_at' => $paymentTask->started_at ?: now(),
-                    'finished_at' => now(),
+                    'sisa_tagihan' => 0,
+                    'total_kembalian' => max(0, $totalBayar - $grandTotal),
+                    'status' => PembayaranInvoice::STATUS_LUNAS,
                     'updated_by' => $this->username(),
                     'updated_at' => now(),
-                ]);
-            }
+                ]));
 
-            $nextTask = $registrasi->tasks()
-                ->where('status', RegistrasiTask::STATUS_MENUNGGU)
-                ->orderBy('task_order')
-                ->first();
+                $paymentTask = $this->getPaymentTask($registrasi);
 
-            if ($nextTask) {
-                $registrasi->update([
-                    'current_task' => $nextTask->task_type,
-                    'status' => RegistrasiKunjungan::STATUS_AKTIF,
-                    'updated_by' => $this->username(),
-                    'updated_at' => now(),
-                ]);
-            } else {
-                $registrasi->update([
-                    'current_task' => RegistrasiKunjungan::TASK_DRAFT,
-                    'status' => RegistrasiKunjungan::STATUS_SELESAI,
-                    'updated_by' => $this->username(),
-                    'updated_at' => now(),
-                ]);
-            }
+                if ($paymentTask) {
+                    $paymentTask->update([
+                        'status' => RegistrasiTask::STATUS_SELESAI,
+                        'started_at' => $paymentTask->started_at ?: now(),
+                        'finished_at' => now(),
+                        'updated_by' => $this->username(),
+                        'updated_at' => now(),
+                    ]);
+                }
 
-            DB::commit();
+                $nextTask = $registrasi->tasks()
+                    ->where('status', RegistrasiTask::STATUS_MENUNGGU)
+                    ->orderBy('task_order')
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($nextTask) {
+                    $registrasi->update([
+                        'current_task' => $nextTask->task_type,
+                        'status' => RegistrasiKunjungan::STATUS_AKTIF,
+                        'updated_by' => $this->username(),
+                        'updated_at' => now(),
+                    ]);
+                } else {
+                    $registrasi->update([
+                        'current_task' => RegistrasiKunjungan::TASK_DRAFT,
+                        'status' => RegistrasiKunjungan::STATUS_SELESAI,
+                        'updated_by' => $this->username(),
+                        'updated_at' => now(),
+                    ]);
+                }
+
+                return [
+                    'invoice' => $invoice,
+                    'next_task' => $nextTask,
+                ];
+            }, 3);
+
+            $invoice = $result['invoice'];
+            $nextTask = $result['next_task'];
 
             return response()->json([
                 'status' => true,
@@ -408,8 +423,14 @@ class PembayaranController extends Controller
                     'depositClaims',
                 ])),
             ]);
-        } catch (\Throwable $e) {
-            DB::rollBack();
+        } catch (ValidationException $e) {
+            return response()->json([
+                'status' => false,
+                'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
+        } catch (Throwable $e) {
+            report($e);
 
             return response()->json([
                 'status' => false,
@@ -430,12 +451,24 @@ class PembayaranController extends Controller
             ], 404);
         }
 
-        DB::beginTransaction();
-
         try {
-            $this->recalculateInvoiceTotals($invoice);
+            DB::transaction(function () use ($invoice) {
+                $lockedInvoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->where(function ($q) {
+                        $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                    })
+                    ->lockForUpdate()
+                    ->firstOrFail();
 
-            DB::commit();
+                if ((int) $lockedInvoice->status === PembayaranInvoice::STATUS_LUNAS) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice lunas tidak bisa dihitung ulang.',
+                    ]);
+                }
+
+                $this->recalculateInvoiceTotals($lockedInvoice);
+            }, 3);
 
             return response()->json([
                 'status' => true,
@@ -451,8 +484,14 @@ class PembayaranController extends Controller
                     'depositClaims',
                 ])),
             ]);
-        } catch (\Throwable $e) {
-            DB::rollBack();
+        } catch (ValidationException $e) {
+            return response()->json([
+                'status' => false,
+                'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
+        } catch (Throwable $e) {
+            report($e);
 
             return response()->json([
                 'status' => false,
@@ -473,33 +512,44 @@ class PembayaranController extends Controller
             ], 404);
         }
 
-        if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Invoice lunas tidak bisa dibatalkan',
-            ], 422);
-        }
-
-        DB::beginTransaction();
-
         try {
-            $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-                'status' => PembayaranInvoice::STATUS_BATAL ?? 9,
-                'is_delete' => 1,
-                'deleted_by' => $this->username(),
-                'deleted_at' => now(),
-                'updated_by' => $this->username(),
-                'updated_at' => now(),
-            ]));
+            DB::transaction(function () use ($invoice) {
+                $lockedInvoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->where(function ($q) {
+                        $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                    })
+                    ->lockForUpdate()
+                    ->firstOrFail();
 
-            DB::commit();
+                if ((int) $lockedInvoice->status === PembayaranInvoice::STATUS_LUNAS) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice lunas tidak bisa dibatalkan.',
+                    ]);
+                }
+
+                $lockedInvoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+                    'status' => PembayaranInvoice::STATUS_BATAL,
+                    'is_delete' => 1,
+                    'deleted_by' => $this->username(),
+                    'deleted_at' => now(),
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+            }, 3);
 
             return response()->json([
                 'status' => true,
                 'message' => 'Invoice berhasil dibatalkan',
             ]);
-        } catch (\Throwable $e) {
-            DB::rollBack();
+        } catch (ValidationException $e) {
+            return response()->json([
+                'status' => false,
+                'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
+        } catch (Throwable $e) {
+            report($e);
 
             return response()->json([
                 'status' => false,
@@ -529,7 +579,6 @@ class PembayaranController extends Controller
 
         if ($request->filled('status')) {
             $status = $this->mapRequestStatusToInvoiceStatus($request->status);
-
             if ($status !== null) {
                 $query->where('status', $status);
             }
@@ -541,7 +590,6 @@ class PembayaranController extends Controller
 
         if ($request->filled('search')) {
             $search = trim((string) $request->search);
-
             $query->where(function ($q) use ($search) {
                 $q->where('no_invoice', 'like', "%{$search}%")
                     ->orWhere('kode_registrasi', 'like', "%{$search}%")
@@ -566,12 +614,16 @@ class PembayaranController extends Controller
             if ($channel === 'online') {
                 $q->where(function ($sub) {
                     $sub->where('channel_konsultasi', 'online')
+                        ->orWhere('channel_konsultasi', 2)
                         ->orWhere('is_konsultasi_online', 1)
                         ->orWhere('is_pembelian_online', 1);
                 });
             } elseif ($channel === 'offline') {
                 $q->where(function ($sub) {
                     $sub->whereNull('channel_konsultasi')
+                        ->orWhere('channel_konsultasi', 0)
+                        ->orWhere('channel_konsultasi', 1)
+                        ->orWhere('channel_konsultasi', 'offline')
                         ->orWhere('channel_konsultasi', '<>', 'online');
                 })
                     ->where(function ($sub) {
@@ -590,13 +642,6 @@ class PembayaranController extends Controller
     {
         $summaryQuery = clone $query;
 
-        /*
-         * Query index memakai eager load, withCount(), dan withSum() untuk kebutuhan tabel.
-         * Query tersebut tidak boleh langsung dipakai untuk summary aggregate, karena MySQL
-         * strict mode akan membaca pembayaran_invoice.* + COUNT/SUM tanpa GROUP BY dan memicu error 1140.
-         * Di sini kolom select dan binding select dari query tabel dibersihkan, lalu dipakai ulang
-         * hanya kondisi filter-nya saja.
-         */
         $baseQuery = $summaryQuery->getQuery();
         $baseQuery->columns = null;
         $baseQuery->orders = null;
@@ -604,7 +649,6 @@ class PembayaranController extends Controller
         $baseQuery->offset = null;
         $baseQuery->bindings['select'] = [];
         $baseQuery->bindings['order'] = [];
-
         $summaryQuery->setEagerLoads([]);
 
         $summary = $summaryQuery
@@ -633,13 +677,10 @@ class PembayaranController extends Controller
         $totalBayar = (float) ($summary->total_bayar ?? 0);
 
         return [
-            // Key utama yang dibaca all-pembayaran.vue
             'total' => $totalInvoice,
             'menunggu' => $totalMenunggu,
             'diproses' => $totalDiproses,
             'lunas' => $totalLunas,
-
-            // Alias untuk kompatibilitas response lama / debug
             'total_invoice' => $totalInvoice,
             'total_menunggu' => $totalMenunggu,
             'total_diproses' => $totalDiproses,
@@ -663,20 +704,18 @@ class PembayaranController extends Controller
         $tanggalKunjungan = $registrasi?->tanggal_kunjungan
             ?? $registrasi?->tanggal
             ?? $invoice->tanggal_invoice;
+        $subtotalProduk = $this->invoiceSubtotalProduk($invoice);
 
         return [
             'id' => $invoice->id,
             'invoice_id' => $invoice->id,
             'pembayaran_id' => $invoice->id,
             'registrasi_id' => $invoice->registrasi_id,
-
-            // Alias invoice yang dibaca frontend
             'no_invoice' => $invoice->no_invoice,
             'nomor_invoice' => $invoice->no_invoice,
             'invoice_number' => $invoice->no_invoice,
             'kode_registrasi' => $invoice->kode_registrasi,
             'nomor_kunjungan' => $invoice->kode_registrasi,
-
             'tanggal_invoice' => $invoice->tanggal_invoice,
             'tanggal_lunas' => $invoice->tanggal_lunas,
             'tanggal_kunjungan' => $tanggalKunjungan,
@@ -684,7 +723,6 @@ class PembayaranController extends Controller
             'registered_at' => $registrasi?->registered_at ?? null,
             'created_at' => $invoice->created_at,
             'toko_id' => $invoice->toko_id,
-
             'pasien_id' => $pasien?->id,
             'pasien_nama' => $pasien?->nama ?? $invoice->nama_pasien ?? '-',
             'nama_pasien' => $pasien?->nama ?? $invoice->nama_pasien ?? '-',
@@ -698,41 +736,35 @@ class PembayaranController extends Controller
                 'no_rm' => $pasien->no_rm ?? null,
                 'no_hp' => $pasien->no_hp ?? $pasien->no_wa ?? null,
             ] : null,
-
             'dokter_nama' => $registrasi?->dokterAwal?->nama,
             'perawat_nama' => $registrasi?->perawatAwal?->nama,
             'items_count' => (int) ($invoice->items_count ?? 0),
-
-            'subtotal_obat' => (float) ($invoice->subtotal_obat ?? 0),
+            'subtotal_obat' => $subtotalProduk,
+            'subtotal_produk' => $subtotalProduk,
             'subtotal_treatment' => (float) ($invoice->subtotal_treatment ?? 0),
+            'subtotal_konsultasi' => (float) ($invoice->subtotal_konsultasi ?? 0),
             'total_tagihan' => $grandTotal,
             'grand_total' => $grandTotal,
             'total_pembayaran' => $grandTotal,
             'total_bayar' => $totalBayar,
             'sisa_tagihan' => max($grandTotal - $totalBayar, 0),
-
-            // Status numeric tetap dikirim untuk kompatibilitas backend,
-            // tetapi frontend all-pembayaran.vue membaca status_pembayaran_key lebih dulu.
             'status' => (int) $invoice->status,
             'status_key' => $statusKey,
             'status_label' => $statusLabel,
             'status_pembayaran_key' => $statusKey,
             'status_pembayaran' => $statusLabel,
             'status_pembayaran_label' => $statusLabel,
-
             'metode' => $invoice->metode?->where('is_delete', 0)->values() ?? [],
             'metode_pembayaran' => $metodePembayaran,
-
             'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
             'sumber_informasi_id' => $invoice->sumber_informasi_id ?? null,
             'sumber_kedatangan' => $invoice->sumber_kedatangan ?? null,
-
             'channel_konsultasi' => $registrasi?->channel_konsultasi ?? null,
             'ada_konsultasi' => $this->hasRegistrasiConsultation($registrasi),
             'ada_treatment' => (float) ($invoice->subtotal_treatment ?? 0) > 0,
-            'ada_penjualan' => (float) ($invoice->subtotal_obat ?? 0) > 0,
+            'ada_penjualan' => $subtotalProduk > 0,
             'is_treatment' => (float) ($invoice->subtotal_treatment ?? 0) > 0,
-            'is_penjualan' => (float) ($invoice->subtotal_obat ?? 0) > 0,
+            'is_penjualan' => $subtotalProduk > 0,
             'layanan_label' => $layananLabel,
             'can_process_pembayaran' => in_array($statusKey, ['menunggu', 'proses'], true),
         ];
@@ -742,6 +774,7 @@ class PembayaranController extends Controller
     {
         $registrasi = $invoice->registrasi;
         $pasien = $registrasi?->pasien;
+        $subtotalProduk = $this->invoiceSubtotalProduk($invoice);
 
         return [
             'id' => $invoice->id,
@@ -759,11 +792,13 @@ class PembayaranController extends Controller
             'metode' => $invoice->metode?->where('is_delete', 0)->values() ?? [],
             'promo' => $invoice->promos?->where('is_delete', 0)->values() ?? [],
             'deposit_claims' => $invoice->depositClaims?->where('is_delete', 0)->values() ?? [],
-            'subtotal_obat' => (float) ($invoice->subtotal_obat ?? 0),
+            'subtotal_obat' => $subtotalProduk,
+            'subtotal_produk' => $subtotalProduk,
             'subtotal_treatment' => (float) ($invoice->subtotal_treatment ?? 0),
+            'subtotal_konsultasi' => (float) ($invoice->subtotal_konsultasi ?? 0),
             'subtotal' => (float) ($invoice->subtotal ?? 0),
-            'diskon_subtotal' => (float) ($invoice->diskon_subtotal ?? 0),
-            'diskon_promo' => (float) ($invoice->diskon_promo ?? 0),
+            'diskon_subtotal' => (float) ($invoice->diskon_subtotal ?? $invoice->diskon_subtotal_amount ?? 0),
+            'diskon_promo' => (float) ($invoice->diskon_promo ?? $invoice->total_promo ?? 0),
             'grand_total' => (float) ($invoice->grand_total ?? 0),
             'total_bayar' => (float) ($invoice->total_bayar ?? 0),
             'sisa_tagihan' => max((float) ($invoice->grand_total ?? 0) - (float) ($invoice->total_bayar ?? 0), 0),
@@ -847,7 +882,7 @@ class PembayaranController extends Controller
     {
         $hasConsultation = $this->hasRegistrasiConsultation($invoice->registrasi);
         $hasTreatment = (float) ($invoice->subtotal_treatment ?? 0) > 0;
-        $hasSales = (float) ($invoice->subtotal_obat ?? 0) > 0;
+        $hasSales = $this->invoiceSubtotalProduk($invoice) > 0;
 
         if ($hasConsultation && $hasTreatment && $hasSales) {
             return 'Konsultasi + Treatment + Penjualan';
@@ -903,16 +938,22 @@ class PembayaranController extends Controller
         }
 
         try {
-            DB::beginTransaction();
+            return DB::transaction(function () use ($registrasi) {
+                $lockedRegistrasi = RegistrasiKunjungan::query()
+                    ->with([
+                        'pasien',
+                        'tasks',
+                        'treatmentDetails',
+                        'penjualanDetails',
+                    ])
+                    ->whereKey($registrasi->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
 
-            $invoice = $this->generateInvoiceFromRegistrasi($registrasi, true);
-
-            DB::commit();
-
-            return $this->resolveInvoice($invoice->id);
-        } catch (\Throwable $e) {
-            DB::rollBack();
-            Log::error('Gagal membuat invoice otomatis saat finish pembayaran', [
+                return $this->generateInvoiceFromRegistrasi($lockedRegistrasi, true);
+            }, 3);
+        } catch (Throwable $e) {
+            Log::error('Gagal membuat invoice otomatis saat pembayaran', [
                 'registrasi_id' => $id,
                 'error' => $e->getMessage(),
             ]);
@@ -942,6 +983,22 @@ class PembayaranController extends Controller
                     ->orWhere('is_delete', 0);
             })
             ->orderByDesc('id')
+            ->first();
+    }
+
+    protected function resolveInvoiceForUpdate($id): ?PembayaranInvoice
+    {
+        return PembayaranInvoice::query()
+            ->where(function ($q) use ($id) {
+                $q->where('id', $id)
+                    ->orWhere('registrasi_id', $id);
+            })
+            ->where(function ($q) {
+                $q->whereNull('is_delete')
+                    ->orWhere('is_delete', 0);
+            })
+            ->orderByDesc('id')
+            ->lockForUpdate()
             ->first();
     }
 
@@ -990,8 +1047,33 @@ class PembayaranController extends Controller
             ->all();
     }
 
+    protected function validatePaymentAmount(float $grandTotal, float $totalBayar): void
+    {
+        if ($grandTotal > 0 && $totalBayar <= 0) {
+            throw ValidationException::withMessages([
+                'metode' => 'Metode pembayaran wajib diisi.',
+            ]);
+        }
+
+        if ($totalBayar < $grandTotal) {
+            throw ValidationException::withMessages([
+                'jumlah_bayar' => 'Jumlah bayar kurang dari grand total.',
+                'grand_total' => $grandTotal,
+                'total_bayar' => $totalBayar,
+                'kurang' => $grandTotal - $totalBayar,
+            ]);
+        }
+    }
+
     protected function replaceInvoiceMetode(PembayaranInvoice $invoice, array $metode): void
     {
+        $invoice->metode()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->get();
+
         $invoice->metode()->update($this->onlyExistingColumns('pembayaran_invoice_metode', [
             'is_delete' => 1,
             'deleted_by' => $this->username(),
@@ -1027,33 +1109,122 @@ class PembayaranController extends Controller
 
     protected function processStockKeluarPembayaran(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
     {
-        if (!method_exists($this->stockTransactionService, 'keluarPembayaran')) {
-            return;
-        }
-
         $items = $invoice->items()
             ->where(function ($q) {
                 $q->whereNull('is_delete')->orWhere('is_delete', 0);
             })
-            ->where(function ($q) {
-                $q->where('item_type', 'produk')->orWhere('jenis_item', 'produk');
-            })
-            ->get();
+            ->get()
+            ->filter(fn ($item) => $this->isProductItem($item))
+            ->values();
 
-        foreach ($items as $item) {
-            if (empty($item->produk_toko_id) || (float) ($item->qty ?? $item->jumlah ?? 0) <= 0) {
-                continue;
+        if ($items->isEmpty()) {
+            return;
+        }
+
+        if ($this->hasExistingPaymentStockMutation($invoice)) {
+            return;
+        }
+
+        $hasReservation = $items->contains(fn ($item) => !empty($item->stock_reservasi_id));
+
+        if ($hasReservation && method_exists($this->stockTransactionService, 'consumeReservasiUntukPenjualan')) {
+            $sourceTypes = [
+                'REGISTRASI_LAYANAN',
+                'registrasi_layanan',
+                'REGISTRASI',
+                'registrasi',
+            ];
+
+            foreach ($sourceTypes as $sourceType) {
+                try {
+                    $this->stockTransactionService->consumeReservasiUntukPenjualan($sourceType, (int) $registrasi->id, [
+                        'kode_mutasi' => $invoice->no_invoice,
+                        'tanggal' => now(),
+                        'ref_type' => 'PEMBAYARAN',
+                        'ref_table' => 'pembayaran_invoice',
+                        'ref_id' => $invoice->id,
+                        'keterangan' => 'Stock keluar pembayaran ' . $invoice->no_invoice,
+                        'created_by' => $this->username(),
+                    ]);
+
+                    return;
+                } catch (ValidationException $e) {
+                    continue;
+                }
             }
 
-            $this->stockTransactionService->keluarPembayaran([
-                'toko_id' => $invoice->toko_id,
-                'produk_toko_id' => $item->produk_toko_id,
-                'jumlah' => (float) ($item->qty ?? $item->jumlah ?? 0),
-                'referensi_id' => $invoice->id,
-                'referensi_tipe' => 'pembayaran_invoice',
-                'catatan' => 'Stock keluar pembayaran ' . $invoice->no_invoice,
+            throw ValidationException::withMessages([
+                'stock_reservasi' => 'Reservasi stok aktif tidak ditemukan atau tidak cocok dengan registrasi ini.',
             ]);
         }
+
+        if (!method_exists($this->stockTransactionService, 'keluarPenjualanTanpaReservasi')) {
+            return;
+        }
+
+        $payloadItems = $items
+            ->filter(function ($item) {
+                return !empty($item->produk_toko_id)
+                    && !empty($item->produk_id)
+                    && !empty($item->tempat_produk_id)
+                    && (float) ($item->qty ?? $item->jumlah ?? 0) > 0;
+            })
+            ->map(function ($item) {
+                return [
+                    'produk_toko_id' => $item->produk_toko_id,
+                    'produk_id' => $item->produk_id,
+                    'tempat_produk_id' => $item->tempat_produk_id,
+                    'qty' => (float) ($item->qty ?? $item->jumlah ?? 0),
+                    'harga_jual' => (float) ($item->harga ?? 0),
+                    'ref_detail_id' => $item->id,
+                ];
+            })
+            ->values()
+            ->all();
+
+        if (count($payloadItems) === 0) {
+            return;
+        }
+
+        $this->stockTransactionService->keluarPenjualanTanpaReservasi($payloadItems, [
+            'kode_mutasi' => $invoice->no_invoice,
+            'tanggal' => now(),
+            'toko_id' => $invoice->toko_id,
+            'ref_type' => 'PEMBAYARAN',
+            'ref_table' => 'pembayaran_invoice',
+            'ref_id' => $invoice->id,
+            'keterangan' => 'Stock keluar pembayaran ' . $invoice->no_invoice,
+            'created_by' => $this->username(),
+        ]);
+    }
+
+    protected function isProductItem($item): bool
+    {
+        $itemType = $item->item_type ?? $item->jenis_item ?? null;
+
+        if (is_numeric($itemType)) {
+            return (int) $itemType === 3;
+        }
+
+        $itemType = strtolower((string) $itemType);
+
+        return in_array($itemType, ['produk', 'obat', 'penjualan'], true);
+    }
+
+    protected function hasExistingPaymentStockMutation(PembayaranInvoice $invoice): bool
+    {
+        if (!Schema::hasTable('stock_mutasi_produk')) {
+            return false;
+        }
+
+        return DB::table('stock_mutasi_produk')
+            ->where('ref_type', 'PEMBAYARAN')
+            ->where('ref_table', 'pembayaran_invoice')
+            ->where('ref_id', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_void')->orWhere('is_void', 0);
+            })
+            ->exists();
     }
 
     protected function getPaymentTask(RegistrasiKunjungan $registrasi): ?RegistrasiTask
@@ -1078,12 +1249,31 @@ class PembayaranController extends Controller
         }
 
         if ($request->filled('tanggal')) {
-            $query->whereDate('tanggal', $request->tanggal);
+            if (Schema::hasColumn('registrasi_kunjungan', 'tanggal')) {
+                $query->whereDate('tanggal', $request->tanggal);
+            } else {
+                $query->whereDate('tanggal_kunjungan', $request->tanggal);
+            }
         }
 
         $query->limit(50)->get()->each(function ($registrasi) {
             if (!$this->resolveInvoice($registrasi->id)) {
-                $this->generateInvoiceFromRegistrasi($registrasi, false);
+                try {
+                    DB::transaction(function () use ($registrasi) {
+                        $lockedRegistrasi = RegistrasiKunjungan::query()
+                            ->with(['pasien', 'tasks', 'treatmentDetails', 'penjualanDetails'])
+                            ->whereKey($registrasi->id)
+                            ->lockForUpdate()
+                            ->firstOrFail();
+
+                        $this->generateInvoiceFromRegistrasi($lockedRegistrasi, false);
+                    }, 3);
+                } catch (Throwable $e) {
+                    Log::warning('Gagal sync invoice pending', [
+                        'registrasi_id' => $registrasi->id,
+                        'error' => $e->getMessage(),
+                    ]);
+                }
             }
         });
     }
@@ -1095,7 +1285,12 @@ class PembayaranController extends Controller
             ->where(function ($q) {
                 $q->whereNull('is_delete')->orWhere('is_delete', 0);
             })
+            ->lockForUpdate()
             ->first();
+
+        if ($existing && (int) $existing->status === PembayaranInvoice::STATUS_LUNAS) {
+            return $existing;
+        }
 
         if ($existing && !$force) {
             return $existing;
@@ -1106,27 +1301,38 @@ class PembayaranController extends Controller
         }
 
         $noInvoice = $existing->no_invoice ?: $this->generateInvoiceNumber($registrasi);
+        $tanggalInvoice = $registrasi->tanggal_kunjungan ?? $registrasi->tanggal ?? Carbon::today()->toDateString();
+        $task = $registrasi->tasks
+            ? $registrasi->tasks->firstWhere('task_type', RegistrasiTask::TYPE_PEMBAYARAN)
+            : null;
 
         $existing->fill($this->onlyExistingColumns('pembayaran_invoice', [
             'registrasi_id' => $registrasi->id,
+            'task_id' => $task?->id,
             'kode_registrasi' => $registrasi->kode_registrasi ?? null,
             'no_invoice' => $noInvoice,
-            'tanggal_invoice' => $registrasi->tanggal ?? Carbon::today()->toDateString(),
+            'tanggal_invoice' => $tanggalInvoice,
             'toko_id' => $registrasi->toko_id,
+            'pasien_id' => $registrasi->pasien_id,
+            'dokter_id' => $registrasi->dokter_awal_id ?? null,
             'jenis_transaksi' => 0,
             'subtotal_obat' => 0,
-            'subtotal_treatment' => 0,
-            'subtotal' => 0,
+            'subtotal_produk' => (float) ($registrasi->total_penjualan ?? 0),
+            'subtotal_treatment' => (float) ($registrasi->total_treatment ?? 0),
+            'subtotal_konsultasi' => (float) ($registrasi->total_konsultasi ?? 0),
+            'subtotal' => (float) ($registrasi->grand_total ?? 0),
             'diskon_subtotal' => 0,
+            'diskon_subtotal_amount' => 0,
             'diskon_promo' => 0,
-            'grand_total' => 0,
+            'total_promo' => 0,
+            'grand_total' => (float) ($registrasi->grand_total ?? 0),
             'total_bayar' => 0,
-            'sisa_tagihan' => 0,
+            'sisa_tagihan' => (float) ($registrasi->grand_total ?? 0),
             'status' => PembayaranInvoice::STATUS_MENUNGGU,
             'is_delete' => 0,
-            'created_by' => $this->username(),
+            'created_by' => $existing->exists ? ($existing->created_by ?? $this->username()) : $this->username(),
             'updated_by' => $this->username(),
-            'created_at' => now(),
+            'created_at' => $existing->exists ? ($existing->created_at ?? now()) : now(),
             'updated_at' => now(),
         ]));
 
@@ -1137,7 +1343,7 @@ class PembayaranController extends Controller
 
     protected function generateInvoiceNumber(RegistrasiKunjungan $registrasi): string
     {
-        $date = Carbon::parse($registrasi->tanggal ?? now())->format('Ymd');
+        $date = Carbon::parse($registrasi->tanggal_kunjungan ?? $registrasi->tanggal ?? now())->format('Ymd');
         $seq = str_pad((string) ($registrasi->id ?? 1), 5, '0', STR_PAD_LEFT);
 
         return 'INV-' . $date . '-' . $seq;
@@ -1151,33 +1357,58 @@ class PembayaranController extends Controller
             })
             ->get();
 
-        $subtotalObat = 0;
+        $subtotalProduk = 0;
         $subtotalTreatment = 0;
+        $subtotalKonsultasi = 0;
 
         foreach ($items as $item) {
-            $amount = (float) ($item->total ?? $item->subtotal ?? 0);
-            $type = strtolower((string) ($item->item_type ?? $item->jenis_item ?? ''));
+            $amount = (float) ($item->subtotal ?? $item->total ?? 0);
+            $type = $item->item_type ?? $item->jenis_item ?? null;
 
-            if ($type === 'produk' || $type === 'obat') {
-                $subtotalObat += $amount;
+            if (is_numeric($type)) {
+                if ((int) $type === 1) {
+                    $subtotalKonsultasi += $amount;
+                } elseif ((int) $type === 3) {
+                    $subtotalProduk += $amount;
+                } else {
+                    $subtotalTreatment += $amount;
+                }
+
+                continue;
+            }
+
+            $type = strtolower((string) $type);
+            if (in_array($type, ['produk', 'obat', 'penjualan'], true)) {
+                $subtotalProduk += $amount;
+            } elseif ($type === 'konsultasi') {
+                $subtotalKonsultasi += $amount;
             } else {
                 $subtotalTreatment += $amount;
             }
         }
 
-        $subtotal = $subtotalObat + $subtotalTreatment;
-        $grandTotal = max($subtotal - (float) ($invoice->diskon_subtotal ?? 0) - (float) ($invoice->diskon_promo ?? 0), 0);
+        $subtotal = $subtotalProduk + $subtotalTreatment + $subtotalKonsultasi;
+        $diskonSubtotal = (float) ($invoice->diskon_subtotal ?? $invoice->diskon_subtotal_amount ?? 0);
+        $diskonPromo = (float) ($invoice->diskon_promo ?? $invoice->total_promo ?? 0);
+        $grandTotal = max($subtotal - $diskonSubtotal - $diskonPromo, 0);
         $totalBayar = (float) ($invoice->total_bayar ?? 0);
 
         $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-            'subtotal_obat' => $subtotalObat,
+            'subtotal_obat' => $subtotalProduk,
+            'subtotal_produk' => $subtotalProduk,
             'subtotal_treatment' => $subtotalTreatment,
+            'subtotal_konsultasi' => $subtotalKonsultasi,
             'subtotal' => $subtotal,
             'grand_total' => $grandTotal,
             'sisa_tagihan' => max($grandTotal - $totalBayar, 0),
             'updated_by' => $this->username(),
             'updated_at' => now(),
         ]));
+    }
+
+    protected function invoiceSubtotalProduk(PembayaranInvoice $invoice): float
+    {
+        return (float) ($invoice->subtotal_obat ?? $invoice->subtotal_produk ?? 0);
     }
 
     protected function onlyExistingColumns(string $table, array $data): array
