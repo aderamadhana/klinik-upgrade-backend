@@ -6,6 +6,7 @@ use App\Http\Controllers\Controller;
 use App\Models\Pembayaran\PembayaranDepositTreatmentClaim;
 use App\Models\Pembayaran\PembayaranInvoice;
 use App\Models\Pembayaran\PembayaranInvoiceMetode;
+use App\Models\Pembayaran\PembayaranInvoiceSequence;
 use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiTask;
 use App\Services\Stock\StockTransactionService;
@@ -331,6 +332,8 @@ class PembayaranController extends Controller
                         'registrasi' => 'Data registrasi invoice tidak ditemukan.',
                     ]);
                 }
+
+                $this->ensureLegacyInvoiceNumber($invoice, $registrasi);
 
                 $invoice->load([
                     'items',
@@ -1300,7 +1303,12 @@ class PembayaranController extends Controller
             $existing = new PembayaranInvoice();
         }
 
-        $noInvoice = $existing->no_invoice ?: $this->generateInvoiceNumber($registrasi);
+        $noInvoice = $existing->no_invoice;
+
+        if (!$this->isLegacyInvoiceNumber($noInvoice)) {
+            $noInvoice = $this->generateInvoiceNumber($registrasi);
+        }
+
         $tanggalInvoice = $registrasi->tanggal_kunjungan ?? $registrasi->tanggal ?? Carbon::today()->toDateString();
         $task = $registrasi->tasks
             ? $registrasi->tasks->firstWhere('task_type', RegistrasiTask::TYPE_PEMBAYARAN)
@@ -1341,12 +1349,193 @@ class PembayaranController extends Controller
         return $existing;
     }
 
+    protected function ensureLegacyInvoiceNumber(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
+    {
+        if ($this->isLegacyInvoiceNumber($invoice->no_invoice ?? null)) {
+            return;
+        }
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'no_invoice' => $this->generateInvoiceNumber($registrasi),
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
     protected function generateInvoiceNumber(RegistrasiKunjungan $registrasi): string
     {
-        $date = Carbon::parse($registrasi->tanggal_kunjungan ?? $registrasi->tanggal ?? now())->format('Ymd');
-        $seq = str_pad((string) ($registrasi->id ?? 1), 5, '0', STR_PAD_LEFT);
+        $invoiceDate = Carbon::parse(
+            $registrasi->tanggal_kunjungan
+            ?? $registrasi->tanggal
+            ?? $registrasi->registered_at
+            ?? now()
+        );
 
-        return 'INV-' . $date . '-' . $seq;
+        $tokoId = (int) ($registrasi->toko_id ?? 0);
+        $tokoCode = $this->resolveLegacyInvoiceTokoCode($tokoId);
+
+        do {
+            $sequence = $this->nextLegacyInvoiceSequence($tokoId, $invoiceDate);
+            $invoiceNumber = $this->formatLegacyInvoiceNumber($tokoCode, $invoiceDate, $sequence);
+        } while ($this->invoiceNumberExists($invoiceNumber));
+
+        return $invoiceNumber;
+    }
+
+    protected function isLegacyInvoiceNumber(?string $invoiceNumber): bool
+    {
+        $invoiceNumber = trim((string) $invoiceNumber);
+
+        if ($invoiceNumber === '') {
+            return false;
+        }
+
+        return !str_starts_with(strtoupper($invoiceNumber), 'INV-');
+    }
+
+    protected function resolveLegacyInvoiceTokoCode(int $tokoId): string
+    {
+        if ($tokoId <= 0 || !Schema::hasTable('master_toko')) {
+            return 'TOKO';
+        }
+
+        $toko = DB::table('master_toko')
+            ->where('id', $tokoId)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->first();
+
+        $code = $toko->kode_toko
+            ?? $toko->kode
+            ?? $toko->nama_toko
+            ?? ('T' . $tokoId);
+
+        $code = strtoupper(preg_replace('/[^A-Z0-9]/', '', (string) $code));
+
+        return $code !== '' ? $code : ('T' . $tokoId);
+    }
+
+    protected function nextLegacyInvoiceSequence(int $tokoId, Carbon $invoiceDate): int
+    {
+        $date = $invoiceDate->toDateString();
+
+        if (!Schema::hasTable('pembayaran_invoice_sequence')) {
+            return $this->nextLegacyInvoiceSequenceFromInvoiceTable($tokoId, $invoiceDate);
+        }
+
+        $sequenceRow = PembayaranInvoiceSequence::query()
+            ->where('toko_id', $tokoId)
+            ->whereDate('tanggal', $date)
+            ->lockForUpdate()
+            ->first();
+
+        if (!$sequenceRow) {
+            $initialSequence = $this->currentLegacyInvoiceSequenceFromInvoiceTable($tokoId, $invoiceDate);
+
+            try {
+                PembayaranInvoiceSequence::query()->create([
+                    'toko_id' => $tokoId,
+                    'tanggal' => $date,
+                    'last_sequence' => $initialSequence,
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+            } catch (Throwable $e) {
+                // Request paralel bisa membuat row sequence lebih dulu.
+                // Ambil ulang dengan lock, jangan langsung gagal sebelum dicek ulang.
+            }
+
+            $sequenceRow = PembayaranInvoiceSequence::query()
+                ->where('toko_id', $tokoId)
+                ->whereDate('tanggal', $date)
+                ->lockForUpdate()
+                ->first();
+        }
+
+        if (!$sequenceRow) {
+            return $this->nextLegacyInvoiceSequenceFromInvoiceTable($tokoId, $invoiceDate);
+        }
+
+        $sequenceRow->last_sequence = ((int) $sequenceRow->last_sequence) + 1;
+        $sequenceRow->updated_at = now();
+        $sequenceRow->save();
+
+        return (int) $sequenceRow->last_sequence;
+    }
+
+    protected function currentLegacyInvoiceSequenceFromInvoiceTable(int $tokoId, Carbon $invoiceDate): int
+    {
+        $prefix = $this->legacyInvoicePrefix(
+            $this->resolveLegacyInvoiceTokoCode($tokoId),
+            $invoiceDate
+        );
+
+        $lastInvoice = PembayaranInvoice::query()
+            ->where('toko_id', $tokoId)
+            ->whereDate('tanggal_invoice', $invoiceDate->toDateString())
+            ->where('no_invoice', 'like', $prefix . '%')
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->orderByDesc('no_invoice')
+            ->value('no_invoice');
+
+        if (!$lastInvoice) {
+            return 0;
+        }
+
+        return (int) substr((string) $lastInvoice, -5);
+    }
+
+    protected function nextLegacyInvoiceSequenceFromInvoiceTable(int $tokoId, Carbon $invoiceDate): int
+    {
+        $prefix = $this->legacyInvoicePrefix(
+            $this->resolveLegacyInvoiceTokoCode($tokoId),
+            $invoiceDate
+        );
+
+        $lastInvoice = PembayaranInvoice::query()
+            ->where('toko_id', $tokoId)
+            ->whereDate('tanggal_invoice', $invoiceDate->toDateString())
+            ->where('no_invoice', 'like', $prefix . '%')
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->orderByDesc('no_invoice')
+            ->value('no_invoice');
+
+        if (!$lastInvoice) {
+            return 1;
+        }
+
+        $sequence = (int) substr((string) $lastInvoice, -5);
+
+        return $sequence + 1;
+    }
+
+    protected function formatLegacyInvoiceNumber(string $tokoCode, Carbon $invoiceDate, int $sequence): string
+    {
+        return $this->legacyInvoicePrefix($tokoCode, $invoiceDate)
+            . str_pad((string) $sequence, 5, '0', STR_PAD_LEFT);
+    }
+
+    protected function legacyInvoicePrefix(string $tokoCode, Carbon $invoiceDate): string
+    {
+        return $tokoCode . $invoiceDate->format('Ymd');
+    }
+
+    protected function invoiceNumberExists(string $invoiceNumber): bool
+    {
+        return PembayaranInvoice::query()
+            ->where('no_invoice', $invoiceNumber)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->exists();
     }
 
     protected function recalculateInvoiceTotals(PembayaranInvoice $invoice): void
