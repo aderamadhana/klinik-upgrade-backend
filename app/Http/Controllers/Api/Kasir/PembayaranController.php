@@ -11,6 +11,7 @@ use App\Models\Pembayaran\PembayaranInvoiceSequence;
 use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiTask;
 use App\Services\Stock\StockTransactionService;
+use App\Services\Pembayaran\VoucherFinalizerService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -23,10 +24,14 @@ use Throwable;
 class PembayaranController extends Controller
 {
     protected StockTransactionService $stockTransactionService;
-
-    public function __construct(StockTransactionService $stockTransactionService)
-    {
+    protected VoucherFinalizerService $voucherFinalizerService;
+    
+    public function __construct(
+        StockTransactionService $stockTransactionService,
+        VoucherFinalizerService $voucherFinalizerService
+    ) {
         $this->stockTransactionService = $stockTransactionService;
+        $this->voucherFinalizerService = $voucherFinalizerService;
     }
 
     public function index(Request $request)
@@ -391,6 +396,12 @@ class PembayaranController extends Controller
                 $this->applyMemberBenefitToInvoice($invoice);
                 $this->refreshInvoiceTotalsFromItems($invoice);
 
+                $this->voucherFinalizerService->applySelectedPromosFromRequest(
+                    $invoice,
+                    $request,
+                    $this->username()
+                );
+
                 $invoice = PembayaranInvoice::query()
                     ->whereKey($invoice->id)
                     ->lockForUpdate()
@@ -618,7 +629,11 @@ class PembayaranController extends Controller
                 }
 
                 $this->rollbackPaymentSideEffects($lockedInvoice, 'Invoice dibatalkan sebelum lunas.');
-
+                $this->voucherFinalizerService->restoreVoucherAfterCancel(
+                    $invoice,
+                    $this->username()
+                );
+                
                 $lockedInvoice->update($this->onlyExistingColumns('pembayaran_invoice', [
                     'status' => PembayaranInvoice::STATUS_BATAL,
                     'is_delete' => 1,
