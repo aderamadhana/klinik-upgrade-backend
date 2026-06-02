@@ -364,6 +364,7 @@ class PembayaranController extends Controller
 
                 $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
                 $this->syncInvoiceItemsFromRegistrasi($invoice, $registrasi);
+                $this->syncInvoiceItemsFromRequest($request, $invoice);
                 $this->refreshInvoiceTotalsFromItems($invoice);
 
                 $invoice = PembayaranInvoice::query()
@@ -390,17 +391,29 @@ class PembayaranController extends Controller
                     $this->processDepositClaimsFromInvoice($invoice, $registrasi);
                 }
 
-                $this->applySelectedPromosFromRequest($request, $invoice);
                 $this->applySubtotalDiscountFromRequest($request, $invoice);
                 $this->refreshInvoiceTotalsFromItems($invoice);
-                $this->applyMemberBenefitToInvoice($invoice);
-                $this->refreshInvoiceTotalsFromItems($invoice);
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
 
                 $this->voucherFinalizerService->applySelectedPromosFromRequest(
                     $invoice,
                     $request,
                     $this->username()
                 );
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
+
+                $this->applyMemberBenefitToInvoice($invoice);
+                $this->refreshInvoiceTotalsFromItems($invoice);
 
                 $invoice = PembayaranInvoice::query()
                     ->whereKey($invoice->id)
@@ -630,10 +643,10 @@ class PembayaranController extends Controller
 
                 $this->rollbackPaymentSideEffects($lockedInvoice, 'Invoice dibatalkan sebelum lunas.');
                 $this->voucherFinalizerService->restoreVoucherAfterCancel(
-                    $invoice,
+                    $lockedInvoice,
                     $this->username()
                 );
-                
+
                 $lockedInvoice->update($this->onlyExistingColumns('pembayaran_invoice', [
                     'status' => PembayaranInvoice::STATUS_BATAL,
                     'is_delete' => 1,
@@ -1815,6 +1828,21 @@ class PembayaranController extends Controller
         return (float) $baseItems->sum(fn ($item) => (float) ($item->subtotal ?? 0));
     }
 
+    protected function normalizePromoDiscountType($value): int
+    {
+        $text = strtolower(trim((string) $value));
+
+        if (in_array($text, ['1', 'percent', 'persen', '%'], true)) {
+            return 1;
+        }
+
+        if (in_array($text, ['2', 'nominal', 'rupiah', 'rp'], true)) {
+            return 2;
+        }
+
+        return 2;
+    }
+
     protected function createInvoicePromoRow(PembayaranInvoice $invoice, object $voucher, float $amount): void
     {
         DB::table('pembayaran_invoice_promo')->insert($this->onlyExistingColumns('pembayaran_invoice_promo', [
@@ -1823,7 +1851,7 @@ class PembayaranController extends Controller
             'kode_voucher' => $voucher->kode_voucher ?? null,
             'nama_voucher' => $voucher->nama_voucher ?? null,
             'scope_type' => $voucher->jenis_voucher_id ?? null,
-            'diskon_tipe' => $voucher->tipe_diskon ?? null,
+            'diskon_tipe' => $this->normalizePromoDiscountType($voucher->tipe_diskon ?? $voucher->diskon_tipe ?? 2),
             'diskon_nilai' => $voucher->total_diskon ?? 0,
             'diskon_amount' => $amount,
             'catatan' => 'Redeem saat submit pembayaran',
@@ -1987,7 +2015,11 @@ class PembayaranController extends Controller
             $payload['no_telp'] = $noTelp;
         }
 
-        $payload['updated_by'] = $this->username();
+        $updaterId = $this->resolvePasienUpdaterId();
+
+        if ($updaterId !== null && Schema::hasColumn('pasien', 'updated_by')) {
+            $payload['updated_by'] = $updaterId;
+        }
         $payload['updated_at'] = now();
 
         DB::table('pasien')
@@ -2455,7 +2487,6 @@ class PembayaranController extends Controller
     {
         $this->voidPaymentStockMutations($invoice, $reason);
         $this->releasePaymentReservations($invoice, $reason);
-        $this->rollbackVoucherRedeem($invoice);
         $this->rollbackDepositPurchaseRecords($invoice);
         $this->rollbackDepositClaimRecords($invoice);
         $this->cancelAccurateSyncLog($invoice, $reason);
@@ -3009,6 +3040,201 @@ class PembayaranController extends Controller
         $this->refreshInvoiceTotalsFromItems($existing);
 
         return $existing->fresh(['items']);
+    }
+
+    protected function syncInvoiceItemsFromRequest(Request $request, PembayaranInvoice $invoice): void
+    {
+        if ($request->has('treatment_items')) {
+            $this->syncRequestTreatmentItems($request, $invoice);
+        }
+
+        if ($request->has('penjualan_items')) {
+            $this->syncRequestProductItems($request, $invoice);
+        }
+
+        $invoice->load('items');
+    }
+
+    protected function syncRequestTreatmentItems(Request $request, PembayaranInvoice $invoice): void
+    {
+        $rows = collect((array) $request->input('treatment_items', []))
+            ->filter(fn ($row) => is_array($row))
+            ->values();
+
+        $activeItemIds = [];
+        $activeSourceIds = [];
+
+        foreach ($rows as $row) {
+            $itemId = (int) ($row['invoice_item_id'] ?? $row['pembayaran_item_id'] ?? $row['id'] ?? 0);
+            $sourceDetailId = (int) ($row['registrasi_treatment_detail_id'] ?? $row['source_detail_id'] ?? 0);
+
+            $item = $this->resolveRequestInvoiceItem($invoice, 2, $itemId, $sourceDetailId);
+            if (!$item) {
+                continue;
+            }
+
+            $qty = max((float) ($row['qty'] ?? $row['jumlah'] ?? $item->qty ?? 1), 1);
+            $harga = (float) ($row['harga'] ?? $row['harga_treatment'] ?? $item->harga ?? 0);
+            $gross = $harga * $qty;
+            $diskonTipe = $this->normalizeItemDiscountType($row['diskon_type'] ?? $row['manual_diskon_type'] ?? $row['diskon_tipe'] ?? $item->diskon_tipe ?? 0);
+            $diskonNilai = (float) ($row['diskon'] ?? $row['manual_diskon'] ?? $row['diskon_nilai'] ?? $item->diskon_nilai ?? 0);
+            $diskonAmount = $this->calculateInvoiceItemDiscountAmount($gross, $diskonTipe, $diskonNilai);
+            $diskonReferral = (float) ($row['diskon_referral'] ?? $item->diskon_referral ?? 0);
+            $subtotal = max($gross - $diskonAmount - $diskonReferral, 0);
+
+            $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
+                'nama_item' => $row['nama'] ?? $row['nama_item'] ?? $row['nama_treatment'] ?? $item->nama_item ?? 'Treatment',
+                'qty' => $qty,
+                'harga' => $harga,
+                'diskon_tipe' => $diskonTipe,
+                'diskon_nilai' => $diskonNilai,
+                'diskon_amount' => $diskonAmount,
+                'diskon_referral' => $diskonReferral,
+                'subtotal' => $subtotal,
+                'treatment_id' => $row['treatment_id'] ?? $item->treatment_id ?? null,
+                'treatment_toko_id' => $row['treatment_toko_id'] ?? $item->treatment_toko_id ?? null,
+                'status' => 1,
+                'is_delete' => 0,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+
+            $item->update($payload);
+            $activeItemIds[] = (int) $item->id;
+            if ($sourceDetailId > 0) {
+                $activeSourceIds[] = $sourceDetailId;
+            }
+        }
+
+        $this->softDeleteMissingRequestItems($invoice, 2, $activeItemIds, $activeSourceIds);
+    }
+
+    protected function syncRequestProductItems(Request $request, PembayaranInvoice $invoice): void
+    {
+        $rows = collect((array) $request->input('penjualan_items', []))
+            ->filter(fn ($row) => is_array($row))
+            ->values();
+
+        $activeItemIds = [];
+        $activeSourceIds = [];
+
+        foreach ($rows as $row) {
+            $itemId = (int) ($row['invoice_item_id'] ?? $row['pembayaran_item_id'] ?? $row['id'] ?? 0);
+            $sourceDetailId = (int) ($row['registrasi_penjualan_detail_id'] ?? $row['source_detail_id'] ?? 0);
+
+            $item = $this->resolveRequestInvoiceItem($invoice, 3, $itemId, $sourceDetailId);
+            if (!$item) {
+                continue;
+            }
+
+            $qty = max((float) ($row['qty'] ?? $row['jumlah'] ?? $item->qty ?? 1), 1);
+            $harga = (float) ($row['harga'] ?? $row['harga_jual'] ?? $item->harga ?? 0);
+            $gross = $harga * $qty;
+            $diskonTipe = $this->normalizeItemDiscountType($row['diskon_type'] ?? $row['manual_diskon_type'] ?? $row['diskon_tipe'] ?? $item->diskon_tipe ?? 0);
+            $diskonNilai = (float) ($row['diskon'] ?? $row['manual_diskon'] ?? $row['diskon_nilai'] ?? $item->diskon_nilai ?? 0);
+            $diskonAmount = $this->calculateInvoiceItemDiscountAmount($gross, $diskonTipe, $diskonNilai);
+            $diskonReferral = (float) ($row['diskon_referral'] ?? $item->diskon_referral ?? 0);
+            $subtotal = max($gross - $diskonAmount - $diskonReferral, 0);
+            $frekuensi = $row['frekuensi'] ?? $row['frekuensi_penggunaan'] ?? $item->frekuensi ?? null;
+            $waktuPakai = $row['waktu_pakai'] ?? $row['waktu_penggunaan'] ?? $item->waktu_pakai ?? null;
+            $instruksi = $row['penggunaan'] ?? $row['instruksi_pemakaian'] ?? $this->buildInstruksiPemakaian($frekuensi, $waktuPakai);
+
+            $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
+                'produk_id' => $row['produk_id'] ?? $item->produk_id ?? null,
+                'produk_toko_id' => $row['produk_toko_id'] ?? $item->produk_toko_id ?? null,
+                'tempat_produk_id' => $row['tempat_produk_id'] ?? $item->tempat_produk_id ?? null,
+                'stock_reservasi_id' => $row['stock_reservasi_id'] ?? $item->stock_reservasi_id ?? null,
+                'nama_item' => $row['nama'] ?? $row['nama_item'] ?? $row['nama_produk'] ?? $item->nama_item ?? 'Produk',
+                'satuan' => $row['unit'] ?? $row['satuan'] ?? $item->satuan ?? 'pcs',
+                'qty' => $qty,
+                'harga' => $harga,
+                'diskon_tipe' => $diskonTipe,
+                'diskon_nilai' => $diskonNilai,
+                'diskon_amount' => $diskonAmount,
+                'diskon_referral' => $diskonReferral,
+                'subtotal' => $subtotal,
+                'frekuensi' => $frekuensi,
+                'waktu_pakai' => $waktuPakai,
+                'instruksi_pemakaian' => $instruksi,
+                'status' => 1,
+                'is_delete' => 0,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+
+            $item->update($payload);
+            $activeItemIds[] = (int) $item->id;
+            if ($sourceDetailId > 0) {
+                $activeSourceIds[] = $sourceDetailId;
+            }
+        }
+
+        $this->softDeleteMissingRequestItems($invoice, 3, $activeItemIds, $activeSourceIds);
+    }
+
+    protected function resolveRequestInvoiceItem(PembayaranInvoice $invoice, int $itemType, int $itemId = 0, int $sourceDetailId = 0)
+    {
+        $baseQuery = $invoice->items()
+            ->where('item_type', $itemType)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate();
+
+        if ($itemId > 0) {
+            $item = (clone $baseQuery)->whereKey($itemId)->first();
+            if ($item) {
+                return $item;
+            }
+        }
+
+        if ($sourceDetailId > 0) {
+            return (clone $baseQuery)
+                ->where('source_detail_id', $sourceDetailId)
+                ->first();
+        }
+
+        return null;
+    }
+
+    protected function softDeleteMissingRequestItems(PembayaranInvoice $invoice, int $itemType, array $activeItemIds, array $activeSourceIds = []): void
+    {
+        $query = $invoice->items()
+            ->where('item_type', $itemType)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate();
+
+        if (count($activeItemIds) > 0) {
+            $query->whereNotIn('id', array_values(array_unique($activeItemIds)));
+        }
+
+        if (count($activeSourceIds) > 0) {
+            $query->whereNotIn('source_detail_id', array_values(array_unique($activeSourceIds)));
+        }
+
+        $query->update($this->onlyExistingColumns('pembayaran_invoice_item', [
+            'is_delete' => 1,
+            'status' => 9,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function normalizeItemDiscountType($value): int
+    {
+        $text = strtolower(trim((string) $value));
+
+        if (in_array($text, ['1', '%', 'percent', 'persen'], true)) {
+            return 1;
+        }
+
+        if (in_array($text, ['2', 'rp', 'rupiah', 'nominal'], true)) {
+            return 2;
+        }
+
+        return 0;
     }
 
     protected function syncInvoiceItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
@@ -3794,6 +4020,31 @@ class PembayaranController extends Controller
                 $q->whereNull('is_delete')->orWhere('is_delete', 0);
             })
             ->exists();
+    }
+
+    protected function resolvePasienUpdaterId(): ?int
+    {
+        $user = null;
+
+        try {
+            $user = auth()->user() ?: auth('api')->user();
+        } catch (\Throwable $e) {
+            $user = null;
+        }
+
+        if (!$user) {
+            return null;
+        }
+
+        foreach (['id', 'user_id', 'master_user_id', 'karyawan_id'] as $field) {
+            $value = $user->{$field} ?? null;
+
+            if (is_numeric($value) && (int) $value > 0) {
+                return (int) $value;
+            }
+        }
+
+        return null;
     }
 
     protected function recalculateInvoiceTotals(PembayaranInvoice $invoice): void
