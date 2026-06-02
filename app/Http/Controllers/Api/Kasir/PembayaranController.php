@@ -294,8 +294,26 @@ class PembayaranController extends Controller
             'referensi_dokter_id' => 'nullable|integer',
             'deposit_expired_option_id' => 'nullable|integer',
             'deposit_expired_at' => 'nullable|date',
+            'deposit_item_ids' => 'nullable|array',
+            'deposit_item_ids.*' => 'nullable|integer',
+            'deposit_items' => 'nullable|array',
+            'deposit_items.*.item_id' => 'nullable|integer',
+            'deposit_items.*.qty' => 'nullable|numeric|min:0',
+            'deposit_item_quantities' => 'nullable|array',
+            'update_pasien_phone' => 'nullable|boolean',
+            'pasien_no_hp_update' => 'nullable|string|max:30',
+            'pasien_no_wa_update' => 'nullable|string|max:30',
+            'pasien_no_telp_update' => 'nullable|string|max:30',
             'sumber_informasi_id' => 'nullable|integer',
             'sumber_kedatangan' => 'nullable|string|max:100',
+            'promo_ids' => 'nullable|array',
+            'promo_ids.*' => 'nullable|integer',
+            'promos' => 'nullable|array',
+            'selected_promos' => 'nullable|array',
+            'applied_promos' => 'nullable|array',
+            'promo_code' => 'nullable|string|max:100',
+            'diskon_subtotal_tipe' => 'nullable',
+            'diskon_subtotal_nilai' => 'nullable|numeric|min:0',
         ]);
 
         if ($validator->fails()) {
@@ -355,11 +373,35 @@ class PembayaranController extends Controller
                     'depositClaims',
                 ]);
 
+                $this->updatePatientPhoneFromRequest($request, $invoice);
+
                 $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
                 $depositExpiredAt = $this->resolveDepositExpiredAt($request);
 
                 $this->validateJenisTransaksiKhusus($request, $invoice, $jenisTransaksi, $depositExpiredAt);
                 $this->syncJenisTransaksiToInvoiceItems($invoice, $jenisTransaksi);
+
+                if ($jenisTransaksi !== 4) {
+                    $this->processDepositClaimsFromInvoice($invoice, $registrasi);
+                }
+
+                $this->applySelectedPromosFromRequest($request, $invoice);
+                $this->applySubtotalDiscountFromRequest($request, $invoice);
+                $this->refreshInvoiceTotalsFromItems($invoice);
+                $this->applyMemberBenefitToInvoice($invoice);
+                $this->refreshInvoiceTotalsFromItems($invoice);
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                $invoice->load([
+                    'items',
+                    'metode',
+                    'promos',
+                    'depositClaims',
+                ]);
 
                 $metode = $this->normalizeMetodePayload($request, $invoice);
                 $totalBayar = collect($metode)->sum('nominal_dialokasikan');
@@ -370,11 +412,19 @@ class PembayaranController extends Controller
                 $this->replaceInvoiceMetode($invoice, $metode, $jenisTransaksi);
 
                 if ($jenisTransaksi === 4) {
-                    $this->applyDepositTransactionRules($invoice, $request, $depositExpiredAt);
-                    $this->generateDepositTreatmentRecords($invoice);
+                    $selectedDepositItems = $this->resolveDepositItems($request, $invoice);
+                    $selectedDepositItemIds = array_keys($selectedDepositItems);
+                    $this->applyDepositTransactionRules($invoice, $request, $depositExpiredAt, $selectedDepositItemIds);
+                    $this->generateDepositTreatmentRecords($invoice, $selectedDepositItems);
+
+                    // Produk/obat dalam transaksi deposit tetap diproses sebagai penjualan normal.
+                    // Guard double stock tetap ada di processStockKeluarPembayaran().
+                    $this->processStockKeluarPembayaran($invoice, $registrasi);
                 } else {
                     $this->processStockKeluarPembayaran($invoice, $registrasi);
                 }
+
+                $this->createAccurateSyncPendingLog($invoice, $registrasi);
 
                 $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
                     'tanggal_lunas' => now(),
@@ -399,6 +449,9 @@ class PembayaranController extends Controller
                     'updated_by' => $this->username(),
                     'updated_at' => now(),
                 ]));
+
+                $invoice->refresh();
+                $this->processMemberPointLedger($invoice);
 
                 $paymentTask = $this->getPaymentTask($registrasi);
 
@@ -563,6 +616,8 @@ class PembayaranController extends Controller
                         'invoice' => 'Invoice lunas tidak bisa dibatalkan.',
                     ]);
                 }
+
+                $this->rollbackPaymentSideEffects($lockedInvoice, 'Invoice dibatalkan sebelum lunas.');
 
                 $lockedInvoice->update($this->onlyExistingColumns('pembayaran_invoice', [
                     'status' => PembayaranInvoice::STATUS_BATAL,
@@ -853,6 +908,15 @@ class PembayaranController extends Controller
             'pasien_no_rm' => $pasien?->no_rm ?? null,
             'no_hp' => $pasien?->no_hp ?? $pasien?->no_wa ?? null,
             'pasien_no_hp' => $pasien?->no_hp ?? $pasien?->no_wa ?? null,
+            'pasien_no_wa' => $pasien?->no_wa ?? null,
+            'pasien_no_telp' => $pasien?->no_telp ?? null,
+            'member_id' => $invoice->member_id ?? null,
+            'member_no' => $invoice->member_no ?? null,
+            'member_tier_id' => $invoice->member_tier_id ?? null,
+            'member_tier_nama' => $invoice->member_tier_nama ?? null,
+            'point_earned' => (float) ($invoice->point_earned ?? 0),
+            'poin' => (float) ($invoice->poin ?? $invoice->point_earned ?? 0),
+            'diskon_member_amount' => (float) ($invoice->diskon_member_amount ?? 0),
             'pasien' => $pasien,
             'dokter_awal' => $registrasi?->dokterAwal,
             'perawat_awal' => $registrasi?->perawatAwal,
@@ -877,6 +941,11 @@ class PembayaranController extends Controller
             'diskon_subtotal' => (float) ($invoice->diskon_subtotal ?? $invoice->diskon_subtotal_amount ?? 0),
             'diskon_promo' => (float) ($invoice->diskon_promo ?? $invoice->total_promo ?? 0),
             'total_promo' => (float) ($invoice->total_promo ?? 0),
+            'diskon_member_amount' => (float) ($invoice->diskon_member_amount ?? 0),
+            'point_earned' => (float) ($invoice->point_earned ?? 0),
+            'point_redeemed' => (float) ($invoice->point_redeemed ?? 0),
+            'point_redeem_value' => (float) ($invoice->point_redeem_value ?? 0),
+            'poin' => (float) ($invoice->poin ?? $invoice->point_earned ?? 0),
             'grand_total' => (float) ($invoice->grand_total ?? 0),
             'total_bayar' => (float) ($invoice->total_bayar ?? 0),
             'sisa_tagihan' => max((float) ($invoice->grand_total ?? 0) - (float) ($invoice->total_bayar ?? 0), 0),
@@ -1117,19 +1186,34 @@ class PembayaranController extends Controller
             ? $invoice->items->filter(fn ($item) => (int) ($item->is_delete ?? 0) === 0)
             : collect();
 
-        $hasProduk = $activeItems->contains(fn ($item) => $this->isProductItem($item));
-
-        if ($hasProduk) {
-            throw ValidationException::withMessages([
-                'items' => 'Transaksi deposit tidak boleh memiliki item produk/obat.',
-            ]);
-        }
-
+        // Produk/obat tetap boleh ada pada transaksi deposit.
+        // Produk diproses sebagai penjualan normal, sedangkan deposit hanya dibuat
+        // untuk treatment yang dipilih dari deposit_item_ids.
         $hasTreatment = $activeItems->contains(fn ($item) => $this->isTreatmentItem($item));
 
         if (!$hasTreatment) {
             throw ValidationException::withMessages([
-                'items' => 'Transaksi deposit wajib memiliki item treatment.',
+                'items' => 'Jenis transaksi deposit hanya bisa dipilih jika invoice memiliki minimal satu treatment.',
+            ]);
+        }
+
+        $selectedDepositItemIds = $this->resolveDepositItemIds($request, $invoice);
+        if (count($selectedDepositItemIds) === 0) {
+            throw ValidationException::withMessages([
+                'deposit_item_ids' => 'Pilih minimal satu treatment yang akan dijadikan deposit.',
+            ]);
+        }
+
+        $validTreatmentItemIds = $activeItems
+            ->filter(fn ($item) => $this->isTreatmentItem($item))
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+
+        $invalid = array_values(array_diff($selectedDepositItemIds, $validTreatmentItemIds));
+        if (count($invalid) > 0) {
+            throw ValidationException::withMessages([
+                'deposit_item_ids' => 'Pilihan treatment deposit tidak valid untuk invoice ini.',
             ]);
         }
     }
@@ -1191,7 +1275,7 @@ class PembayaranController extends Controller
         $invoice->load('items');
     }
 
-    protected function applyDepositTransactionRules(PembayaranInvoice $invoice, Request $request, ?string $depositExpiredAt): void
+    protected function applyDepositTransactionRules(PembayaranInvoice $invoice, Request $request, ?string $depositExpiredAt, array $selectedItemIds = []): void
     {
         $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
             'dokter_id' => null,
@@ -1208,6 +1292,7 @@ class PembayaranController extends Controller
                 $q->whereNull('is_delete')->orWhere('is_delete', 0);
             })
             ->where('item_type', 2)
+            ->when(count($selectedItemIds) > 0, fn ($q) => $q->whereIn('id', $selectedItemIds))
             ->lockForUpdate()
             ->update($this->onlyExistingColumns('pembayaran_invoice_item', [
                 'jenis_transaksi' => 4,
@@ -1222,7 +1307,7 @@ class PembayaranController extends Controller
         $invoice->load('items');
     }
 
-    protected function generateDepositTreatmentRecords(PembayaranInvoice $invoice): void
+    protected function generateDepositTreatmentRecords(PembayaranInvoice $invoice, array $selectedItems = []): void
     {
         if (!Schema::hasTable('pembayaran_deposit_treatment')) {
             throw ValidationException::withMessages([
@@ -1230,22 +1315,34 @@ class PembayaranController extends Controller
             ]);
         }
 
+        $selectedItemIds = array_keys($selectedItems);
+
         $items = $invoice->items()
             ->where(function ($q) {
                 $q->whereNull('is_delete')->orWhere('is_delete', 0);
             })
             ->where('item_type', 2)
+            ->when(count($selectedItemIds) > 0, fn ($q) => $q->whereIn('id', $selectedItemIds))
             ->lockForUpdate()
             ->get();
 
         foreach ($items as $item) {
-            $qty = (float) ($item->qty ?? 0);
-            if ($qty <= 0) {
-                $qty = 1;
+            $invoiceQty = (float) ($item->qty ?? 0);
+            if ($invoiceQty <= 0) {
+                $invoiceQty = 1;
             }
 
-            $totalNilai = (float) ($item->subtotal ?? 0);
-            $hargaSatuan = round($totalNilai / $qty, 2);
+            $selectedQty = (float) ($selectedItems[(int) $item->id] ?? 0);
+            if ($selectedQty <= 0) {
+                $selectedQty = $invoiceQty;
+            }
+
+            $selectedQty = min($selectedQty, $invoiceQty);
+            $selectedQty = max($selectedQty, 1);
+
+            $itemSubtotal = (float) ($item->subtotal ?? 0);
+            $hargaSatuan = $invoiceQty > 0 ? round($itemSubtotal / $invoiceQty, 2) : 0;
+            $totalNilai = round($hargaSatuan * $selectedQty, 2);
 
             $deposit = PembayaranDepositTreatment::query()
                 ->where('pembayaran_item_id', $item->id)
@@ -1260,9 +1357,9 @@ class PembayaranController extends Controller
                 'treatment_id' => $item->treatment_id ?? $item->item_id ?? 0,
                 'treatment_toko_id' => $item->treatment_toko_id ?? null,
                 'nama_treatment' => $item->nama_item ?? '-',
-                'qty_total' => $qty,
+                'qty_total' => $selectedQty,
                 'qty_claimed' => 0,
-                'qty_sisa' => $qty,
+                'qty_sisa' => $selectedQty,
                 'harga_satuan' => $hargaSatuan,
                 'total_nilai' => $totalNilai,
                 'nilai_claimed' => 0,
@@ -1292,6 +1389,1250 @@ class PembayaranController extends Controller
                 'updated_at' => now(),
             ]));
         }
+    }
+
+
+    protected function processDepositClaimsFromInvoice(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
+    {
+        if (!Schema::hasTable('pembayaran_deposit_treatment') || !Schema::hasTable('pembayaran_deposit_treatment_claim')) {
+            return;
+        }
+
+        $items = $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where('item_type', 2)
+            ->whereNotNull('deposit_treatment_id')
+            ->lockForUpdate()
+            ->get();
+
+        foreach ($items as $item) {
+            $depositId = (int) ($item->deposit_treatment_id ?? 0);
+            if ($depositId <= 0) {
+                continue;
+            }
+
+            $deposit = DB::table('pembayaran_deposit_treatment')
+                ->where('id', $depositId)
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                })
+                ->lockForUpdate()
+                ->first();
+
+            if (!$deposit) {
+                throw ValidationException::withMessages([
+                    'deposit' => 'Data deposit treatment tidak ditemukan untuk item ' . ($item->nama_item ?? '-'),
+                ]);
+            }
+
+            if (!empty($deposit->expired_at) && Carbon::parse($deposit->expired_at)->lt(Carbon::today())) {
+                throw ValidationException::withMessages([
+                    'deposit' => 'Deposit treatment sudah expired untuk item ' . ($item->nama_item ?? '-'),
+                ]);
+            }
+
+            $treatmentIdItem = (int) ($item->treatment_id ?? 0);
+            $treatmentIdDeposit = (int) ($deposit->treatment_id ?? 0);
+            if ($treatmentIdItem > 0 && $treatmentIdDeposit > 0 && $treatmentIdItem !== $treatmentIdDeposit) {
+                throw ValidationException::withMessages([
+                    'deposit' => 'Treatment yang diklaim tidak sesuai dengan deposit yang tersedia.',
+                ]);
+            }
+
+            $qtyClaim = max((float) ($item->qty ?? 1), 1);
+            $qtySisa = (float) ($deposit->qty_sisa ?? 0);
+            if ($qtySisa < $qtyClaim) {
+                throw ValidationException::withMessages([
+                    'deposit' => 'Qty deposit tidak mencukupi untuk item ' . ($item->nama_item ?? '-'),
+                ]);
+            }
+
+            $hargaSatuan = (float) ($deposit->harga_satuan ?? 0);
+            $nilaiRealisasi = round($qtyClaim * $hargaSatuan, 2);
+            $nilaiSisa = (float) ($deposit->nilai_sisa ?? 0);
+            if ($nilaiSisa > 0) {
+                $nilaiRealisasi = min($nilaiRealisasi, $nilaiSisa);
+            }
+
+            $existingClaim = DB::table('pembayaran_deposit_treatment_claim')
+                ->where('pembayaran_item_id', $item->id)
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                })
+                ->lockForUpdate()
+                ->first();
+
+            if ($existingClaim) {
+                $claimId = $existingClaim->id;
+                continue;
+            }
+
+            $claimId = DB::table('pembayaran_deposit_treatment_claim')->insertGetId($this->onlyExistingColumns('pembayaran_deposit_treatment_claim', [
+                'deposit_treatment_id' => $depositId,
+                'registrasi_id' => $registrasi->id,
+                'pembayaran_id' => $invoice->id,
+                'pembayaran_item_id' => $item->id,
+                'toko_claim_id' => $invoice->toko_id,
+                'treatment_detail_id' => $item->source_detail_id ?? null,
+                'qty_claim' => $qtyClaim,
+                'nilai_realisasi' => $nilaiRealisasi,
+                'claim_dokter_id' => $item->dokter_id ?? $registrasi->dokter_awal_id ?? null,
+                'claim_perawat_id' => $item->perawat_id ?? $registrasi->perawat_awal_id ?? null,
+                'claimed_at' => now(),
+                'status' => PembayaranDepositTreatmentClaim::STATUS_AKTIF,
+                'is_delete' => 0,
+                'created_by' => $this->username(),
+                'updated_by' => $this->username(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]));
+
+            DB::table('pembayaran_deposit_treatment')
+                ->where('id', $depositId)
+                ->update($this->onlyExistingColumns('pembayaran_deposit_treatment', [
+                    'qty_claimed' => (float) ($deposit->qty_claimed ?? 0) + $qtyClaim,
+                    'qty_sisa' => max($qtySisa - $qtyClaim, 0),
+                    'nilai_claimed' => (float) ($deposit->nilai_claimed ?? 0) + $nilaiRealisasi,
+                    'nilai_sisa' => max($nilaiSisa - $nilaiRealisasi, 0),
+                    'status' => max($qtySisa - $qtyClaim, 0) <= 0 ? 2 : ($deposit->status ?? 1),
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+
+            $item->update($this->onlyExistingColumns('pembayaran_invoice_item', [
+                'deposit_claim_id' => $claimId,
+                'subtotal' => 0,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+        }
+
+        $invoice->load('items');
+    }
+
+    protected function applySelectedPromosFromRequest(Request $request, PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pembayaran_invoice_promo') || !Schema::hasTable('master_voucher_diskon')) {
+            return;
+        }
+
+        $references = $this->normalizeSelectedPromoReferences($request);
+        if (count($references) === 0) {
+            return;
+        }
+
+        $items = $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->get();
+
+        $this->resetInvoicePromoRows($invoice);
+
+        $selectedVouchers = [];
+        foreach ($references as $reference) {
+            $voucher = $this->findVoucherByReference($reference);
+            if (!$voucher) {
+                throw ValidationException::withMessages([
+                    'promo' => 'Voucher tidak ditemukan atau tidak aktif.',
+                ]);
+            }
+            $selectedVouchers[$voucher->id] = $voucher;
+        }
+
+        $nonCombine = collect($selectedVouchers)->filter(fn ($voucher) => (int) ($voucher->is_bisa_digabung_promo ?? 0) !== 1);
+        if ($nonCombine->count() > 0 && count($selectedVouchers) > 1) {
+            throw ValidationException::withMessages([
+                'promo' => 'Voucher tidak bisa digabung dengan promo lain.',
+            ]);
+        }
+
+        $totalPromo = 0;
+        foreach ($selectedVouchers as $voucher) {
+            $this->validateVoucherForInvoice($voucher, $invoice);
+            $amount = $this->calculateVoucherAmount($voucher, $items);
+            if ($amount <= 0) {
+                throw ValidationException::withMessages([
+                    'promo' => 'Voucher ' . ($voucher->nama_voucher ?? $voucher->kode_voucher ?? '-') . ' tidak sesuai dengan item transaksi.',
+                ]);
+            }
+
+            $remainingBase = max((float) $items->sum(fn ($item) => (float) ($item->subtotal ?? 0)) - $totalPromo, 0);
+            $amount = min($amount, $remainingBase);
+            if ($amount <= 0) {
+                continue;
+            }
+
+            $this->createInvoicePromoRow($invoice, $voucher, $amount);
+            $this->redeemVoucherCodeIfNeeded($voucher, $invoice);
+            $this->consumeVoucherQuotaIfNeeded($voucher, $invoice);
+            $totalPromo += $amount;
+        }
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'total_promo' => $totalPromo,
+            'diskon_promo' => $totalPromo,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function applySubtotalDiscountFromRequest(Request $request, PembayaranInvoice $invoice): void
+    {
+        if (!$request->filled('diskon_subtotal_nilai')) {
+            $this->prorateSubtotalDiscountToItems(
+                $invoice,
+                (float) ($invoice->diskon_subtotal_amount ?? 0)
+            );
+            return;
+        }
+
+        $baseSubtotal = $this->getSubtotalDiscountProrationBase($invoice);
+        $tipe = $request->input('diskon_subtotal_tipe', 0);
+        $nilai = (float) $request->input('diskon_subtotal_nilai', 0);
+        $tipeValue = $this->normalizeSubtotalDiscountType($tipe);
+
+        if ($nilai <= 0 || $baseSubtotal <= 0) {
+            $amount = 0;
+        } elseif ($tipeValue === 1) {
+            $amount = min(round(($baseSubtotal * $nilai) / 100, 2), $baseSubtotal);
+        } else {
+            $amount = min($nilai, $baseSubtotal);
+        }
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'diskon_subtotal_tipe' => $amount > 0 ? $tipeValue : 0,
+            'diskon_subtotal_nilai' => $amount > 0 ? $nilai : 0,
+            'diskon_subtotal_amount' => $amount,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+
+        $invoice->forceFill([
+            'diskon_subtotal_tipe' => $amount > 0 ? $tipeValue : 0,
+            'diskon_subtotal_nilai' => $amount > 0 ? $nilai : 0,
+            'diskon_subtotal_amount' => $amount,
+        ]);
+
+        $this->prorateSubtotalDiscountToItems($invoice, $amount);
+    }
+
+    protected function normalizeSelectedPromoReferences(Request $request): array
+    {
+        $references = [];
+
+        foreach ((array) $request->input('promo_ids', []) as $id) {
+            if ($id) {
+                $references[] = ['id' => (int) $id];
+            }
+        }
+
+        foreach (['promos', 'selected_promos', 'applied_promos'] as $key) {
+            $rows = $request->input($key, []);
+            if (!is_array($rows)) {
+                continue;
+            }
+
+            foreach ($rows as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+
+                $references[] = [
+                    'id' => $row['id'] ?? $row['voucher_id'] ?? $row['master_voucher_diskon_id'] ?? null,
+                    'kode' => $row['kode_voucher'] ?? $row['kode'] ?? $row['code'] ?? null,
+                ];
+            }
+        }
+
+        if ($request->filled('promo_code')) {
+            $references[] = ['kode' => $request->input('promo_code')];
+        }
+
+        return collect($references)
+            ->filter(fn ($row) => !empty($row['id']) || !empty($row['kode']))
+            ->unique(fn ($row) => ($row['id'] ?? '') . '|' . ($row['kode'] ?? ''))
+            ->values()
+            ->all();
+    }
+
+    protected function findVoucherByReference(array $reference): ?object
+    {
+        $query = DB::table('master_voucher_diskon')
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status_voucher')->orWhere('status_voucher', 1);
+            });
+
+        if (!empty($reference['id'])) {
+            $query->where('id', (int) $reference['id']);
+        } elseif (!empty($reference['kode'])) {
+            $kode = trim((string) $reference['kode']);
+            $query->where(function ($q) use ($kode) {
+                $q->where('kode_voucher', $kode);
+
+                if (Schema::hasTable('master_voucher_diskon_kode')) {
+                    $voucherId = DB::table('master_voucher_diskon_kode')
+                        ->where('kode_voucher', $kode)
+                        ->where(function ($sub) {
+                            $sub->whereNull('is_delete')->orWhere('is_delete', 0);
+                        })
+                        ->value('voucher_diskon_id');
+
+                    if ($voucherId) {
+                        $q->orWhere('id', $voucherId);
+                    }
+                }
+            });
+        }
+
+        return $query->lockForUpdate()->first();
+    }
+
+    protected function validateVoucherForInvoice(object $voucher, PembayaranInvoice $invoice): void
+    {
+        if ((int) ($voucher->is_all_toko ?? 0) !== 1 && !empty($voucher->toko_id) && (int) $voucher->toko_id !== (int) $invoice->toko_id) {
+            throw ValidationException::withMessages([
+                'promo' => 'Voucher tidak berlaku untuk cabang transaksi ini.',
+            ]);
+        }
+
+        if ((int) ($voucher->is_unlimited_date ?? 0) !== 1) {
+            $today = Carbon::today();
+            if (!empty($voucher->tanggal_mulai) && Carbon::parse($voucher->tanggal_mulai)->gt($today)) {
+                throw ValidationException::withMessages(['promo' => 'Voucher belum aktif.']);
+            }
+            if (!empty($voucher->tanggal_akhir) && Carbon::parse($voucher->tanggal_akhir)->lt($today)) {
+                throw ValidationException::withMessages(['promo' => 'Voucher sudah expired.']);
+            }
+        }
+
+        if ((int) ($voucher->is_unlimited_generate ?? 0) !== 1 && (int) ($voucher->qty_generate ?? 0) <= 0) {
+            throw ValidationException::withMessages([
+                'promo' => 'Kuota voucher ' . ($voucher->nama_voucher ?? $voucher->kode_voucher ?? '-') . ' sudah habis.',
+            ]);
+        }
+
+        if (Schema::hasTable('master_voucher_diskon_kode')) {
+            $kodeRows = DB::table('master_voucher_diskon_kode')
+                ->where('voucher_diskon_id', $voucher->id)
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                })
+                ->lockForUpdate()
+                ->get();
+
+            if ($kodeRows->isNotEmpty()) {
+                $available = $kodeRows->contains(function ($row) {
+                    return (int) ($row->status_kode ?? 0) === 1
+                        && (empty($row->expired_at) || Carbon::parse($row->expired_at)->gte(Carbon::today()));
+                });
+
+                $alreadyForThisInvoice = $kodeRows->contains(function ($row) use ($invoice) {
+                    return (int) ($row->status_kode ?? 0) === 2
+                        && (string) ($row->redeemed_invoice_no ?? '') === (string) $invoice->no_invoice;
+                });
+
+                if (!$available && !$alreadyForThisInvoice) {
+                    throw ValidationException::withMessages([
+                        'promo' => 'Kode voucher sudah tidak tersedia atau sudah digunakan.',
+                    ]);
+                }
+            }
+        }
+    }
+
+    protected function calculateVoucherAmount(object $voucher, $items): float
+    {
+        $eligibleBase = $this->resolveVoucherEligibleBase($voucher, $items);
+        if ($eligibleBase <= 0) {
+            return 0;
+        }
+
+        $tipe = strtolower((string) ($voucher->tipe_diskon ?? 'nominal'));
+        $nilai = (float) ($voucher->total_diskon ?? 0);
+
+        if ($tipe === 'percent' || $tipe === 'persen' || $tipe === '%') {
+            $amount = round(($eligibleBase * $nilai) / 100, 2);
+            $max = (float) ($voucher->total_diskon_maksimal ?? 0);
+            if ($max > 0) {
+                $amount = min($amount, $max);
+            }
+        } else {
+            $amount = $nilai;
+        }
+
+        return min(max($amount, 0), $eligibleBase);
+    }
+
+    protected function resolveVoucherEligibleBase(object $voucher, $items): float
+    {
+        $baseItems = collect($items);
+
+        if (Schema::hasTable('master_voucher_diskon_item')) {
+            $voucherItems = DB::table('master_voucher_diskon_item')
+                ->where('voucher_diskon_id', $voucher->id)
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                })
+                ->get();
+
+            if ($voucherItems->isNotEmpty()) {
+                $baseItems = $baseItems->filter(function ($item) use ($voucherItems) {
+                    return $voucherItems->contains(function ($rule) use ($item) {
+                        if ($rule->item_type === 'produk') {
+                            return $this->isProductItem($item) && (int) ($item->produk_id ?? 0) === (int) $rule->item_id;
+                        }
+                        if ($rule->item_type === 'treatment') {
+                            return $this->isTreatmentItem($item) && (int) ($item->treatment_id ?? 0) === (int) $rule->item_id;
+                        }
+                        return false;
+                    });
+                });
+            }
+        }
+
+        return (float) $baseItems->sum(fn ($item) => (float) ($item->subtotal ?? 0));
+    }
+
+    protected function createInvoicePromoRow(PembayaranInvoice $invoice, object $voucher, float $amount): void
+    {
+        DB::table('pembayaran_invoice_promo')->insert($this->onlyExistingColumns('pembayaran_invoice_promo', [
+            'pembayaran_id' => $invoice->id,
+            'voucher_id' => $voucher->id,
+            'kode_voucher' => $voucher->kode_voucher ?? null,
+            'nama_voucher' => $voucher->nama_voucher ?? null,
+            'scope_type' => $voucher->jenis_voucher_id ?? null,
+            'diskon_tipe' => $voucher->tipe_diskon ?? null,
+            'diskon_nilai' => $voucher->total_diskon ?? 0,
+            'diskon_amount' => $amount,
+            'catatan' => 'Redeem saat submit pembayaran',
+            'is_delete' => 0,
+            'created_by' => $this->username(),
+            'updated_by' => $this->username(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function resetInvoicePromoRows(PembayaranInvoice $invoice): void
+    {
+        DB::table('pembayaran_invoice_promo')
+            ->where('pembayaran_id', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->update($this->onlyExistingColumns('pembayaran_invoice_promo', [
+                'is_delete' => 1,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+    }
+
+    protected function redeemVoucherCodeIfNeeded(object $voucher, PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('master_voucher_diskon_kode')) {
+            return;
+        }
+
+        $row = DB::table('master_voucher_diskon_kode')
+            ->where('voucher_diskon_id', $voucher->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) use ($invoice) {
+                $q->where('status_kode', 1)
+                    ->orWhere(function ($sub) use ($invoice) {
+                        $sub->where('status_kode', 2)
+                            ->where('redeemed_invoice_no', $invoice->no_invoice);
+                    });
+            })
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->first();
+
+        if (!$row) {
+            return;
+        }
+
+        DB::table('master_voucher_diskon_kode')
+            ->where('id', $row->id)
+            ->update($this->onlyExistingColumns('master_voucher_diskon_kode', [
+                'status_kode' => 2,
+                'used_at' => now(),
+                'redeemed_invoice_no' => $invoice->no_invoice,
+                'redeemed_pasien_id' => $invoice->pasien_id,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+    }
+
+
+    protected function resolveDepositItemIds(Request $request, PembayaranInvoice $invoice): array
+    {
+        return array_keys($this->resolveDepositItems($request, $invoice));
+    }
+
+    protected function resolveDepositItems(Request $request, PembayaranInvoice $invoice): array
+    {
+        $result = [];
+
+        foreach ((array) $request->input('deposit_items', []) as $row) {
+            $itemId = (int) ($row['item_id'] ?? $row['id'] ?? $row['pembayaran_item_id'] ?? 0);
+            $qty = (float) ($row['qty'] ?? $row['jumlah'] ?? 0);
+
+            if ($itemId > 0 && $qty > 0) {
+                $result[$itemId] = $qty;
+            }
+        }
+
+        foreach ((array) $request->input('deposit_item_quantities', []) as $itemId => $qty) {
+            $itemId = (int) $itemId;
+            $qty = (float) $qty;
+
+            if ($itemId > 0 && $qty > 0) {
+                $result[$itemId] = $qty;
+            }
+        }
+
+        if (count($result) === 0) {
+            foreach ((array) $request->input('deposit_item_ids', []) as $id) {
+                $itemId = (int) $id;
+
+                if ($itemId > 0) {
+                    $result[$itemId] = 0;
+                }
+            }
+        }
+
+        if (count($result) === 0) {
+            return [];
+        }
+
+        $activeItems = $invoice->items
+            ? $invoice->items->filter(fn ($item) => (int) ($item->is_delete ?? 0) === 0 && $this->isTreatmentItem($item))
+            : collect();
+
+        $normalized = [];
+        foreach ($activeItems as $item) {
+            $itemId = (int) ($item->id ?? 0);
+            if ($itemId <= 0 || !array_key_exists($itemId, $result)) {
+                continue;
+            }
+
+            $invoiceQty = (float) ($item->qty ?? 0);
+            if ($invoiceQty <= 0) {
+                $invoiceQty = 1;
+            }
+
+            $selectedQty = (float) ($result[$itemId] ?? 0);
+            if ($selectedQty <= 0) {
+                $selectedQty = $invoiceQty;
+            }
+
+            $normalized[$itemId] = min(max($selectedQty, 1), $invoiceQty);
+        }
+
+        return $normalized;
+    }
+
+    protected function updatePatientPhoneFromRequest(Request $request, PembayaranInvoice $invoice): void
+    {
+        if (!$request->boolean('update_pasien_phone')) {
+            return;
+        }
+
+        if (!Schema::hasTable('pasien') || empty($invoice->pasien_id)) {
+            return;
+        }
+
+        $noHp = $this->normalizeIndonesianPhone($request->input('pasien_no_hp_update'));
+        $noWa = $this->normalizeIndonesianPhone($request->input('pasien_no_wa_update') ?: $request->input('pasien_no_hp_update'));
+        $noTelp = $this->normalizeIndonesianPhone($request->input('pasien_no_telp_update'));
+
+        if (!$noHp && !$noWa && !$noTelp) {
+            throw ValidationException::withMessages([
+                'pasien_no_hp_update' => 'Nomor telepon/HP/WA tidak boleh kosong jika memilih update nomor pasien.',
+            ]);
+        }
+
+        $payload = [];
+        if ($noHp) {
+            $payload['no_hp'] = $noHp;
+        }
+        if ($noWa) {
+            $payload['no_wa'] = $noWa;
+        }
+        if ($noTelp) {
+            $payload['no_telp'] = $noTelp;
+        }
+
+        $payload['updated_by'] = $this->username();
+        $payload['updated_at'] = now();
+
+        DB::table('pasien')
+            ->where('id', $invoice->pasien_id)
+            ->lockForUpdate()
+            ->update($this->onlyExistingColumns('pasien', $payload));
+    }
+
+    protected function normalizeIndonesianPhone($value): ?string
+    {
+        $digits = preg_replace('/[^0-9]/', '', (string) $value);
+        if ($digits === '') {
+            return null;
+        }
+
+        if (str_starts_with($digits, '62')) {
+            return $digits;
+        }
+
+        if (str_starts_with($digits, '0')) {
+            return '62' . substr($digits, 1);
+        }
+
+        if (str_starts_with($digits, '8')) {
+            return '62' . $digits;
+        }
+
+        return $digits;
+    }
+
+    protected function consumeVoucherQuotaIfNeeded(object $voucher, PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('master_voucher_diskon')) {
+            return;
+        }
+
+        if ((int) ($voucher->is_unlimited_generate ?? 0) === 1) {
+            return;
+        }
+
+        $affected = DB::table('master_voucher_diskon')
+            ->where('id', $voucher->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where('qty_generate', '>', 0)
+            ->decrement('qty_generate', 1, $this->onlyExistingColumns('master_voucher_diskon', [
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+
+        if ($affected < 1) {
+            throw ValidationException::withMessages([
+                'promo' => 'Kuota voucher ' . ($voucher->nama_voucher ?? $voucher->kode_voucher ?? '-') . ' sudah habis.',
+            ]);
+        }
+    }
+
+    protected function restoreVoucherQuotaFromInvoice(PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pembayaran_invoice_promo') || !Schema::hasTable('master_voucher_diskon')) {
+            return;
+        }
+
+        $voucherIds = DB::table('pembayaran_invoice_promo')
+            ->where('pembayaran_id', $invoice->id)
+            ->whereNotNull('voucher_id')
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->pluck('voucher_id')
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values();
+
+        foreach ($voucherIds as $voucherId) {
+            $voucher = DB::table('master_voucher_diskon')
+                ->where('id', $voucherId)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$voucher || (int) ($voucher->is_unlimited_generate ?? 0) === 1) {
+                continue;
+            }
+
+            DB::table('master_voucher_diskon')
+                ->where('id', $voucherId)
+                ->increment('qty_generate', 1, $this->onlyExistingColumns('master_voucher_diskon', [
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+        }
+    }
+
+    protected function applyMemberBenefitToInvoice(PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pasien_member')) {
+            return;
+        }
+
+        $member = $this->resolveActivePatientMember((int) $invoice->pasien_id);
+        if (!$member) {
+            $pointEarned = $this->calculatePointEarned($invoice, null, null);
+            $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+                'member_id' => null,
+                'member_no' => null,
+                'member_tier_id' => null,
+                'member_tier_nama' => null,
+                'diskon_member_amount' => 0,
+                'point_earned' => $pointEarned,
+                'poin' => $pointEarned,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+            return;
+        }
+
+        $tier = $this->resolveMemberTier((int) ($member->member_tier_id ?? 0));
+        $subtotal = (float) ($invoice->subtotal ?? 0);
+        $afterPromo = max(
+            $subtotal
+            - (float) ($invoice->diskon_subtotal_amount ?? 0)
+            - (float) ($invoice->total_promo ?? 0),
+            0
+        );
+
+        $diskonMember = 0;
+        $tierDiscount = (float) ($tier->diskon_persen ?? 0);
+        if ($tierDiscount > 0 && $afterPromo > 0) {
+            $diskonMember = round(($afterPromo * $tierDiscount) / 100, 2);
+        }
+
+        $pointEarned = $this->calculatePointEarned($invoice, $member, $tier);
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'member_id' => $member->id,
+            'member_no' => $member->no_member ?? null,
+            'member_tier_id' => $member->member_tier_id ?? null,
+            'member_tier_nama' => $tier->nama ?? null,
+            'diskon_member_amount' => $diskonMember,
+            'point_earned' => $pointEarned,
+            'poin' => $pointEarned,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function resolveActivePatientMember(int $pasienId): ?object
+    {
+        if ($pasienId <= 0 || !Schema::hasTable('pasien_member')) {
+            return null;
+        }
+
+        return DB::table('pasien_member')
+            ->where('pasien_id', $pasienId)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where('status', 1)
+            ->where(function ($q) {
+                $q->whereNull('tanggal_expired')->orWhereDate('tanggal_expired', '>=', Carbon::today());
+            })
+            ->orderByDesc('id')
+            ->lockForUpdate()
+            ->first();
+    }
+
+    protected function resolveMemberTier(int $tierId): ?object
+    {
+        if ($tierId <= 0 || !Schema::hasTable('master_member_tier')) {
+            return null;
+        }
+
+        return DB::table('master_member_tier')
+            ->where('id', $tierId)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('is_active')->orWhere('is_active', 1);
+            })
+            ->first();
+    }
+
+    protected function resolveActivePoinRule(): ?object
+    {
+        if (!Schema::hasTable('master_poin_rules')) {
+            return null;
+        }
+
+        return DB::table('master_poin_rules')
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('is_active')->orWhere('is_active', 1);
+            })
+            ->where(function ($q) {
+                $q->whereNull('berlaku_mulai')->orWhereDate('berlaku_mulai', '<=', Carbon::today());
+            })
+            ->where(function ($q) {
+                $q->whereNull('berlaku_sampai')->orWhereDate('berlaku_sampai', '>=', Carbon::today());
+            })
+            ->orderByDesc('berlaku_mulai')
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    protected function calculatePointEarned(PembayaranInvoice $invoice, ?object $member = null, ?object $tier = null): int
+    {
+        $base = (float) ($invoice->subtotal_treatment ?? 0);
+        if ($base <= 0) {
+            return 0;
+        }
+
+        $tierRate = (float) ($tier->point_rate ?? 0);
+        if ($tierRate > 0) {
+            return max((int) floor($base * $tierRate), 0);
+        }
+
+        $rule = $this->resolveActivePoinRule();
+        if (!$rule) {
+            return 0;
+        }
+
+        $minimal = (float) ($rule->minimal_transaksi ?? 0);
+        if ($minimal > 0 && $base < $minimal) {
+            return 0;
+        }
+
+        $nominalPerPoin = (float) ($rule->nominal_per_poin ?? 0);
+        if ($nominalPerPoin <= 0) {
+            return 0;
+        }
+
+        if ((int) ($rule->is_berlaku_kelipatan ?? 1) === 1) {
+            return max((int) floor($base / $nominalPerPoin), 0);
+        }
+
+        return $base >= $nominalPerPoin ? 1 : 0;
+    }
+
+    protected function processMemberPointLedger(PembayaranInvoice $invoice): void
+    {
+        $pointEarned = (int) round((float) ($invoice->point_earned ?? $invoice->poin ?? 0));
+        if ($pointEarned <= 0 || empty($invoice->pasien_id)) {
+            return;
+        }
+
+        if (Schema::hasTable('member_point_ledger') && !empty($invoice->member_id)) {
+            $exists = DB::table('member_point_ledger')
+                ->where('pembayaran_id', $invoice->id)
+                ->where('transaksi_type', 1)
+                ->where(function ($q) {
+                    $q->whereNull('is_void')->orWhere('is_void', 0);
+                })
+                ->exists();
+
+            if (!$exists) {
+                DB::table('member_point_ledger')->insert($this->onlyExistingColumns('member_point_ledger', [
+                    'member_id' => $invoice->member_id,
+                    'pasien_id' => $invoice->pasien_id,
+                    'pembayaran_id' => $invoice->id,
+                    'registrasi_id' => $invoice->registrasi_id,
+                    'transaksi_type' => 1,
+                    'point_masuk' => $pointEarned,
+                    'point_keluar' => 0,
+                    'nominal_referensi' => $invoice->subtotal_treatment ?? 0,
+                    'catatan' => 'Earn point pembayaran ' . $invoice->no_invoice,
+                    'tanggal_transaksi' => now(),
+                    'is_void' => 0,
+                    'created_by' => $this->username(),
+                    'updated_by' => $this->username(),
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]));
+
+                if (Schema::hasTable('pasien_member')) {
+                    DB::table('pasien_member')
+                        ->where('id', $invoice->member_id)
+                        ->update($this->onlyExistingColumns('pasien_member', [
+                            'total_spending' => DB::raw('total_spending + ' . (float) ($invoice->grand_total ?? 0)),
+                            'total_point' => DB::raw('total_point + ' . $pointEarned),
+                            'point_sisa' => DB::raw('point_sisa + ' . $pointEarned),
+                            'updated_by' => $this->username(),
+                            'updated_at' => now(),
+                        ]));
+                }
+            }
+        }
+
+        if (Schema::hasTable('pasien_poin_ledger')) {
+            $existsPasienLedger = DB::table('pasien_poin_ledger')
+                ->where('source_table', 'pembayaran_invoice')
+                ->where('source_id', $invoice->id)
+                ->where('tipe_mutasi', 'earn')
+                ->where(function ($q) {
+                    $q->whereNull('is_void')->orWhere('is_void', 0);
+                })
+                ->exists();
+
+            if (!$existsPasienLedger) {
+                $lastSaldo = (int) DB::table('pasien_poin_ledger')
+                    ->where('pasien_id', $invoice->pasien_id)
+                    ->where(function ($q) {
+                        $q->whereNull('is_void')->orWhere('is_void', 0);
+                    })
+                    ->orderByDesc('id')
+                    ->value('saldo_setelah');
+
+                DB::table('pasien_poin_ledger')->insert($this->onlyExistingColumns('pasien_poin_ledger', [
+                    'pasien_id' => $invoice->pasien_id,
+                    'toko_id' => $invoice->toko_id,
+                    'source_table' => 'pembayaran_invoice',
+                    'source_id' => $invoice->id,
+                    'source_no' => $invoice->no_invoice,
+                    'tanggal' => now(),
+                    'tipe_mutasi' => 'earn',
+                    'poin_masuk' => $pointEarned,
+                    'poin_keluar' => 0,
+                    'saldo_sebelum' => $lastSaldo,
+                    'saldo_setelah' => $lastSaldo + $pointEarned,
+                    'nominal_transaksi' => $invoice->subtotal_treatment ?? 0,
+                    'rule_id' => optional($this->resolveActivePoinRule())->id,
+                    'keterangan' => 'Earn point pembayaran ' . $invoice->no_invoice,
+                    'is_void' => 0,
+                    'created_by' => null,
+                    'created_at' => now(),
+                ]));
+            }
+        }
+    }
+
+    protected function rollbackMemberPointLedger(PembayaranInvoice $invoice, string $reason): void
+    {
+        if (Schema::hasTable('member_point_ledger')) {
+            $ledgers = DB::table('member_point_ledger')
+                ->where('pembayaran_id', $invoice->id)
+                ->where(function ($q) {
+                    $q->whereNull('is_void')->orWhere('is_void', 0);
+                })
+                ->lockForUpdate()
+                ->get();
+
+            foreach ($ledgers as $ledger) {
+                DB::table('member_point_ledger')
+                    ->where('id', $ledger->id)
+                    ->update($this->onlyExistingColumns('member_point_ledger', [
+                        'is_void' => 1,
+                        'catatan' => trim((string) ($ledger->catatan ?? '') . ' | VOID: ' . $reason),
+                        'updated_by' => $this->username(),
+                        'updated_at' => now(),
+                    ]));
+
+                if (Schema::hasTable('pasien_member') && (int) ($ledger->transaksi_type ?? 0) === 1) {
+                    DB::table('pasien_member')
+                        ->where('id', $ledger->member_id)
+                        ->update($this->onlyExistingColumns('pasien_member', [
+                            'total_point' => DB::raw('GREATEST(total_point - ' . (float) ($ledger->point_masuk ?? 0) . ', 0)'),
+                            'point_sisa' => DB::raw('GREATEST(point_sisa - ' . (float) ($ledger->point_masuk ?? 0) . ', 0)'),
+                            'updated_by' => $this->username(),
+                            'updated_at' => now(),
+                        ]));
+                }
+            }
+        }
+
+        if (Schema::hasTable('pasien_poin_ledger')) {
+            DB::table('pasien_poin_ledger')
+                ->where('source_table', 'pembayaran_invoice')
+                ->where('source_id', $invoice->id)
+                ->where(function ($q) {
+                    $q->whereNull('is_void')->orWhere('is_void', 0);
+                })
+                ->update($this->onlyExistingColumns('pasien_poin_ledger', [
+                    'is_void' => 1,
+                    'keterangan' => DB::raw("CONCAT(COALESCE(keterangan, ''), ' | VOID: " . addslashes($reason) . "')"),
+                ]));
+        }
+    }
+
+    protected function createAccurateSyncPendingLog(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
+    {
+        if (!Schema::hasTable('accurate_sync_log')) {
+            return;
+        }
+
+        $items = $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->get()
+            ->filter(function ($item) {
+                $send = (int) ($item->is_send_to_accurate ?? 0) === 1;
+                $sendZero = (int) ($item->send_when_zero ?? 0) === 1;
+                $subtotal = (float) ($item->subtotal ?? 0);
+                return $send && ($subtotal > 0 || $sendZero);
+            })
+            ->values();
+
+        if ($items->isEmpty()) {
+            return;
+        }
+
+        $payload = $this->buildAccuratePendingPayload($invoice, $registrasi, $items);
+
+        $existing = DB::table('accurate_sync_log')
+            ->where('pembayaran_id', $invoice->id)
+            ->where('sync_type', 'sales_invoice')
+            ->whereIn('status', [0, 2])
+            ->lockForUpdate()
+            ->first();
+
+        $data = $this->onlyExistingColumns('accurate_sync_log', [
+            'pembayaran_id' => $invoice->id,
+            'no_invoice' => $invoice->no_invoice,
+            'sync_type' => 'sales_invoice',
+            'status' => 0,
+            'request_payload' => json_encode($payload, JSON_UNESCAPED_UNICODE),
+            'error_message' => null,
+            'updated_at' => now(),
+            'created_at' => now(),
+        ]);
+
+        if ($existing) {
+            unset($data['created_at']);
+            DB::table('accurate_sync_log')->where('id', $existing->id)->update($data);
+        } else {
+            DB::table('accurate_sync_log')->insert($data);
+        }
+    }
+
+    protected function buildAccuratePendingPayload(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi, $items): array
+    {
+        return [
+            'no_invoice' => $invoice->no_invoice,
+            'tanggal_invoice' => $invoice->tanggal_invoice,
+            'tanggal_lunas' => now()->toDateTimeString(),
+            'toko_id' => $invoice->toko_id,
+            'registrasi_id' => $invoice->registrasi_id,
+            'kode_registrasi' => $invoice->kode_registrasi,
+            'pasien_id' => $invoice->pasien_id,
+            'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
+            'grand_total' => (float) ($invoice->grand_total ?? 0),
+            'items' => $items->map(function ($item) {
+                return [
+                    'item_id' => $item->id,
+                    'item_type' => $item->item_type,
+                    'nama_item' => $item->nama_item,
+                    'qty' => (float) ($item->qty ?? 0),
+                    'harga' => (float) ($item->harga ?? 0),
+                    'subtotal' => (float) ($item->subtotal ?? 0),
+                    'accurate_mapping_id' => $item->accurate_mapping_id,
+                    'accurate_source_type' => $item->accurate_source_type,
+                    'accurate_source_code' => $item->accurate_source_code,
+                    'kode_accurate' => $item->kode_accurate_snapshot,
+                    'nama_accurate' => $item->nama_accurate_snapshot,
+                    'send_when_zero' => (int) ($item->send_when_zero ?? 0),
+                ];
+            })->values()->all(),
+        ];
+    }
+
+    protected function rollbackPaymentSideEffects(PembayaranInvoice $invoice, string $reason): void
+    {
+        $this->voidPaymentStockMutations($invoice, $reason);
+        $this->releasePaymentReservations($invoice, $reason);
+        $this->rollbackVoucherRedeem($invoice);
+        $this->rollbackDepositPurchaseRecords($invoice);
+        $this->rollbackDepositClaimRecords($invoice);
+        $this->cancelAccurateSyncLog($invoice, $reason);
+        $this->rollbackMemberPointLedger($invoice, $reason);
+    }
+
+    protected function voidPaymentStockMutations(PembayaranInvoice $invoice, string $reason): void
+    {
+        if (!Schema::hasTable('stock_mutasi_produk')) {
+            return;
+        }
+
+        DB::table('stock_mutasi_produk')
+            ->where('ref_type', 'PEMBAYARAN')
+            ->where('ref_table', 'pembayaran_invoice')
+            ->where('ref_id', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_void')->orWhere('is_void', 0);
+            })
+            ->update($this->onlyExistingColumns('stock_mutasi_produk', [
+                'is_void' => 1,
+                'void_reason' => $reason,
+            ]));
+    }
+
+    protected function releasePaymentReservations(PembayaranInvoice $invoice, string $reason): void
+    {
+        if (!Schema::hasTable('stock_reservasi_produk')) {
+            return;
+        }
+
+        $reservationIds = $invoice->items()
+            ->whereNotNull('stock_reservasi_id')
+            ->pluck('stock_reservasi_id')
+            ->filter()
+            ->unique()
+            ->values()
+            ->all();
+
+        if (count($reservationIds) === 0) {
+            return;
+        }
+
+        DB::table('stock_reservasi_produk')
+            ->whereIn('id', $reservationIds)
+            ->whereIn('status', [0, 1])
+            ->update($this->onlyExistingColumns('stock_reservasi_produk', [
+                'status' => 3,
+                'released_at' => now(),
+                'keterangan' => $reason,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+    }
+
+    protected function rollbackVoucherRedeem(PembayaranInvoice $invoice): void
+    {
+        $this->restoreVoucherQuotaFromInvoice($invoice);
+
+        if (Schema::hasTable('master_voucher_diskon_kode')) {
+            DB::table('master_voucher_diskon_kode')
+                ->where('redeemed_invoice_no', $invoice->no_invoice)
+                ->update($this->onlyExistingColumns('master_voucher_diskon_kode', [
+                    'status_kode' => 1,
+                    'used_at' => null,
+                    'redeemed_invoice_no' => null,
+                    'redeemed_pasien_id' => null,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+        }
+
+        if (Schema::hasTable('pembayaran_invoice_promo')) {
+            DB::table('pembayaran_invoice_promo')
+                ->where('pembayaran_id', $invoice->id)
+                ->update($this->onlyExistingColumns('pembayaran_invoice_promo', [
+                    'is_delete' => 1,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+        }
+    }
+
+    protected function rollbackDepositPurchaseRecords(PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pembayaran_deposit_treatment')) {
+            return;
+        }
+
+        DB::table('pembayaran_deposit_treatment')
+            ->where('pembayaran_id', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->update($this->onlyExistingColumns('pembayaran_deposit_treatment', [
+                'status' => 9,
+                'is_delete' => 1,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+    }
+
+    protected function rollbackDepositClaimRecords(PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pembayaran_deposit_treatment_claim') || !Schema::hasTable('pembayaran_deposit_treatment')) {
+            return;
+        }
+
+        $claims = DB::table('pembayaran_deposit_treatment_claim')
+            ->where('pembayaran_id', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->get();
+
+        foreach ($claims as $claim) {
+            $deposit = DB::table('pembayaran_deposit_treatment')
+                ->where('id', $claim->deposit_treatment_id)
+                ->lockForUpdate()
+                ->first();
+
+            if ($deposit) {
+                DB::table('pembayaran_deposit_treatment')
+                    ->where('id', $deposit->id)
+                    ->update($this->onlyExistingColumns('pembayaran_deposit_treatment', [
+                        'qty_claimed' => max((float) ($deposit->qty_claimed ?? 0) - (float) ($claim->qty_claim ?? 0), 0),
+                        'qty_sisa' => (float) ($deposit->qty_sisa ?? 0) + (float) ($claim->qty_claim ?? 0),
+                        'nilai_claimed' => max((float) ($deposit->nilai_claimed ?? 0) - (float) ($claim->nilai_realisasi ?? 0), 0),
+                        'nilai_sisa' => (float) ($deposit->nilai_sisa ?? 0) + (float) ($claim->nilai_realisasi ?? 0),
+                        'status' => 1,
+                        'updated_by' => $this->username(),
+                        'updated_at' => now(),
+                    ]));
+            }
+        }
+
+        DB::table('pembayaran_deposit_treatment_claim')
+            ->where('pembayaran_id', $invoice->id)
+            ->update($this->onlyExistingColumns('pembayaran_deposit_treatment_claim', [
+                'status' => 9,
+                'is_delete' => 1,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+    }
+
+    protected function cancelAccurateSyncLog(PembayaranInvoice $invoice, string $reason): void
+    {
+        if (!Schema::hasTable('accurate_sync_log')) {
+            return;
+        }
+
+        DB::table('accurate_sync_log')
+            ->where('pembayaran_id', $invoice->id)
+            ->where('status', 0)
+            ->update($this->onlyExistingColumns('accurate_sync_log', [
+                'status' => 2,
+                'error_message' => $reason,
+                'updated_at' => now(),
+            ]));
+    }
+
+    protected function resolveAccurateMapping(string $sourceType, string $sourceCode): ?object
+    {
+        if (!Schema::hasTable('master_accurate_item_mapping')) {
+            return null;
+        }
+
+        return DB::table('master_accurate_item_mapping')
+            ->where(function ($q) use ($sourceType) {
+                $q->where('source_type', $sourceType)
+                    ->orWhere('source_type', strtoupper($sourceType));
+            })
+            ->where(function ($q) use ($sourceCode) {
+                $q->where('source_code', $sourceCode)
+                    ->orWhere('source_code', strtoupper($sourceCode))
+                    ->orWhere('source_code', strtolower($sourceCode));
+            })
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('is_active')->orWhere('is_active', 1);
+            })
+            ->orderBy('sort_order')
+            ->first();
+    }
+
+    protected function mappingShouldSendWhenZero(?object $mapping): bool
+    {
+        return $mapping && (int) ($mapping->is_send_to_accurate ?? 0) === 1 && (int) ($mapping->send_when_zero ?? 0) === 1;
     }
 
     protected function normalizeMetodePayload(Request $request, PembayaranInvoice $invoice): array
@@ -1663,11 +3004,196 @@ class PembayaranController extends Controller
 
         $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
 
+        $activeKonsultasiSourceIds = $this->syncKonsultasiInvoiceItemFromRegistrasi($invoice, $registrasi);
         $activeTreatmentSourceIds = $this->syncTreatmentInvoiceItemsFromRegistrasi($invoice, $registrasi);
         $activePenjualanSourceIds = $this->syncPenjualanInvoiceItemsFromRegistrasi($invoice, $registrasi);
+        $activeMarkerSourceIds = $this->syncAccurateMarkerItemsFromRegistrasi($invoice, $registrasi);
 
-        $this->markRemovedInvoiceItems($invoice, 1, $activeTreatmentSourceIds);
-        $this->markRemovedInvoiceItems($invoice, 2, $activePenjualanSourceIds);
+        $this->markRemovedInvoiceItems($invoice, 1, $activeKonsultasiSourceIds);
+        $this->markRemovedInvoiceItems($invoice, 2, $activeTreatmentSourceIds);
+        $this->markRemovedInvoiceItems($invoice, 3, $activePenjualanSourceIds);
+        $this->markRemovedInvoiceItems($invoice, 5, $activeMarkerSourceIds);
+    }
+
+
+    protected function syncKonsultasiInvoiceItemFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): array
+    {
+        $hasConsultation = $this->hasRegistrasiConsultation($registrasi);
+        $sourceId = (int) ($registrasi->id ?? 0);
+
+        if (!$hasConsultation || $sourceId <= 0) {
+            return [];
+        }
+
+        $sourceCode = strtoupper((string) ($registrasi->konsultasi_source_code ?: $registrasi->channel_konsultasi ?: 'KONSULTASI'));
+        $mapping = $this->resolveAccurateMapping('konsultasi', $sourceCode);
+        $subtotal = (float) ($registrasi->total_konsultasi ?? 0);
+
+        if ($subtotal <= 0 && $mapping && (int) ($mapping->is_billable ?? 0) === 1) {
+            $subtotal = (float) ($mapping->default_harga ?? 0);
+        }
+
+        if ($subtotal <= 0 && !$this->mappingShouldSendWhenZero($mapping)) {
+            return [];
+        }
+
+        $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
+            'pembayaran_id' => $invoice->id,
+            'registrasi_id' => $registrasi->id,
+            'item_type' => 1,
+            'source_type' => 3,
+            'source_detail_id' => $sourceId,
+            'accurate_mapping_id' => $mapping->id ?? null,
+            'accurate_source_type' => $mapping->source_type ?? 'konsultasi',
+            'accurate_source_code' => $mapping->source_code ?? $sourceCode,
+            'kode_accurate_snapshot' => $mapping->kode_accurate ?? null,
+            'nama_accurate_snapshot' => $mapping->nama_accurate ?? null,
+            'is_send_to_accurate' => $mapping ? (int) ($mapping->is_send_to_accurate ?? 0) : 0,
+            'send_when_zero' => $mapping ? (int) ($mapping->send_when_zero ?? 0) : 0,
+            'nama_item' => $registrasi->konsultasi_source_name ?: ($mapping->source_name ?? 'Konsultasi'),
+            'satuan' => 'x',
+            'qty' => 1,
+            'harga' => $subtotal,
+            'diskon_tipe' => 0,
+            'diskon_nilai' => 0,
+            'diskon_amount' => 0,
+            'diskon_referral' => 0,
+            'subtotal' => $subtotal,
+            'dokter_id' => $registrasi->dokter_awal_id ?? null,
+            'perawat_id' => $registrasi->perawat_awal_id ?? null,
+            'status' => 1,
+            'is_delete' => 0,
+            'created_by' => $this->username(),
+            'updated_by' => $this->username(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $this->upsertInvoiceItemBySource($invoice->id, 1, 3, $sourceId, $payload);
+
+        return [$sourceId];
+    }
+
+    protected function syncAccurateMarkerItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): array
+    {
+        $activeIds = [];
+
+        if ((int) ($registrasi->is_pembelian_online ?? 0) === 1) {
+            $sourceId = (int) ($registrasi->id ?? 0);
+            $mapping = $this->resolveAccurateMapping('marker', 'PEMBELIAN_ONLINE')
+                ?: $this->resolveAccurateMapping('pembelian_online', 'PEMBELIAN_ONLINE');
+
+            if ($sourceId > 0 && $this->mappingShouldSendWhenZero($mapping)) {
+                $activeIds[] = $sourceId;
+                $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
+                    'pembayaran_id' => $invoice->id,
+                    'registrasi_id' => $registrasi->id,
+                    'item_type' => 5,
+                    'source_type' => 4,
+                    'source_detail_id' => $sourceId,
+                    'accurate_mapping_id' => $mapping->id ?? null,
+                    'accurate_source_type' => $mapping->source_type ?? 'marker',
+                    'accurate_source_code' => $mapping->source_code ?? 'PEMBELIAN_ONLINE',
+                    'kode_accurate_snapshot' => $mapping->kode_accurate ?? null,
+                    'nama_accurate_snapshot' => $mapping->nama_accurate ?? null,
+                    'is_send_to_accurate' => $mapping ? (int) ($mapping->is_send_to_accurate ?? 0) : 0,
+                    'send_when_zero' => $mapping ? (int) ($mapping->send_when_zero ?? 0) : 0,
+                    'nama_item' => $mapping->source_name ?? 'Pembelian Online',
+                    'satuan' => 'x',
+                    'qty' => 1,
+                    'harga' => 0,
+                    'subtotal' => 0,
+                    'status' => 1,
+                    'is_delete' => 0,
+                    'created_by' => $this->username(),
+                    'updated_by' => $this->username(),
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ]);
+
+                $this->upsertInvoiceItemBySource($invoice->id, 5, 4, $sourceId, $payload);
+            }
+        }
+
+        return $activeIds;
+    }
+
+
+    protected function resolveTreatmentPrice($detail, RegistrasiKunjungan $registrasi): float
+    {
+        $candidateFields = [
+            'harga',
+            'harga_treatment',
+            'tarif',
+            'harga_terendah',
+            'price',
+        ];
+
+        foreach ($candidateFields as $field) {
+            $value = (float) ($detail->{$field} ?? 0);
+            if ($value > 0) {
+                return $value;
+            }
+        }
+
+        $treatmentTokoId = (int) ($detail->treatment_toko_id ?? 0);
+        $treatmentId = (int) ($detail->treatment_id ?? 0);
+        $tokoId = (int) ($registrasi->toko_id ?? 0);
+
+        if (Schema::hasTable('master_treatment_toko')) {
+            $query = DB::table('master_treatment_toko')
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                });
+
+            if ($treatmentTokoId > 0) {
+                $row = (clone $query)
+                    ->where('id', $treatmentTokoId)
+                    ->first(['tarif', 'harga_terendah']);
+
+                $price = $this->pickPositiveAmount([
+                    $row->tarif ?? 0,
+                    $row->harga_terendah ?? 0,
+                ]);
+
+                if ($price > 0) {
+                    return $price;
+                }
+            }
+
+            if ($treatmentId > 0 && $tokoId > 0) {
+                $row = (clone $query)
+                    ->where('treatment_id', $treatmentId)
+                    ->where('toko_id', $tokoId)
+                    ->first(['tarif', 'harga_terendah']);
+
+                $price = $this->pickPositiveAmount([
+                    $row->tarif ?? 0,
+                    $row->harga_terendah ?? 0,
+                ]);
+
+                if ($price > 0) {
+                    return $price;
+                }
+            }
+        }
+
+        $qty = max((float) ($detail->jumlah ?? $detail->qty ?? 1), 1);
+        $subtotal = (float) ($detail->total ?? $detail->subtotal ?? 0);
+
+        return $subtotal > 0 ? round($subtotal / $qty, 2) : 0.0;
+    }
+
+    protected function pickPositiveAmount(array $values): float
+    {
+        foreach ($values as $value) {
+            $amount = (float) $value;
+            if ($amount > 0) {
+                return $amount;
+            }
+        }
+
+        return 0.0;
     }
 
     protected function syncTreatmentInvoiceItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): array
@@ -1688,9 +3214,10 @@ class PembayaranController extends Controller
             $activeIds[] = $sourceId;
 
             $qty = max((float) ($detail->jumlah ?? $detail->qty ?? 1), 1);
-            $harga = (float) ($detail->harga ?? $detail->harga_treatment ?? 0);
+            $harga = $this->resolveTreatmentPrice($detail, $registrasi);
             $gross = $harga * $qty;
-            $subtotal = (float) ($detail->total ?? $detail->subtotal ?? $gross);
+            $rawSubtotal = (float) ($detail->total ?? $detail->subtotal ?? 0);
+            $subtotal = $rawSubtotal > 0 ? $rawSubtotal : $gross;
 
             $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
                 'pembayaran_id' => $invoice->id,
@@ -1836,11 +3363,11 @@ class PembayaranController extends Controller
         DB::table('pembayaran_invoice_item')->insert($payload);
     }
 
-    protected function markRemovedInvoiceItems(PembayaranInvoice $invoice, int $sourceType, array $activeSourceIds): void
+    protected function markRemovedInvoiceItems(PembayaranInvoice $invoice, int $itemType, array $activeSourceIds): void
     {
         $query = DB::table('pembayaran_invoice_item')
             ->where('pembayaran_id', $invoice->id)
-            ->where('source_type', $sourceType)
+            ->where('item_type', $itemType)
             ->where(function ($q) {
                 $q->whereNull('is_delete')->orWhere('is_delete', 0);
             });
@@ -1882,9 +3409,17 @@ class PembayaranController extends Controller
         }
 
         $subtotal = $subtotalTreatment + $subtotalProduk + $subtotalKonsultasi;
-        $diskonSubtotal = (float) ($invoice->diskon_subtotal_amount ?? $invoice->diskon_subtotal ?? 0);
+        $prorationBase = $subtotalTreatment + $subtotalProduk;
+        $diskonSubtotal = min(
+            max((float) ($invoice->diskon_subtotal_amount ?? $invoice->diskon_subtotal ?? 0), 0),
+            max($prorationBase, 0)
+        );
+
+        $this->prorateSubtotalDiscountToItems($invoice, $diskonSubtotal);
+
         $diskonPromo = (float) ($invoice->total_promo ?? $invoice->diskon_promo ?? 0);
-        $grandTotal = max($subtotal - $diskonSubtotal - $diskonPromo, 0);
+        $diskonMember = (float) ($invoice->diskon_member_amount ?? 0);
+        $grandTotal = max($subtotal - $diskonSubtotal - $diskonPromo - $diskonMember, 0);
 
         $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
             'subtotal_obat' => $subtotalProduk,
@@ -1892,11 +3427,142 @@ class PembayaranController extends Controller
             'subtotal_treatment' => $subtotalTreatment,
             'subtotal_konsultasi' => $subtotalKonsultasi,
             'subtotal' => $subtotal,
+            'diskon_subtotal_amount' => $diskonSubtotal,
             'grand_total' => $grandTotal,
             'sisa_tagihan' => max($grandTotal - (float) ($invoice->total_bayar ?? 0), 0),
             'updated_by' => $this->username(),
             'updated_at' => now(),
         ]));
+
+        $invoice->forceFill([
+            'subtotal_produk' => $subtotalProduk,
+            'subtotal_treatment' => $subtotalTreatment,
+            'subtotal_konsultasi' => $subtotalKonsultasi,
+            'subtotal' => $subtotal,
+            'diskon_subtotal_amount' => $diskonSubtotal,
+            'grand_total' => $grandTotal,
+        ]);
+    }
+
+
+    protected function normalizeSubtotalDiscountType($value): int
+    {
+        $text = strtolower(trim((string) $value));
+
+        if ($text === '1' || $text === '%' || $text === 'percent' || $text === 'persen') {
+            return 1;
+        }
+
+        if ($text === '2' || $text === 'rp' || $text === 'rupiah' || $text === 'nominal') {
+            return 2;
+        }
+
+        return 0;
+    }
+
+    protected function getSubtotalDiscountProrationBase(PembayaranInvoice $invoice): float
+    {
+        if (!Schema::hasTable('pembayaran_invoice_item')) {
+            return 0.0;
+        }
+
+        return (float) DB::table('pembayaran_invoice_item')
+            ->where('pembayaran_id', $invoice->id)
+            ->whereIn('item_type', [2, 3])
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->sum('subtotal');
+    }
+
+    protected function prorateSubtotalDiscountToItems(PembayaranInvoice $invoice, float $diskonSubtotal): void
+    {
+        if (!Schema::hasTable('pembayaran_invoice_item')) {
+            return;
+        }
+
+        $hasProrataAmount = Schema::hasColumn('pembayaran_invoice_item', 'diskon_subtotal_amount');
+        $hasBeforeColumn = Schema::hasColumn('pembayaran_invoice_item', 'subtotal_before_diskon_subtotal');
+        $hasAfterColumn = Schema::hasColumn('pembayaran_invoice_item', 'subtotal_after_diskon_subtotal');
+
+        if (!$hasProrataAmount && !$hasBeforeColumn && !$hasAfterColumn) {
+            return;
+        }
+
+        $items = DB::table('pembayaran_invoice_item')
+            ->where('pembayaran_id', $invoice->id)
+            ->whereIn('item_type', [2, 3])
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get(['id', 'subtotal']);
+
+        $baseSubtotal = (float) $items->sum(fn ($item) => (float) ($item->subtotal ?? 0));
+        $diskonSubtotal = min(max($diskonSubtotal, 0), max($baseSubtotal, 0));
+
+        if ($items->isEmpty() || $baseSubtotal <= 0 || $diskonSubtotal <= 0) {
+            foreach ($items as $item) {
+                $subtotal = (float) ($item->subtotal ?? 0);
+                $payload = [
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ];
+
+                if ($hasProrataAmount) {
+                    $payload['diskon_subtotal_amount'] = 0;
+                }
+                if ($hasBeforeColumn) {
+                    $payload['subtotal_before_diskon_subtotal'] = $subtotal;
+                }
+                if ($hasAfterColumn) {
+                    $payload['subtotal_after_diskon_subtotal'] = $subtotal;
+                }
+
+                DB::table('pembayaran_invoice_item')
+                    ->where('id', $item->id)
+                    ->update($this->onlyExistingColumns('pembayaran_invoice_item', $payload));
+            }
+
+            return;
+        }
+
+        $allocated = 0.0;
+        $lastIndex = $items->count() - 1;
+
+        foreach ($items->values() as $index => $item) {
+            $subtotal = (float) ($item->subtotal ?? 0);
+
+            if ($index === $lastIndex) {
+                $amount = round($diskonSubtotal - $allocated, 2);
+            } else {
+                $amount = round(($subtotal / $baseSubtotal) * $diskonSubtotal, 2);
+                $allocated += $amount;
+            }
+
+            $amount = min(max($amount, 0), $subtotal);
+            $afterSubtotal = max($subtotal - $amount, 0);
+
+            $payload = [
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ];
+
+            if ($hasProrataAmount) {
+                $payload['diskon_subtotal_amount'] = $amount;
+            }
+            if ($hasBeforeColumn) {
+                $payload['subtotal_before_diskon_subtotal'] = $subtotal;
+            }
+            if ($hasAfterColumn) {
+                $payload['subtotal_after_diskon_subtotal'] = $afterSubtotal;
+            }
+
+            DB::table('pembayaran_invoice_item')
+                ->where('id', $item->id)
+                ->update($this->onlyExistingColumns('pembayaran_invoice_item', $payload));
+        }
     }
 
     protected function calculateInvoiceItemDiscountAmount(float $gross, int $diskonTipe, float $diskonNilai): float
