@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api\Kasir;
 
 use App\Http\Controllers\Controller;
+use App\Models\Pembayaran\PembayaranDepositTreatment;
 use App\Models\Pembayaran\PembayaranDepositTreatmentClaim;
 use App\Models\Pembayaran\PembayaranInvoice;
 use App\Models\Pembayaran\PembayaranInvoiceMetode;
@@ -290,6 +291,9 @@ class PembayaranController extends Controller
             'jumlah_bayar' => 'nullable|numeric|min:0',
             'catatan_pembayaran' => 'nullable|string',
             'jenis_transaksi' => 'nullable|integer|in:0,1,2,3,4',
+            'referensi_dokter_id' => 'nullable|integer',
+            'deposit_expired_option_id' => 'nullable|integer',
+            'deposit_expired_at' => 'nullable|date',
             'sumber_informasi_id' => 'nullable|integer',
             'sumber_kedatangan' => 'nullable|string|max:100',
         ]);
@@ -335,6 +339,15 @@ class PembayaranController extends Controller
 
                 $this->ensureLegacyInvoiceNumber($invoice, $registrasi);
 
+                $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
+                $this->syncInvoiceItemsFromRegistrasi($invoice, $registrasi);
+                $this->refreshInvoiceTotalsFromItems($invoice);
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
                 $invoice->load([
                     'items',
                     'metode',
@@ -342,19 +355,39 @@ class PembayaranController extends Controller
                     'depositClaims',
                 ]);
 
+                $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
+                $depositExpiredAt = $this->resolveDepositExpiredAt($request);
+
+                $this->validateJenisTransaksiKhusus($request, $invoice, $jenisTransaksi, $depositExpiredAt);
+                $this->syncJenisTransaksiToInvoiceItems($invoice, $jenisTransaksi);
+
                 $metode = $this->normalizeMetodePayload($request, $invoice);
                 $totalBayar = collect($metode)->sum('nominal_dialokasikan');
                 $grandTotal = (float) ($invoice->grand_total ?? 0);
 
                 $this->validatePaymentAmount($grandTotal, $totalBayar);
 
-                $this->replaceInvoiceMetode($invoice, $metode);
+                $this->replaceInvoiceMetode($invoice, $metode, $jenisTransaksi);
 
-                $this->processStockKeluarPembayaran($invoice, $registrasi);
+                if ($jenisTransaksi === 4) {
+                    $this->applyDepositTransactionRules($invoice, $request, $depositExpiredAt);
+                    $this->generateDepositTreatmentRecords($invoice);
+                } else {
+                    $this->processStockKeluarPembayaran($invoice, $registrasi);
+                }
 
                 $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
                     'tanggal_lunas' => now(),
-                    'jenis_transaksi' => (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0),
+                    'jenis_transaksi' => $jenisTransaksi,
+                    'referensi_dokter_id' => $jenisTransaksi === 4
+                        ? $request->input('referensi_dokter_id')
+                        : ($request->input('referensi_dokter_id', $invoice->referensi_dokter_id ?? null)),
+                    'deposit_expired_option_id' => $jenisTransaksi === 4
+                        ? $request->input('deposit_expired_option_id')
+                        : ($invoice->deposit_expired_option_id ?? null),
+                    'deposit_expired_at' => $jenisTransaksi === 4
+                        ? $depositExpiredAt
+                        : ($invoice->deposit_expired_at ?? null),
                     'sumber_informasi_id' => $request->input('sumber_informasi_id', $invoice->sumber_informasi_id ?? null),
                     'sumber_kedatangan' => $request->input('sumber_kedatangan', $invoice->sumber_kedatangan ?? null),
                     'catatan' => $request->input('catatan_pembayaran', $invoice->catatan ?? null),
@@ -760,6 +793,9 @@ class PembayaranController extends Controller
             'metode' => $invoice->metode?->where('is_delete', 0)->values() ?? [],
             'metode_pembayaran' => $metodePembayaran,
             'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
+            'referensi_dokter_id' => $invoice->referensi_dokter_id ?? null,
+            'deposit_expired_option_id' => $invoice->deposit_expired_option_id ?? null,
+            'deposit_expired_at' => $invoice->deposit_expired_at ?? null,
             'sumber_informasi_id' => $invoice->sumber_informasi_id ?? null,
             'sumber_kedatangan' => $invoice->sumber_kedatangan ?? null,
             'channel_konsultasi' => $registrasi?->channel_konsultasi ?? null,
@@ -778,22 +814,60 @@ class PembayaranController extends Controller
         $registrasi = $invoice->registrasi;
         $pasien = $registrasi?->pasien;
         $subtotalProduk = $this->invoiceSubtotalProduk($invoice);
+        $items = $invoice->items?->where('is_delete', 0)->values() ?? collect();
+        $metode = $invoice->metode?->where('is_delete', 0)->values() ?? collect();
+        $promo = $invoice->promos?->where('is_delete', 0)->values() ?? collect();
+        $tanggalKunjungan = $registrasi?->tanggal_kunjungan
+            ?? $registrasi?->tanggal
+            ?? $invoice->tanggal_invoice;
+        $tanggalKunjunganDate = $tanggalKunjungan
+            ? Carbon::parse($tanggalKunjungan)->toDateString()
+            : null;
+        $tanggalInvoiceDate = $invoice->tanggal_invoice
+            ? Carbon::parse($invoice->tanggal_invoice)->toDateString()
+            : null;
+        $voucherLabel = $promo->isNotEmpty()
+            ? $promo->pluck('nama_voucher')->filter()->implode(', ')
+            : null;
 
         return [
             'id' => $invoice->id,
             'invoice_id' => $invoice->id,
             'registrasi_id' => $invoice->registrasi_id,
             'no_invoice' => $invoice->no_invoice,
+            'nomor_invoice' => $invoice->no_invoice,
+            'invoice_number' => $invoice->no_invoice,
             'kode_registrasi' => $invoice->kode_registrasi,
+            'nomor_kunjungan' => $invoice->kode_registrasi,
             'tanggal_invoice' => $invoice->tanggal_invoice,
+            'tanggal_invoice_date' => $tanggalInvoiceDate,
             'tanggal_lunas' => $invoice->tanggal_lunas,
+            'tanggal_kunjungan' => $tanggalKunjunganDate,
+            'tanggal' => $tanggalKunjunganDate,
+            'registered_at' => $registrasi?->registered_at ?? null,
             'toko_id' => $invoice->toko_id,
+            'pasien_id' => $pasien?->id ?? $invoice->pasien_id,
+            'pasien_nama' => $pasien?->nama ?? $invoice->nama_pasien ?? null,
+            'nama_pasien' => $pasien?->nama ?? $invoice->nama_pasien ?? null,
+            'no_rm' => $pasien?->no_rm ?? null,
+            'pasien_no_rm' => $pasien?->no_rm ?? null,
+            'no_hp' => $pasien?->no_hp ?? $pasien?->no_wa ?? null,
+            'pasien_no_hp' => $pasien?->no_hp ?? $pasien?->no_wa ?? null,
             'pasien' => $pasien,
             'dokter_awal' => $registrasi?->dokterAwal,
             'perawat_awal' => $registrasi?->perawatAwal,
-            'items' => $invoice->items?->where('is_delete', 0)->values() ?? [],
-            'metode' => $invoice->metode?->where('is_delete', 0)->values() ?? [],
-            'promo' => $invoice->promos?->where('is_delete', 0)->values() ?? [],
+            'dokter_id' => $registrasi?->dokter_awal_id ?? $invoice->dokter_id ?? null,
+            'dokter_nama' => $registrasi?->dokterAwal?->nama ?? null,
+            'perawat_id' => $registrasi?->perawat_awal_id ?? null,
+            'perawat_nama' => $registrasi?->perawatAwal?->nama ?? null,
+            'items' => $items,
+            'metode' => $metode,
+            'promo' => $promo,
+            'promos' => $promo,
+            'voucher' => $promo,
+            'voucher_list' => $promo,
+            'voucher_label' => $voucherLabel,
+            'voucher_nama' => $voucherLabel,
             'deposit_claims' => $invoice->depositClaims?->where('is_delete', 0)->values() ?? [],
             'subtotal_obat' => $subtotalProduk,
             'subtotal_produk' => $subtotalProduk,
@@ -802,6 +876,7 @@ class PembayaranController extends Controller
             'subtotal' => (float) ($invoice->subtotal ?? 0),
             'diskon_subtotal' => (float) ($invoice->diskon_subtotal ?? $invoice->diskon_subtotal_amount ?? 0),
             'diskon_promo' => (float) ($invoice->diskon_promo ?? $invoice->total_promo ?? 0),
+            'total_promo' => (float) ($invoice->total_promo ?? 0),
             'grand_total' => (float) ($invoice->grand_total ?? 0),
             'total_bayar' => (float) ($invoice->total_bayar ?? 0),
             'sisa_tagihan' => max((float) ($invoice->grand_total ?? 0) - (float) ($invoice->total_bayar ?? 0), 0),
@@ -810,6 +885,9 @@ class PembayaranController extends Controller
             'status_key' => $this->mapInvoiceStatusToKey($invoice->status),
             'status_label' => $this->mapInvoiceStatusToLabel($invoice->status),
             'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
+            'referensi_dokter_id' => $invoice->referensi_dokter_id ?? null,
+            'deposit_expired_option_id' => $invoice->deposit_expired_option_id ?? null,
+            'deposit_expired_at' => $invoice->deposit_expired_at ?? null,
             'sumber_informasi_id' => $invoice->sumber_informasi_id ?? null,
             'sumber_kedatangan' => $invoice->sumber_kedatangan ?? null,
             'catatan' => $invoice->catatan ?? null,
@@ -1005,6 +1083,217 @@ class PembayaranController extends Controller
             ->first();
     }
 
+    protected function validateJenisTransaksiKhusus(Request $request, PembayaranInvoice $invoice, int $jenisTransaksi, ?string $depositExpiredAt = null): void
+    {
+        if ($jenisTransaksi !== 0 && trim((string) $request->input('catatan_pembayaran')) === '') {
+            throw ValidationException::withMessages([
+                'catatan_pembayaran' => 'Catatan wajib diisi untuk transaksi khusus.',
+            ]);
+        }
+
+        if ($jenisTransaksi !== 4) {
+            return;
+        }
+
+        if (!$request->filled('referensi_dokter_id')) {
+            throw ValidationException::withMessages([
+                'referensi_dokter_id' => 'Referensi dokter wajib diisi untuk transaksi deposit.',
+            ]);
+        }
+
+        if (!$request->filled('deposit_expired_option_id') && !$request->filled('deposit_expired_at')) {
+            throw ValidationException::withMessages([
+                'deposit_expired_at' => 'Masa berlaku deposit wajib diisi.',
+            ]);
+        }
+
+        if (!$depositExpiredAt) {
+            throw ValidationException::withMessages([
+                'deposit_expired_at' => 'Tanggal expired deposit tidak valid.',
+            ]);
+        }
+
+        $activeItems = $invoice->items
+            ? $invoice->items->filter(fn ($item) => (int) ($item->is_delete ?? 0) === 0)
+            : collect();
+
+        $hasProduk = $activeItems->contains(fn ($item) => $this->isProductItem($item));
+
+        if ($hasProduk) {
+            throw ValidationException::withMessages([
+                'items' => 'Transaksi deposit tidak boleh memiliki item produk/obat.',
+            ]);
+        }
+
+        $hasTreatment = $activeItems->contains(fn ($item) => $this->isTreatmentItem($item));
+
+        if (!$hasTreatment) {
+            throw ValidationException::withMessages([
+                'items' => 'Transaksi deposit wajib memiliki item treatment.',
+            ]);
+        }
+    }
+
+    protected function resolveDepositExpiredAt(Request $request): ?string
+    {
+        if ($request->filled('deposit_expired_at')) {
+            return Carbon::parse($request->input('deposit_expired_at'))->toDateString();
+        }
+
+        if (!$request->filled('deposit_expired_option_id')) {
+            return null;
+        }
+
+        if (!Schema::hasTable('master_deposit_expired_option')) {
+            return null;
+        }
+
+        $option = DB::table('master_deposit_expired_option')
+            ->where('id', $request->input('deposit_expired_option_id'))
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('is_active')->orWhere('is_active', 1);
+            })
+            ->first();
+
+        if (!$option) {
+            throw ValidationException::withMessages([
+                'deposit_expired_option_id' => 'Masa berlaku deposit tidak valid atau tidak aktif.',
+            ]);
+        }
+
+        $jumlahHari = (int) ($option->jumlah_hari ?? 0);
+
+        if ($jumlahHari <= 0) {
+            throw ValidationException::withMessages([
+                'deposit_expired_at' => 'Tanggal expired deposit wajib diisi untuk opsi custom.',
+            ]);
+        }
+
+        return now()->addDays($jumlahHari)->toDateString();
+    }
+
+    protected function syncJenisTransaksiToInvoiceItems(PembayaranInvoice $invoice, int $jenisTransaksi): void
+    {
+        $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->update($this->onlyExistingColumns('pembayaran_invoice_item', [
+                'jenis_transaksi' => $jenisTransaksi,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+
+        $invoice->load('items');
+    }
+
+    protected function applyDepositTransactionRules(PembayaranInvoice $invoice, Request $request, ?string $depositExpiredAt): void
+    {
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'dokter_id' => null,
+            'referensi_dokter_id' => $request->input('referensi_dokter_id'),
+            'deposit_expired_option_id' => $request->input('deposit_expired_option_id'),
+            'deposit_expired_at' => $depositExpiredAt,
+            'jenis_transaksi' => 4,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+
+        $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where('item_type', 2)
+            ->lockForUpdate()
+            ->update($this->onlyExistingColumns('pembayaran_invoice_item', [
+                'jenis_transaksi' => 4,
+                'dokter_id' => null,
+                'perawat_id' => null,
+                'expired_at' => $depositExpiredAt,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+
+        $invoice->refresh();
+        $invoice->load('items');
+    }
+
+    protected function generateDepositTreatmentRecords(PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pembayaran_deposit_treatment')) {
+            throw ValidationException::withMessages([
+                'deposit' => 'Tabel pembayaran_deposit_treatment belum tersedia.',
+            ]);
+        }
+
+        $items = $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where('item_type', 2)
+            ->lockForUpdate()
+            ->get();
+
+        foreach ($items as $item) {
+            $qty = (float) ($item->qty ?? 0);
+            if ($qty <= 0) {
+                $qty = 1;
+            }
+
+            $totalNilai = (float) ($item->subtotal ?? 0);
+            $hargaSatuan = round($totalNilai / $qty, 2);
+
+            $deposit = PembayaranDepositTreatment::query()
+                ->where('pembayaran_item_id', $item->id)
+                ->lockForUpdate()
+                ->first();
+
+            $payload = $this->onlyExistingColumns('pembayaran_deposit_treatment', [
+                'pembayaran_id' => $invoice->id,
+                'pembayaran_item_id' => $item->id,
+                'pasien_id' => $invoice->pasien_id,
+                'toko_beli_id' => $invoice->toko_id,
+                'treatment_id' => $item->treatment_id ?? $item->item_id ?? 0,
+                'treatment_toko_id' => $item->treatment_toko_id ?? null,
+                'nama_treatment' => $item->nama_item ?? '-',
+                'qty_total' => $qty,
+                'qty_claimed' => 0,
+                'qty_sisa' => $qty,
+                'harga_satuan' => $hargaSatuan,
+                'total_nilai' => $totalNilai,
+                'nilai_claimed' => 0,
+                'nilai_sisa' => $totalNilai,
+                'expired_at' => $invoice->deposit_expired_at,
+                'referensi_dokter_id' => $invoice->referensi_dokter_id,
+                'claim_scope' => 2,
+                'status' => 1,
+                'is_delete' => 0,
+                'created_by' => $this->username(),
+                'updated_by' => $this->username(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            if ($deposit) {
+                unset($payload['created_by'], $payload['created_at']);
+                $deposit->update($payload);
+            } else {
+                $deposit = PembayaranDepositTreatment::query()->create($payload);
+            }
+
+            $item->update($this->onlyExistingColumns('pembayaran_invoice_item', [
+                'deposit_treatment_id' => $deposit->id,
+                'expired_at' => $invoice->deposit_expired_at,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+        }
+    }
+
     protected function normalizeMetodePayload(Request $request, PembayaranInvoice $invoice): array
     {
         $metode = $request->input('metode', []);
@@ -1068,7 +1357,7 @@ class PembayaranController extends Controller
         }
     }
 
-    protected function replaceInvoiceMetode(PembayaranInvoice $invoice, array $metode): void
+    protected function replaceInvoiceMetode(PembayaranInvoice $invoice, array $metode, int $jenisTransaksi = 0): void
     {
         $invoice->metode()
             ->where(function ($q) {
@@ -1094,6 +1383,7 @@ class PembayaranController extends Controller
                 'metode_bayar_id' => $item['metode_bayar_id'],
                 'metode_bayar_nama' => $item['metode_bayar_nama'],
                 'metode_bayar_tipe' => (int) ($item['metode_bayar_tipe'] ?: 1),
+                'jenis_transaksi' => $jenisTransaksi,
                 'nominal_dialokasikan' => $item['nominal_dialokasikan'],
                 'nominal_diterima' => $item['nominal_diterima'],
                 'nominal_kembalian' => $item['nominal_kembalian'] ?? max(0, (float) $item['nominal_diterima'] - (float) $item['nominal_dialokasikan']),
@@ -1212,6 +1502,19 @@ class PembayaranController extends Controller
         $itemType = strtolower((string) $itemType);
 
         return in_array($itemType, ['produk', 'obat', 'penjualan'], true);
+    }
+
+    protected function isTreatmentItem($item): bool
+    {
+        $itemType = $item->item_type ?? $item->jenis_item ?? null;
+
+        if (is_numeric($itemType)) {
+            return (int) $itemType === 2;
+        }
+
+        $itemType = strtolower((string) $itemType);
+
+        return in_array($itemType, ['treatment', 'perawatan'], true);
     }
 
     protected function hasExistingPaymentStockMutation(PembayaranInvoice $invoice): bool
@@ -1346,7 +1649,281 @@ class PembayaranController extends Controller
 
         $existing->save();
 
-        return $existing;
+        $this->syncInvoiceItemsFromRegistrasi($existing, $registrasi);
+        $this->refreshInvoiceTotalsFromItems($existing);
+
+        return $existing->fresh(['items']);
+    }
+
+    protected function syncInvoiceItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
+    {
+        if (!Schema::hasTable('pembayaran_invoice_item')) {
+            return;
+        }
+
+        $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
+
+        $activeTreatmentSourceIds = $this->syncTreatmentInvoiceItemsFromRegistrasi($invoice, $registrasi);
+        $activePenjualanSourceIds = $this->syncPenjualanInvoiceItemsFromRegistrasi($invoice, $registrasi);
+
+        $this->markRemovedInvoiceItems($invoice, 1, $activeTreatmentSourceIds);
+        $this->markRemovedInvoiceItems($invoice, 2, $activePenjualanSourceIds);
+    }
+
+    protected function syncTreatmentInvoiceItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): array
+    {
+        $activeIds = [];
+        $details = collect($registrasi->treatmentDetails ?? []);
+
+        foreach ($details as $detail) {
+            if ((int) ($detail->is_delete ?? 0) === 1 || (int) ($detail->status ?? 0) === 9) {
+                continue;
+            }
+
+            $sourceId = (int) ($detail->id ?? 0);
+            if ($sourceId <= 0) {
+                continue;
+            }
+
+            $activeIds[] = $sourceId;
+
+            $qty = max((float) ($detail->jumlah ?? $detail->qty ?? 1), 1);
+            $harga = (float) ($detail->harga ?? $detail->harga_treatment ?? 0);
+            $gross = $harga * $qty;
+            $subtotal = (float) ($detail->total ?? $detail->subtotal ?? $gross);
+
+            $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
+                'pembayaran_id' => $invoice->id,
+                'registrasi_id' => $registrasi->id,
+                'item_type' => 2,
+                'source_type' => 1,
+                'source_detail_id' => $sourceId,
+                'deposit_treatment_id' => $detail->deposit_treatment_id ?? null,
+                'deposit_claim_id' => $detail->deposit_claim_id ?? null,
+                'treatment_id' => $detail->treatment_id ?? null,
+                'treatment_toko_id' => $detail->treatment_toko_id ?? null,
+                'nama_item' => $detail->nama_treatment
+                    ?? $detail->treatment?->nama
+                    ?? $detail->treatmentToko?->nama_treatment
+                    ?? 'Treatment',
+                'qty' => $qty,
+                'harga' => $harga,
+                'diskon_tipe' => (int) ($detail->diskon_tipe ?? 0),
+                'diskon_nilai' => (float) ($detail->diskon_nilai ?? 0),
+                'diskon_amount' => (float) ($detail->diskon_amount ?? 0),
+                'diskon_referral' => (float) ($detail->diskon_referral ?? 0),
+                'subtotal' => $subtotal,
+                'dokter_id' => $registrasi->dokter_awal_id ?? null,
+                'perawat_id' => $registrasi->perawat_awal_id ?? null,
+                'is_saran_dokter' => (int) ($detail->is_saran_dokter ?? 0),
+                'status' => 1,
+                'is_delete' => 0,
+                'created_by' => $this->username(),
+                'updated_by' => $this->username(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            $this->upsertInvoiceItemBySource($invoice->id, 2, 1, $sourceId, $payload);
+        }
+
+        return $activeIds;
+    }
+
+    protected function syncPenjualanInvoiceItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): array
+    {
+        $activeIds = [];
+        $details = collect($registrasi->penjualanDetails ?? []);
+
+        foreach ($details as $detail) {
+            if ((int) ($detail->is_delete ?? 0) === 1 || (int) ($detail->status ?? 0) === 9) {
+                continue;
+            }
+
+            $sourceId = (int) ($detail->id ?? 0);
+            if ($sourceId <= 0) {
+                continue;
+            }
+
+            $activeIds[] = $sourceId;
+
+            $qty = max((float) ($detail->jumlah ?? $detail->qty ?? 1), 1);
+            $harga = (float) ($detail->harga ?? $detail->harga_jual ?? 0);
+            $gross = $harga * $qty;
+            $diskonTipe = (int) ($detail->diskon_tipe ?? 0);
+            $diskonNilai = (float) ($detail->diskon_nilai ?? 0);
+            $diskonAmount = $this->calculateInvoiceItemDiscountAmount($gross, $diskonTipe, $diskonNilai);
+            $diskonReferral = (float) ($detail->diskon_referral ?? 0);
+            $subtotal = (float) ($detail->subtotal ?? max($gross - $diskonAmount - $diskonReferral, 0));
+
+            $frekuensi = $detail->frekuensi_penggunaan
+                ?? $detail->frekuensi
+                ?? null;
+            $waktuPakai = $detail->waktu_penggunaan
+                ?? $detail->waktu_pakai
+                ?? null;
+            $instruksi = $detail->instruksi_pemakaian
+                ?? $detail->penggunaan
+                ?? $this->buildInstruksiPemakaian($frekuensi, $waktuPakai);
+
+            $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
+                'pembayaran_id' => $invoice->id,
+                'registrasi_id' => $registrasi->id,
+                'item_type' => 3,
+                'source_type' => 2,
+                'source_detail_id' => $sourceId,
+                'produk_id' => $detail->produk_id ?? null,
+                'produk_toko_id' => $detail->produk_toko_id ?? null,
+                'tempat_produk_id' => $detail->tempat_produk_id ?? null,
+                'stock_reservasi_id' => $detail->stock_reservasi_id ?? null,
+                'nama_item' => $detail->nama_produk
+                    ?? $detail->produk?->nama
+                    ?? $detail->produkToko?->nama_produk
+                    ?? 'Produk',
+                'satuan' => $detail->unit
+                    ?? $detail->satuan
+                    ?? $detail->produk?->satuan_nama
+                    ?? 'pcs',
+                'qty' => $qty,
+                'harga' => $harga,
+                'diskon_tipe' => $diskonTipe,
+                'diskon_nilai' => $diskonNilai,
+                'diskon_amount' => $diskonAmount,
+                'diskon_referral' => $diskonReferral,
+                'subtotal' => $subtotal,
+                'dokter_id' => (int) ($detail->is_saran_dokter ?? 0) === 1
+                    ? ($registrasi->dokter_awal_id ?? null)
+                    : null,
+                'is_saran_dokter' => (int) ($detail->is_saran_dokter ?? 0),
+                'frekuensi' => $frekuensi,
+                'waktu_pakai' => $waktuPakai,
+                'instruksi_pemakaian' => $instruksi,
+                'status' => 1,
+                'is_delete' => 0,
+                'created_by' => $this->username(),
+                'updated_by' => $this->username(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]);
+
+            $this->upsertInvoiceItemBySource($invoice->id, 3, 2, $sourceId, $payload);
+        }
+
+        return $activeIds;
+    }
+
+    protected function upsertInvoiceItemBySource(int $invoiceId, int $itemType, int $sourceType, int $sourceDetailId, array $payload): void
+    {
+        $existingId = DB::table('pembayaran_invoice_item')
+            ->where('pembayaran_id', $invoiceId)
+            ->where('item_type', $itemType)
+            ->where('source_type', $sourceType)
+            ->where('source_detail_id', $sourceDetailId)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->value('id');
+
+        if ($existingId) {
+            unset($payload['created_by'], $payload['created_at']);
+            DB::table('pembayaran_invoice_item')
+                ->where('id', $existingId)
+                ->update($payload);
+            return;
+        }
+
+        DB::table('pembayaran_invoice_item')->insert($payload);
+    }
+
+    protected function markRemovedInvoiceItems(PembayaranInvoice $invoice, int $sourceType, array $activeSourceIds): void
+    {
+        $query = DB::table('pembayaran_invoice_item')
+            ->where('pembayaran_id', $invoice->id)
+            ->where('source_type', $sourceType)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            });
+
+        if (!empty($activeSourceIds)) {
+            $query->whereNotIn('source_detail_id', $activeSourceIds);
+        }
+
+        $query->update($this->onlyExistingColumns('pembayaran_invoice_item', [
+            'is_delete' => 1,
+            'status' => 9,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function refreshInvoiceTotalsFromItems(PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pembayaran_invoice_item')) {
+            return;
+        }
+
+        $totals = DB::table('pembayaran_invoice_item')
+            ->selectRaw("SUM(CASE WHEN item_type = 2 THEN subtotal ELSE 0 END) as treatment_total")
+            ->selectRaw("SUM(CASE WHEN item_type = 3 THEN subtotal ELSE 0 END) as produk_total")
+            ->selectRaw("SUM(CASE WHEN item_type = 1 THEN subtotal ELSE 0 END) as konsultasi_total")
+            ->where('pembayaran_id', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->first();
+
+        $subtotalTreatment = (float) ($totals->treatment_total ?? 0);
+        $subtotalProduk = (float) ($totals->produk_total ?? 0);
+        $subtotalKonsultasi = (float) ($totals->konsultasi_total ?? 0);
+
+        if ($subtotalKonsultasi <= 0 && (float) ($invoice->subtotal_konsultasi ?? 0) > 0) {
+            $subtotalKonsultasi = (float) $invoice->subtotal_konsultasi;
+        }
+
+        $subtotal = $subtotalTreatment + $subtotalProduk + $subtotalKonsultasi;
+        $diskonSubtotal = (float) ($invoice->diskon_subtotal_amount ?? $invoice->diskon_subtotal ?? 0);
+        $diskonPromo = (float) ($invoice->total_promo ?? $invoice->diskon_promo ?? 0);
+        $grandTotal = max($subtotal - $diskonSubtotal - $diskonPromo, 0);
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'subtotal_obat' => $subtotalProduk,
+            'subtotal_produk' => $subtotalProduk,
+            'subtotal_treatment' => $subtotalTreatment,
+            'subtotal_konsultasi' => $subtotalKonsultasi,
+            'subtotal' => $subtotal,
+            'grand_total' => $grandTotal,
+            'sisa_tagihan' => max($grandTotal - (float) ($invoice->total_bayar ?? 0), 0),
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function calculateInvoiceItemDiscountAmount(float $gross, int $diskonTipe, float $diskonNilai): float
+    {
+        if ($gross <= 0 || $diskonNilai <= 0) {
+            return 0;
+        }
+
+        if ($diskonTipe === 1) {
+            return min(round(($gross * $diskonNilai) / 100, 2), $gross);
+        }
+
+        if ($diskonTipe === 2) {
+            return min($diskonNilai, $gross);
+        }
+
+        return 0;
+    }
+
+    protected function buildInstruksiPemakaian(?string $frekuensi, ?string $waktuPakai): ?string
+    {
+        $parts = array_values(array_filter([
+            trim((string) $frekuensi),
+            trim((string) $waktuPakai),
+        ]));
+
+        return empty($parts) ? null : implode(' - ', $parts);
     }
 
     protected function ensureLegacyInvoiceNumber(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
