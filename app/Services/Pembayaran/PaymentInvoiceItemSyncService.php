@@ -308,7 +308,38 @@ class PaymentInvoiceItemSyncService
 
         $this->upsertInvoiceItemBySource($invoice->id, 1, 3, $sourceId, $payload);
 
+        // Satu registrasi hanya boleh punya satu item konsultasi aktif.
+        // Case SPPG/SPKK/online sebelumnya bisa membuat 2 item:
+        // - Konsultasi Dokter generic
+        // - Konsultasi SPPG/SPKK mapped Accurate
+        // Karena source_detail_id sama, markRemovedInvoiceItems() tidak menghapus yang generic.
+        // Setelah item konsultasi final dibuat, nonaktifkan semua konsultasi lain
+        // selain source_type/source_detail_id yang dipilih.
+        $this->deactivateOtherConsultationItems($invoice->id, 3, $sourceId);
+
         return [$sourceId];
+    }
+
+    protected function deactivateOtherConsultationItems(int $invoiceId, int $activeSourceType, int $activeSourceDetailId): void
+    {
+        DB::table('pembayaran_invoice_item')
+            ->where('pembayaran_id', $invoiceId)
+            ->where('item_type', 1)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) use ($activeSourceType, $activeSourceDetailId) {
+                $q->where('source_type', '!=', $activeSourceType)
+                    ->orWhere('source_detail_id', '!=', $activeSourceDetailId)
+                    ->orWhereNull('source_type')
+                    ->orWhereNull('source_detail_id');
+            })
+            ->update($this->onlyExistingColumns('pembayaran_invoice_item', [
+                'is_delete' => 1,
+                'status' => 9,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
     }
 
     protected function syncAccurateMarkerItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): array
