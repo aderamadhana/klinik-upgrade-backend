@@ -205,16 +205,22 @@ class VoucherFinalizerService
     {
         $rows = [];
 
-        foreach ((array) $request->input('promos', []) as $row) {
-            $voucherId = (int) ($row['voucher_id'] ?? $row['id'] ?? $row['master_voucher_diskon_id'] ?? 0);
-            $kodeVoucher = trim((string) ($row['kode_voucher'] ?? $row['kode'] ?? $row['code'] ?? ''));
+        foreach (['promos', 'selected_promos', 'applied_promos'] as $payloadKey) {
+            foreach ((array) $request->input($payloadKey, []) as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
 
-            if ($voucherId > 0 || $kodeVoucher !== '') {
-                $rows[] = [
-                    'voucher_id' => $voucherId > 0 ? $voucherId : null,
-                    'kode_voucher' => $kodeVoucher !== '' ? $kodeVoucher : null,
-                    'client_amount' => (float) ($row['diskon_amount'] ?? 0),
-                ];
+                $voucherId = (int) ($row['voucher_id'] ?? $row['id'] ?? $row['master_voucher_diskon_id'] ?? 0);
+                $kodeVoucher = trim((string) ($row['kode_voucher'] ?? $row['kode'] ?? $row['code'] ?? ''));
+
+                if ($voucherId > 0 || $kodeVoucher !== '') {
+                    $rows[] = [
+                        'voucher_id' => $voucherId > 0 ? $voucherId : null,
+                        'kode_voucher' => $kodeVoucher !== '' ? $kodeVoucher : null,
+                        'client_amount' => (float) ($row['diskon_amount'] ?? $row['amount'] ?? 0),
+                    ];
+                }
             }
         }
 
@@ -630,6 +636,21 @@ class VoucherFinalizerService
         }
     }
 
+    protected function normalizePromoDiscountType($value): int
+    {
+        $text = strtolower(trim((string) $value));
+
+        if (in_array($text, ['1', 'percent', 'persen', '%'], true)) {
+            return 1;
+        }
+
+        if (in_array($text, ['2', 'nominal', 'rupiah', 'rp'], true)) {
+            return 2;
+        }
+
+        return 2;
+    }
+
     protected function insertInvoicePromoRows(object $invoice, object $voucher, array $selected, array $allocations, string $username): void
     {
         foreach ($allocations as $allocation) {
@@ -640,7 +661,7 @@ class VoucherFinalizerService
                 'kode_voucher' => $selected['kode_voucher'] ?: $voucher->kode_voucher,
                 'nama_voucher' => $voucher->nama_voucher ?? $voucher->kode_voucher ?? 'Voucher',
                 'scope_type' => $allocation['scope_type'],
-                'diskon_tipe' => strtolower((string) ($voucher->tipe_diskon ?? 'nominal')) === 'percent' ? 1 : 2,
+                'diskon_tipe' => $this->normalizePromoDiscountType($voucher->tipe_diskon ?? $voucher->diskon_tipe ?? 2),
                 'diskon_nilai' => $voucher->total_diskon ?? 0,
                 'diskon_amount' => round((float) $allocation['amount'], 2),
                 'catatan' => 'Validated by backend finalizer',
