@@ -550,22 +550,73 @@ class AntrianDokterController extends Controller
         foreach ($items as $item) {
             $produkTokoId = $item['produk_toko_id'] ?? null;
             $produkId = $item['produk_id'] ?? null;
+
             $jumlah = max((int) ($item['jumlah'] ?? $item['qty'] ?? 1), 1);
-            $stock = $this->lockAvailableProductStock($registrasi, $produkTokoId, $produkId, $jumlah);
             $harga = (float) ($item['harga'] ?? 0);
             $subtotal = (float) ($item['subtotal'] ?? ($harga * $jumlah));
             $namaProduk = $item['nama_produk'] ?? $item['nama'] ?? 'Produk / Obat';
+
             $frekuensiPenggunaan = $item['frekuensi_penggunaan'] ?? $item['frekuensi'] ?? null;
             $waktuPenggunaan = $item['waktu_penggunaan'] ?? $item['waktu_pakai'] ?? null;
-            $instruksiPemakaian = $item['instruksi_pemakaian'] ?? collect([$frekuensiPenggunaan, $waktuPenggunaan])->filter()->implode(' - ');
-            $isSaranDokter = $this->isDoctorSuggestedProduct($registrasi, $produkTokoId, $produkId);
+            $instruksiPemakaian = $item['instruksi_pemakaian']
+                ?? collect([$frekuensiPenggunaan, $waktuPenggunaan])->filter()->implode(' - ');
+
+            $existingPenjualan = $this->findActiveBasePenjualanDetail($registrasi, $produkTokoId, $produkId);
+
+            if ($existingPenjualan) {
+                if (!$this->isSameProductBillingValue($existingPenjualan, $jumlah, $harga, $subtotal)) {
+                    throw new \Exception(
+                        "Produk {$namaProduk} sudah ada dari registrasi dengan qty/harga berbeda. " .
+                        "Ubah qty/harga dari registrasi atau kasir agar stok reservasi tidak double."
+                    );
+                }
+
+                RegistrasiDokterResepDetail::create($this->onlyExistingColumns('registrasi_dokter_resep_detail', [
+                    'registrasi_id' => $registrasi->id,
+                    'soap_id' => $soap->id,
+                    'produk_toko_id' => $existingPenjualan->produk_toko_id,
+                    'produk_id' => $existingPenjualan->produk_id,
+                    'tempat_produk_id' => $existingPenjualan->tempat_produk_id,
+                    'stock_reservasi_id' => $existingPenjualan->stock_reservasi_id,
+                    'is_saran_dokter' => 0,
+                    'nama_produk' => $existingPenjualan->nama_produk ?: $namaProduk,
+                    'harga' => $existingPenjualan->harga,
+                    'jumlah' => $existingPenjualan->jumlah,
+                    'total' => $existingPenjualan->subtotal,
+                    'frekuensi' => $frekuensiPenggunaan,
+                    'waktu_pakai' => $waktuPenggunaan,
+                    'penggunaan' => $instruksiPemakaian ?: null,
+                    'status' => 0,
+                    'is_delete' => 0,
+                    'created_by' => $this->username(),
+                    'created_at' => now(),
+                ]));
+
+                $existingPenjualan->update($this->onlyExistingColumns('registrasi_penjualan_detail', [
+                    'frekuensi_penggunaan' => $frekuensiPenggunaan,
+                    'waktu_penggunaan' => $waktuPenggunaan,
+                    'instruksi_pemakaian' => $instruksiPemakaian ?: null,
+                    'is_saran_dokter' => 0,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+
+                continue;
+            }
+
+            $stock = $this->lockAvailableProductStock($registrasi, $produkTokoId, $produkId, $jumlah);
+
+            $produkTokoId = $produkTokoId ?: $stock->produk_toko_id;
+            $produkId = $produkId ?: $stock->produk_id;
+
+            $isSaranDokter = 1;
             $reservasi = $this->reserveDoctorProductStock($registrasi, $task, $stock, $jumlah, $namaProduk);
 
             $resep = RegistrasiDokterResepDetail::create($this->onlyExistingColumns('registrasi_dokter_resep_detail', [
                 'registrasi_id' => $registrasi->id,
                 'soap_id' => $soap->id,
                 'produk_toko_id' => $produkTokoId,
-                'produk_id' => $produkId ?: $stock->produk_id,
+                'produk_id' => $produkId,
                 'tempat_produk_id' => $stock->tempat_produk_id,
                 'stock_reservasi_id' => $reservasi->id,
                 'is_saran_dokter' => $isSaranDokter,
@@ -591,7 +642,7 @@ class AntrianDokterController extends Controller
                 'source_karyawan_id' => $registrasi->dokter_awal_id,
                 'is_saran_dokter' => $isSaranDokter,
                 'produk_toko_id' => $produkTokoId,
-                'produk_id' => $produkId ?: $stock->produk_id,
+                'produk_id' => $produkId,
                 'tempat_produk_id' => $stock->tempat_produk_id,
                 'stock_reservasi_id' => $reservasi->id,
                 'nama_produk' => $namaProduk,
@@ -632,18 +683,37 @@ class AntrianDokterController extends Controller
         foreach ($items as $item) {
             $treatmentTokoId = $item['treatment_toko_id'] ?? null;
             $treatmentId = $item['treatment_id'] ?? null;
+
             $harga = (float) ($item['harga'] ?? 0);
             $jumlah = max((int) ($item['jumlah'] ?? $item['qty'] ?? 1), 1);
             $total = (float) ($item['total'] ?? ($harga * $jumlah));
             $namaTreatment = $item['nama_treatment'] ?? $item['nama'] ?? 'Treatment';
-            $isSaranDokter = $this->isDoctorSuggestedTreatment($registrasi, $treatmentTokoId, $treatmentId);
+
+            $existingTreatment = $this->findActiveBaseTreatmentDetail($registrasi, $treatmentTokoId, $treatmentId);
+
+            if ($existingTreatment) {
+                $existingTreatment->update($this->onlyExistingColumns('registrasi_treatment_detail', [
+                    'nama_treatment' => $namaTreatment,
+                    'harga' => $harga,
+                    'jumlah' => $jumlah,
+                    'total' => $total,
+                    'perlu_tindakan_perawat' => $this->isTrue($item['perlu_tindakan_perawat'] ?? false) ? 1 : 0,
+                    'route_treatment' => $item['route_treatment'] ?? null,
+                    'catatan' => $item['catatan'] ?? null,
+                    'is_saran_dokter' => 0,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+
+                continue;
+            }
 
             RegistrasiTreatmentDetail::create($this->onlyExistingColumns('registrasi_treatment_detail', [
                 'registrasi_id' => $registrasi->id,
                 'source_type' => 2,
                 'source_task_id' => $task->id,
                 'source_karyawan_id' => $registrasi->dokter_awal_id,
-                'is_saran_dokter' => $isSaranDokter,
+                'is_saran_dokter' => 1,
                 'is_deposit_claim' => 0,
                 'deposit_treatment_id' => null,
                 'deposit_claim_id' => null,
@@ -666,33 +736,19 @@ class AntrianDokterController extends Controller
 
     private function recalculateRegistrasiKunjungan(Request $request, RegistrasiKunjungan $registrasi): void
     {
-        $totalTreatment = (float) RegistrasiTreatmentDetail::query()
-            ->where('registrasi_id', $registrasi->id)
-            ->where('is_delete', 0)
-            ->where('status', '!=', 9)
-            ->sum('total');
+        $treatmentItems = $this->getActiveTreatmentDetailsForBilling($registrasi);
+        $penjualanItems = $this->getActivePenjualanDetailsForBilling($registrasi);
 
-        $totalPenjualan = (float) RegistrasiPenjualanDetail::query()
-            ->where('registrasi_id', $registrasi->id)
-            ->where('is_delete', 0)
-            ->where('status', '!=', 9)
-            ->sum('subtotal');
+        $totalTreatment = (float) $treatmentItems->sum(fn ($item) => (float) ($item->total ?? 0));
+        $totalPenjualan = (float) $penjualanItems->sum(fn ($item) => (float) ($item->subtotal ?? 0));
 
-        $hasTreatment = $totalTreatment > 0 || RegistrasiTreatmentDetail::query()
-            ->where('registrasi_id', $registrasi->id)
-            ->where('is_delete', 0)
-            ->where('status', '!=', 9)
-            ->exists();
-
-        $hasPenjualan = $totalPenjualan > 0 || RegistrasiPenjualanDetail::query()
-            ->where('registrasi_id', $registrasi->id)
-            ->where('is_delete', 0)
-            ->where('status', '!=', 9)
-            ->exists();
+        $hasTreatment = $treatmentItems->isNotEmpty();
+        $hasPenjualan = $penjualanItems->isNotEmpty();
 
         $addConsultation = $this->isTrue($request->input('add_consultation'));
         $hasOriginalConsultation = $this->hasConsultation($registrasi);
         $hasConsultation = $hasOriginalConsultation || $addConsultation;
+
         $totalKonsultasi = 0;
         $ruleBiayaKonsultasi = 0;
         $catatanBiayaKonsultasi = null;
@@ -708,20 +764,10 @@ class AntrianDokterController extends Controller
         }
 
         $hasSaranDokterPenjualan = Schema::hasColumn('registrasi_penjualan_detail', 'is_saran_dokter')
-            && RegistrasiPenjualanDetail::query()
-                ->where('registrasi_id', $registrasi->id)
-                ->where('is_delete', 0)
-                ->where('status', '!=', 9)
-                ->where('is_saran_dokter', 1)
-                ->exists();
+            && $penjualanItems->contains(fn ($item) => (int) ($item->is_saran_dokter ?? 0) === 1);
 
         $hasSaranDokterTreatment = Schema::hasColumn('registrasi_treatment_detail', 'is_saran_dokter')
-            && RegistrasiTreatmentDetail::query()
-                ->where('registrasi_id', $registrasi->id)
-                ->where('is_delete', 0)
-                ->where('status', '!=', 9)
-                ->where('is_saran_dokter', 1)
-                ->exists();
+            && $treatmentItems->contains(fn ($item) => (int) ($item->is_saran_dokter ?? 0) === 1);
 
         $channelKonsultasi = $registrasi->channel_konsultasi;
 
@@ -729,12 +775,9 @@ class AntrianDokterController extends Controller
             $channelKonsultasi = RegistrasiKunjungan::CHANNEL_OFFLINE;
         }
 
-        $perluTindakanPerawat = RegistrasiTreatmentDetail::query()
-            ->where('registrasi_id', $registrasi->id)
-            ->where('is_delete', 0)
-            ->where('status', '!=', 9)
-            ->where('perlu_tindakan_perawat', 1)
-            ->exists();
+        $perluTindakanPerawat = $treatmentItems->contains(
+            fn ($item) => (int) ($item->perlu_tindakan_perawat ?? 0) === 1
+        );
 
         $registrasi->update($this->onlyExistingColumns('registrasi_kunjungan', [
             'channel_konsultasi' => $channelKonsultasi,
@@ -875,11 +918,7 @@ class AntrianDokterController extends Controller
 
     private function insertTreatmentInvoiceItems(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
     {
-        $items = RegistrasiTreatmentDetail::query()
-            ->where('registrasi_id', $registrasi->id)
-            ->where('is_delete', 0)
-            ->where('status', '!=', 9)
-            ->get();
+        $items = $this->getActiveTreatmentDetailsForBilling($registrasi);
 
         foreach ($items as $item) {
             $qty = (float) ($item->jumlah ?? 1);
@@ -918,11 +957,7 @@ class AntrianDokterController extends Controller
 
     private function insertPenjualanInvoiceItems(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
     {
-        $items = RegistrasiPenjualanDetail::query()
-            ->where('registrasi_id', $registrasi->id)
-            ->where('is_delete', 0)
-            ->where('status', '!=', 9)
-            ->get();
+        $items = $this->getActivePenjualanDetailsForBilling($registrasi);
 
         foreach ($items as $item) {
             $qty = (float) ($item->jumlah ?? 1);
@@ -1369,5 +1404,150 @@ class AntrianDokterController extends Controller
     private function username(): string
     {
         return auth()->user()->username ?? auth()->user()->name ?? 'system';
+    }
+
+    private function getActiveTreatmentDetailsForBilling(RegistrasiKunjungan $registrasi)
+    {
+        $items = RegistrasiTreatmentDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->orderBy('source_type', 'asc')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        return $this->filterDuplicateDoctorRows(
+            $items,
+            fn ($item) => $this->buildTreatmentDuplicateKey($item->treatment_toko_id ?? null, $item->treatment_id ?? null)
+        );
+    }
+
+    private function getActivePenjualanDetailsForBilling(RegistrasiKunjungan $registrasi)
+    {
+        $items = RegistrasiPenjualanDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->orderBy('source_type', 'asc')
+            ->orderBy('id', 'asc')
+            ->get();
+
+        return $this->filterDuplicateDoctorRows(
+            $items,
+            fn ($item) => $this->buildPenjualanDuplicateKey($item->produk_toko_id ?? null, $item->produk_id ?? null)
+        );
+    }
+
+    private function filterDuplicateDoctorRows($items, callable $keyResolver)
+    {
+        $baseKeys = [];
+
+        foreach ($items as $item) {
+            $key = $keyResolver($item);
+
+            if ($key !== null && (int) ($item->source_type ?? 0) !== 2) {
+                $baseKeys[$key] = true;
+            }
+        }
+
+        return $items
+            ->reject(function ($item) use ($baseKeys, $keyResolver) {
+                if ((int) ($item->source_type ?? 0) !== 2) {
+                    return false;
+                }
+
+                $key = $keyResolver($item);
+
+                return $key !== null && isset($baseKeys[$key]);
+            })
+            ->values();
+    }
+
+    private function findActiveBasePenjualanDetail(RegistrasiKunjungan $registrasi, $produkTokoId, $produkId)
+    {
+        if (!$produkTokoId && !$produkId) {
+            return null;
+        }
+
+        return RegistrasiPenjualanDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->where('source_type', '!=', 2)
+            ->where(function ($query) use ($produkTokoId, $produkId) {
+                if ($produkTokoId) {
+                    $query->orWhere('produk_toko_id', $produkTokoId);
+                }
+
+                if ($produkId) {
+                    $query->orWhere('produk_id', $produkId);
+                }
+            })
+            ->orderByRaw('CASE WHEN source_type = 1 THEN 0 ELSE 1 END')
+            ->orderBy('id', 'asc')
+            ->first();
+    }
+
+    private function findActiveBaseTreatmentDetail(RegistrasiKunjungan $registrasi, $treatmentTokoId, $treatmentId)
+    {
+        if (!$treatmentTokoId && !$treatmentId) {
+            return null;
+        }
+
+        return RegistrasiTreatmentDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->where('source_type', '!=', 2)
+            ->where(function ($query) use ($treatmentTokoId, $treatmentId) {
+                if ($treatmentTokoId) {
+                    $query->orWhere('treatment_toko_id', $treatmentTokoId);
+                }
+
+                if ($treatmentId) {
+                    $query->orWhere('treatment_id', $treatmentId);
+                }
+            })
+            ->orderByRaw('CASE WHEN source_type = 1 THEN 0 ELSE 1 END')
+            ->orderBy('id', 'asc')
+            ->first();
+    }
+
+    private function buildPenjualanDuplicateKey($produkTokoId, $produkId): ?string
+    {
+        if ($produkTokoId) {
+            return 'produk_toko:' . $produkTokoId;
+        }
+
+        if ($produkId) {
+            return 'produk:' . $produkId;
+        }
+
+        return null;
+    }
+
+    private function buildTreatmentDuplicateKey($treatmentTokoId, $treatmentId): ?string
+    {
+        if ($treatmentTokoId) {
+            return 'treatment_toko:' . $treatmentTokoId;
+        }
+
+        if ($treatmentId) {
+            return 'treatment:' . $treatmentId;
+        }
+
+        return null;
+    }
+
+    private function isSameProductBillingValue($existingPenjualan, int $jumlah, float $harga, float $subtotal): bool
+    {
+        return (int) ($existingPenjualan->jumlah ?? 0) === $jumlah
+            && $this->isSameDecimal($existingPenjualan->harga ?? 0, $harga)
+            && $this->isSameDecimal($existingPenjualan->subtotal ?? 0, $subtotal);
+    }
+
+    private function isSameDecimal($left, $right, float $tolerance = 0.01): bool
+    {
+        return abs(((float) $left) - ((float) $right)) <= $tolerance;
     }
 }

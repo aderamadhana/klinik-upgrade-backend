@@ -320,9 +320,20 @@ class PembayaranController extends Controller
             'deposit_expired_at' => 'nullable|date',
             'deposit_item_ids' => 'nullable|array',
             'deposit_item_ids.*' => 'nullable|integer',
+            'deposit_treatment_item_ids' => 'nullable|array',
+            'deposit_treatment_item_ids.*' => 'nullable|integer',
             'deposit_items' => 'nullable|array',
             'deposit_items.*.item_id' => 'nullable|integer',
+            'deposit_items.*.pembayaran_item_id' => 'nullable|integer',
+            'deposit_items.*.invoice_item_id' => 'nullable|integer',
             'deposit_items.*.qty' => 'nullable|numeric|min:0',
+            'deposit_items.*.qty_deposit' => 'nullable|numeric|min:0',
+            'deposit_treatment_items' => 'nullable|array',
+            'deposit_treatment_items.*.item_id' => 'nullable|integer',
+            'deposit_treatment_items.*.pembayaran_item_id' => 'nullable|integer',
+            'deposit_treatment_items.*.invoice_item_id' => 'nullable|integer',
+            'deposit_treatment_items.*.qty' => 'nullable|numeric|min:0',
+            'deposit_treatment_items.*.qty_deposit' => 'nullable|numeric|min:0',
             'deposit_item_quantities' => 'nullable|array',
             'update_pasien_phone' => 'nullable|boolean',
             'pasien_no_hp_update' => 'nullable|string|max:30',
@@ -879,6 +890,7 @@ class PembayaranController extends Controller
     protected function formatPaymentListRow(PembayaranInvoice $invoice): array
     {
         $registrasi = $invoice->registrasi;
+        $konsultasiMeta = $this->resolveKonsultasiMeta($registrasi);
         $pasien = $registrasi?->pasien;
         $statusKey = $this->mapInvoiceStatusToKey($invoice->status);
         $statusLabel = $this->mapInvoiceStatusToLabel($invoice->status);
@@ -899,6 +911,12 @@ class PembayaranController extends Controller
             'no_invoice' => $invoice->no_invoice,
             'nomor_invoice' => $invoice->no_invoice,
             'invoice_number' => $invoice->no_invoice,
+            'channel_konsultasi' => $konsultasiMeta['channel'],
+            'channel_konsultasi_key' => $konsultasiMeta['channel_key'],
+            'channel_konsultasi_label' => $konsultasiMeta['channel_label'],
+            'konsultasi_source_code' => $konsultasiMeta['source_code'],
+            'konsultasi_source_name' => $konsultasiMeta['source_name'],
+            'jenis_konsultasi_label' => $konsultasiMeta['jenis_label'],
             'kode_registrasi' => $invoice->kode_registrasi,
             'nomor_kunjungan' => $invoice->kode_registrasi,
             'tanggal_invoice' => $invoice->tanggal_invoice,
@@ -961,6 +979,7 @@ class PembayaranController extends Controller
     protected function formatPaymentRow(PembayaranInvoice $invoice): array
     {
         $registrasi = $invoice->registrasi;
+        $konsultasiMeta = $this->resolveKonsultasiMeta($registrasi);
         $pasien = $registrasi?->pasien;
         $subtotalProduk = $this->invoiceSubtotalProduk($invoice);
         $items = $invoice->items?->where('is_delete', 0)->values() ?? collect();
@@ -986,6 +1005,12 @@ class PembayaranController extends Controller
             'no_invoice' => $invoice->no_invoice,
             'nomor_invoice' => $invoice->no_invoice,
             'invoice_number' => $invoice->no_invoice,
+            'channel_konsultasi' => $konsultasiMeta['channel'],
+            'channel_konsultasi_key' => $konsultasiMeta['channel_key'],
+            'channel_konsultasi_label' => $konsultasiMeta['channel_label'],
+            'konsultasi_source_code' => $konsultasiMeta['source_code'],
+            'konsultasi_source_name' => $konsultasiMeta['source_name'],
+            'jenis_konsultasi_label' => $konsultasiMeta['jenis_label'],
             'kode_registrasi' => $invoice->kode_registrasi,
             'nomor_kunjungan' => $invoice->kode_registrasi,
             'tanggal_invoice' => $invoice->tanggal_invoice,
@@ -1411,32 +1436,64 @@ class PembayaranController extends Controller
 
         $selectedItemIds = array_keys($selectedItems);
 
+        if (count($selectedItemIds) === 0) {
+            throw ValidationException::withMessages([
+                'deposit_treatment_items' => 'Pilih minimal satu treatment yang akan dijadikan deposit.',
+            ]);
+        }
+
         $items = $invoice->items()
             ->where(function ($q) {
                 $q->whereNull('is_delete')->orWhere('is_delete', 0);
             })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 9);
+            })
             ->where('item_type', 2)
-            ->when(count($selectedItemIds) > 0, fn ($q) => $q->whereIn('id', $selectedItemIds))
+            ->whereIn('id', $selectedItemIds)
             ->lockForUpdate()
             ->get();
 
+        if ($items->count() !== count($selectedItemIds)) {
+            throw ValidationException::withMessages([
+                'deposit_treatment_items' => 'Pilihan treatment deposit tidak valid untuk invoice ini.',
+            ]);
+        }
+
         foreach ($items as $item) {
             $invoiceQty = (float) ($item->qty ?? 0);
+
             if ($invoiceQty <= 0) {
                 $invoiceQty = 1;
             }
 
             $selectedQty = (float) ($selectedItems[(int) $item->id] ?? 0);
+
             if ($selectedQty <= 0) {
                 $selectedQty = $invoiceQty;
             }
 
-            $selectedQty = min($selectedQty, $invoiceQty);
-            $selectedQty = max($selectedQty, 1);
+            if ($selectedQty > $invoiceQty) {
+                throw ValidationException::withMessages([
+                    'deposit_treatment_items' => 'Qty deposit untuk ' . ($item->nama_item ?? 'treatment') . ' tidak boleh melebihi qty invoice.',
+                ]);
+            }
 
-            $itemSubtotal = (float) ($item->subtotal ?? 0);
-            $hargaSatuan = $invoiceQty > 0 ? round($itemSubtotal / $invoiceQty, 2) : 0;
+            $selectedQty = min(max($selectedQty, 1), $invoiceQty);
+
+            $itemNetSubtotal = $this->resolveDepositItemNetSubtotal($item);
+
+            $hargaSatuan = $invoiceQty > 0
+                ? round($itemNetSubtotal / $invoiceQty, 2)
+                : 0;
+
             $totalNilai = round($hargaSatuan * $selectedQty, 2);
+
+            if ($totalNilai <= 0) {
+                throw ValidationException::withMessages([
+                    'deposit_treatment_items' => 'Nilai deposit untuk ' . ($item->nama_item ?? 'treatment') . ' tidak valid.',
+                ]);
+            }
 
             $deposit = PembayaranDepositTreatment::query()
                 ->where('pembayaran_item_id', $item->id)
@@ -1485,7 +1542,26 @@ class PembayaranController extends Controller
         }
     }
 
+    protected function resolveDepositItemNetSubtotal($item): float
+    {
+        $subtotalAfterDiskonSubtotal = (float) ($item->subtotal_after_diskon_subtotal ?? 0);
 
+        if ($subtotalAfterDiskonSubtotal > 0) {
+            return $subtotalAfterDiskonSubtotal;
+        }
+
+        $subtotalBeforeDiskonSubtotal = (float) ($item->subtotal_before_diskon_subtotal ?? 0);
+        $diskonSubtotalAmount = (float) ($item->diskon_subtotal_amount ?? 0);
+
+        if ($subtotalBeforeDiskonSubtotal > 0) {
+            return max($subtotalBeforeDiskonSubtotal - $diskonSubtotalAmount, 0);
+        }
+
+        $subtotal = (float) ($item->subtotal ?? 0);
+
+        return max($subtotal, 0);
+    }
+    
     protected function processDepositClaimsFromInvoice(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
     {
         if (!Schema::hasTable('pembayaran_deposit_treatment') || !Schema::hasTable('pembayaran_deposit_treatment_claim')) {
@@ -1954,14 +2030,23 @@ class PembayaranController extends Controller
 
     protected function resolveDepositItems(Request $request, PembayaranInvoice $invoice): array
     {
-        $result = [];
+        $payloadRows = array_merge(
+            (array) $request->input('deposit_items', []),
+            (array) $request->input('deposit_treatment_items', [])
+        );
 
-        foreach ((array) $request->input('deposit_items', []) as $row) {
-            $itemId = (int) ($row['item_id'] ?? $row['id'] ?? $row['pembayaran_item_id'] ?? 0);
-            $qty = (float) ($row['qty'] ?? $row['jumlah'] ?? 0);
+        foreach (array_merge(
+            (array) $request->input('deposit_item_ids', []),
+            (array) $request->input('deposit_treatment_item_ids', [])
+        ) as $id) {
+            $itemId = (int) $id;
 
-            if ($itemId > 0 && $qty > 0) {
-                $result[$itemId] = $qty;
+            if ($itemId > 0) {
+                $payloadRows[] = [
+                    'item_id' => $itemId,
+                    'invoice_item_id' => $itemId,
+                    'qty_deposit' => 0,
+                ];
             }
         }
 
@@ -1969,52 +2054,153 @@ class PembayaranController extends Controller
             $itemId = (int) $itemId;
             $qty = (float) $qty;
 
-            if ($itemId > 0 && $qty > 0) {
-                $result[$itemId] = $qty;
+            if ($itemId > 0) {
+                $payloadRows[] = [
+                    'item_id' => $itemId,
+                    'invoice_item_id' => $itemId,
+                    'qty_deposit' => $qty,
+                ];
             }
         }
 
-        if (count($result) === 0) {
-            foreach ((array) $request->input('deposit_item_ids', []) as $id) {
-                $itemId = (int) $id;
-
-                if ($itemId > 0) {
-                    $result[$itemId] = 0;
-                }
-            }
-        }
-
-        if (count($result) === 0) {
+        if (count($payloadRows) === 0) {
             return [];
         }
 
-        $activeItems = $invoice->items
-            ? $invoice->items->filter(fn ($item) => (int) ($item->is_delete ?? 0) === 0 && $this->isTreatmentItem($item))
-            : collect();
+        $activeItems = $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 9);
+            })
+            ->lockForUpdate()
+            ->get()
+            ->filter(fn ($item) => $this->isTreatmentItem($item))
+            ->values();
 
-        $normalized = [];
-        foreach ($activeItems as $item) {
-            $itemId = (int) ($item->id ?? 0);
-            if ($itemId <= 0 || !array_key_exists($itemId, $result)) {
+        $selected = [];
+        $usedItemIds = [];
+
+        foreach ($payloadRows as $row) {
+            if (!is_array($row)) {
                 continue;
             }
 
+            $item = $this->matchDepositInvoiceItemFromPayload(
+                $activeItems,
+                $row,
+                $usedItemIds
+            );
+
+            if (!$item) {
+                continue;
+            }
+
+            $invoiceItemId = (int) $item->id;
             $invoiceQty = (float) ($item->qty ?? 0);
+
             if ($invoiceQty <= 0) {
                 $invoiceQty = 1;
             }
 
-            $selectedQty = (float) ($result[$itemId] ?? 0);
-            if ($selectedQty <= 0) {
-                $selectedQty = $invoiceQty;
+            $qtyDeposit = (float) (
+                $row['qty_deposit']
+                ?? $row['qty']
+                ?? $row['jumlah']
+                ?? 0
+            );
+
+            if ($qtyDeposit <= 0) {
+                $qtyDeposit = $invoiceQty;
             }
 
-            $normalized[$itemId] = min(max($selectedQty, 1), $invoiceQty);
+            if ($qtyDeposit > $invoiceQty) {
+                throw ValidationException::withMessages([
+                    'deposit_treatment_items' => 'Qty deposit untuk ' . ($item->nama_item ?? 'treatment') . ' tidak boleh melebihi qty invoice.',
+                ]);
+            }
+
+            $selected[$invoiceItemId] = min(max($qtyDeposit, 1), $invoiceQty);
+            $usedItemIds[] = $invoiceItemId;
         }
 
-        return $normalized;
+        return $selected;
     }
+    
+    protected function matchDepositInvoiceItemFromPayload($activeItems, array $row, array $usedItemIds = [])
+    {
+        $candidateItemId = (int) (
+            $row['item_id']
+            ?? $row['pembayaran_item_id']
+            ?? $row['invoice_item_id']
+            ?? $row['id']
+            ?? 0
+        );
 
+        if ($candidateItemId > 0) {
+            $item = $activeItems->first(function ($item) use ($candidateItemId, $usedItemIds) {
+                return (int) ($item->id ?? 0) === $candidateItemId
+                    && !in_array((int) ($item->id ?? 0), $usedItemIds, true);
+            });
+
+            if ($item) {
+                return $item;
+            }
+        }
+
+        $sourceDetailId = (int) (
+            $row['source_detail_id']
+            ?? $row['registrasi_treatment_detail_id']
+            ?? 0
+        );
+
+        if ($sourceDetailId > 0) {
+            $item = $activeItems->first(function ($item) use ($sourceDetailId, $usedItemIds) {
+                return (int) ($item->source_detail_id ?? 0) === $sourceDetailId
+                    && !in_array((int) ($item->id ?? 0), $usedItemIds, true);
+            });
+
+            if ($item) {
+                return $item;
+            }
+        }
+
+        $treatmentTokoId = (int) ($row['treatment_toko_id'] ?? 0);
+        $treatmentId = (int) ($row['treatment_id'] ?? 0);
+
+        if ($treatmentTokoId > 0 && $treatmentId > 0) {
+            $item = $activeItems->first(function ($item) use ($treatmentTokoId, $treatmentId, $usedItemIds) {
+                return (int) ($item->treatment_toko_id ?? 0) === $treatmentTokoId
+                    && (int) ($item->treatment_id ?? 0) === $treatmentId
+                    && !in_array((int) ($item->id ?? 0), $usedItemIds, true);
+            });
+
+            if ($item) {
+                return $item;
+            }
+        }
+
+        if ($treatmentTokoId > 0) {
+            $item = $activeItems->first(function ($item) use ($treatmentTokoId, $usedItemIds) {
+                return (int) ($item->treatment_toko_id ?? 0) === $treatmentTokoId
+                    && !in_array((int) ($item->id ?? 0), $usedItemIds, true);
+            });
+
+            if ($item) {
+                return $item;
+            }
+        }
+
+        if ($treatmentId > 0) {
+            return $activeItems->first(function ($item) use ($treatmentId, $usedItemIds) {
+                return (int) ($item->treatment_id ?? 0) === $treatmentId
+                    && !in_array((int) ($item->id ?? 0), $usedItemIds, true);
+            });
+        }
+
+        return null;
+    }
     protected function updatePatientPhoneFromRequest(Request $request, PembayaranInvoice $invoice): void
     {
         $this->paymentPatientService->updatePhoneFromRequest($request, $invoice);
@@ -3317,6 +3503,78 @@ class PembayaranController extends Controller
     protected function invoiceSubtotalProduk(PembayaranInvoice $invoice): float
     {
         return (float) ($invoice->subtotal_obat ?? $invoice->subtotal_produk ?? 0);
+    }
+
+    protected function resolveKonsultasiMeta($registrasi): array
+    {
+        if (!$registrasi) {
+            return [
+                'channel' => 0,
+                'channel_key' => 'tanpa_konsultasi',
+                'channel_label' => 'Tanpa Konsultasi',
+                'source_code' => null,
+                'source_name' => null,
+                'jenis_label' => 'Tanpa Konsultasi',
+            ];
+        }
+
+        $channel = (int) ($registrasi->channel_konsultasi ?? 0);
+
+        $sourceCode = trim((string) ($registrasi->konsultasi_source_code ?? ''));
+        $sourceName = trim((string) ($registrasi->konsultasi_source_name ?? ''));
+
+        if ($sourceCode === '' && $channel > 0) {
+            $sourceCode = $channel === 2
+                ? 'KONSULTASI_ONLINE'
+                : 'KONSULTASI_OFFLINE';
+        }
+
+        if ($sourceName === '') {
+            $sourceName = $this->mapKonsultasiSourceName($sourceCode);
+        }
+
+        $channelKey = $this->resolveKonsultasiChannelKey($channel);
+        $channelLabel = $this->resolveKonsultasiChannelLabel($channel);
+
+        return [
+            'channel' => $channel,
+            'channel_key' => $channelKey,
+            'channel_label' => $channelLabel,
+            'source_code' => $sourceCode !== '' ? $sourceCode : null,
+            'source_name' => $sourceName !== '' ? $sourceName : null,
+            'jenis_label' => $sourceName !== '' ? $sourceName : $channelLabel,
+        ];
+    }
+
+    protected function resolveKonsultasiChannelKey(int $channel): string
+    {
+        return match ($channel) {
+            1 => 'offline',
+            2 => 'online',
+            default => 'tanpa_konsultasi',
+        };
+    }
+
+    protected function resolveKonsultasiChannelLabel(int $channel): string
+    {
+        return match ($channel) {
+            1 => 'Konsultasi Offline',
+            2 => 'Konsultasi Online',
+            default => 'Tanpa Konsultasi',
+        };
+    }
+
+    protected function mapKonsultasiSourceName(?string $sourceCode): string
+    {
+        $sourceCode = strtoupper(trim((string) $sourceCode));
+
+        return match ($sourceCode) {
+            'KONSULTASI_OFFLINE' => 'Konsultasi Dokter',
+            'KONSULTASI_ONLINE' => 'Konsultasi Online',
+            'KONSULTASI_SPPG' => 'Konsultasi SPPG',
+            'KONSULTASI_SPKK' => 'Konsultasi SPKK',
+            default => '',
+        };
     }
 
     protected function onlyExistingColumns(string $table, array $data): array
