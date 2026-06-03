@@ -717,17 +717,22 @@ class PasienController extends Controller
             ->orderByDesc('id')
             ->first(['no_member', 'total_point', 'point_sisa', 'status']);
 
+        $memberPointSisa = (float) ($member->point_sisa ?? 0);
+
         return [
             'total_kunjungan' => (int) $totalKunjungan,
             'total_transaksi' => (float) $totalTransaksi,
             'last_visit_date' => $lastVisit ? $this->formatDate($lastVisit->tanggal_kunjungan) : null,
             'last_visit_at' => $lastVisit ? $this->formatDateTime($lastVisit->registered_at) : null,
+
             'deposit_qty_sisa' => (float) ($deposit->qty_sisa ?? 0),
             'deposit_nilai_sisa' => (float) ($deposit->nilai_sisa ?? 0),
+
             'member_no' => $member->no_member ?? null,
             'member_status' => isset($member->status) ? $this->memberStatusText($member->status) : null,
             'member_total_point' => (float) ($member->total_point ?? 0),
-            'member_point_sisa' => (float) ($member->point_sisa ?? 0),
+            'member_point_sisa' => $memberPointSisa,
+            'member_point_value' => $memberPointSisa * 2500,
         ];
     }
 

@@ -21,6 +21,7 @@ use App\Http\Controllers\Api\Master\MasterPoinRuleController;
 use App\Http\Controllers\Api\Master\MasterMemberTierController;
 
 use App\Http\Controllers\Api\Administrasi\PasienController;
+use App\Http\Controllers\Api\Administrasi\PasienDepositController;
 
 use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
 
@@ -66,6 +67,11 @@ Route::middleware('auth:api')->group(function () {
     });
     
     Route::prefix('administrasi')->group(function () {
+        Route::get('pasien/{id}/saldo-deposit', [PasienDepositController::class, 'show'])
+            ->whereNumber('id');
+        Route::post('pasien/{id}/saldo-deposit/{depositId}/claim', [PasienDepositController::class, 'claim'])
+            ->whereNumber('id')
+            ->whereNumber('depositId');
         Route::get('pasien/{id}/riwayat', [PasienController::class, 'riwayat'])->whereNumber('id');
         Route::apiResource('pasien', PasienController::class);
     });
