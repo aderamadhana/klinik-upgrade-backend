@@ -4,9 +4,9 @@ namespace App\Services\Pembayaran;
 
 use App\Models\Master\MasterMemberTier;
 use App\Models\Master\MasterPoinRule;
-use App\Models\Member\MemberPointLedger;
-use App\Models\Member\PasienMember;
-use App\Models\Pasien\PasienPoinLedger;
+use App\Models\Poin\MemberPointLedger;
+use App\Models\Poin\PasienPoinLedger;
+use App\Models\PasienMember;
 use App\Models\Pembayaran\PembayaranInvoice;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
