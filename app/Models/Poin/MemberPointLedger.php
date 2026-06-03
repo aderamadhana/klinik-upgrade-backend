@@ -12,6 +12,9 @@ use Illuminate\Database\Eloquent\Model;
 class MemberPointLedger extends Model
 {
     use Auditable;
+    public const TYPE_EARN = 1;
+    public const TYPE_REDEEM = 2;
+    public const TYPE_ADJUSTMENT = 3;
     protected $table = 'member_point_ledger';
 
     protected $guarded = [];

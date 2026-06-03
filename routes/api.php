@@ -66,6 +66,7 @@ Route::middleware('auth:api')->group(function () {
     });
     
     Route::prefix('administrasi')->group(function () {
+        Route::get('pasien/{id}/riwayat', [PasienController::class, 'riwayat'])->whereNumber('id');
         Route::apiResource('pasien', PasienController::class);
     });
 
