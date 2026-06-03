@@ -16,6 +16,7 @@ use App\Services\Pembayaran\VoucherFinalizerService;
 use App\Services\Pembayaran\PaymentInvoiceItemSyncService;
 use App\Services\Pembayaran\PaymentPatientService;
 use App\Services\Pembayaran\PaymentSubtotalDiscountService;
+use App\Services\Pembayaran\PaymentMemberPointService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -32,19 +33,22 @@ class PembayaranController extends Controller
     protected PaymentInvoiceItemSyncService $invoiceItemSyncService;
     protected PaymentPatientService $paymentPatientService;
     protected PaymentSubtotalDiscountService $subtotalDiscountService;
+    protected PaymentMemberPointService $memberPointService;
     
     public function __construct(
         StockTransactionService $stockTransactionService,
         VoucherFinalizerService $voucherFinalizerService,
         PaymentInvoiceItemSyncService $invoiceItemSyncService,
         PaymentPatientService $paymentPatientService,
-        PaymentSubtotalDiscountService $subtotalDiscountService
+        PaymentSubtotalDiscountService $subtotalDiscountService,
+        PaymentMemberPointService $memberPointService
     ) {
         $this->stockTransactionService = $stockTransactionService;
         $this->voucherFinalizerService = $voucherFinalizerService;
         $this->invoiceItemSyncService = $invoiceItemSyncService;
         $this->paymentPatientService = $paymentPatientService;
         $this->subtotalDiscountService = $subtotalDiscountService;
+        $this->memberPointService = $memberPointService;
     }
 
     public function index(Request $request)
@@ -427,7 +431,7 @@ class PembayaranController extends Controller
                     ->firstOrFail();
                 $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
 
-                $this->applyMemberBenefitToInvoice($invoice);
+                $this->memberPointService->applyMemberBenefitToInvoice($invoice, $this->username());
                 $this->refreshInvoiceTotalsFromItems($invoice);
 
                 $invoice = PembayaranInvoice::query()
@@ -490,7 +494,7 @@ class PembayaranController extends Controller
                 ]));
 
                 $invoice->refresh();
-                $this->processMemberPointLedger($invoice);
+                $this->memberPointService->processEarnedPointLedger($invoice, $this->username());
 
                 $paymentTask = $this->getPaymentTask($registrasi);
 
@@ -2102,293 +2106,6 @@ class PembayaranController extends Controller
         }
     }
 
-    protected function applyMemberBenefitToInvoice(PembayaranInvoice $invoice): void
-    {
-        if (!Schema::hasTable('pasien_member')) {
-            return;
-        }
-
-        $member = $this->resolveActivePatientMember((int) $invoice->pasien_id);
-        if (!$member) {
-            $pointEarned = $this->calculatePointEarned($invoice, null, null);
-            $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-                'member_id' => null,
-                'member_no' => null,
-                'member_tier_id' => null,
-                'member_tier_nama' => null,
-                'diskon_member_amount' => 0,
-                'point_earned' => $pointEarned,
-                'poin' => $pointEarned,
-                'updated_by' => $this->username(),
-                'updated_at' => now(),
-            ]));
-            return;
-        }
-
-        $tier = $this->resolveMemberTier((int) ($member->member_tier_id ?? 0));
-        $subtotal = (float) ($invoice->subtotal ?? 0);
-        $afterPromo = max(
-            $subtotal
-            - (float) ($invoice->diskon_subtotal_amount ?? 0)
-            - (float) ($invoice->total_promo ?? 0),
-            0
-        );
-
-        $diskonMember = 0;
-        $tierDiscount = (float) ($tier->diskon_persen ?? 0);
-        if ($tierDiscount > 0 && $afterPromo > 0) {
-            $diskonMember = round(($afterPromo * $tierDiscount) / 100, 2);
-        }
-
-        $pointEarned = $this->calculatePointEarned($invoice, $member, $tier);
-
-        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-            'member_id' => $member->id,
-            'member_no' => $member->no_member ?? null,
-            'member_tier_id' => $member->member_tier_id ?? null,
-            'member_tier_nama' => $tier->nama ?? null,
-            'diskon_member_amount' => $diskonMember,
-            'point_earned' => $pointEarned,
-            'poin' => $pointEarned,
-            'updated_by' => $this->username(),
-            'updated_at' => now(),
-        ]));
-    }
-
-    protected function resolveActivePatientMember(int $pasienId): ?object
-    {
-        if ($pasienId <= 0 || !Schema::hasTable('pasien_member')) {
-            return null;
-        }
-
-        return DB::table('pasien_member')
-            ->where('pasien_id', $pasienId)
-            ->where(function ($q) {
-                $q->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->where('status', 1)
-            ->where(function ($q) {
-                $q->whereNull('tanggal_expired')->orWhereDate('tanggal_expired', '>=', Carbon::today());
-            })
-            ->orderByDesc('id')
-            ->lockForUpdate()
-            ->first();
-    }
-
-    protected function resolveMemberTier(int $tierId): ?object
-    {
-        if ($tierId <= 0 || !Schema::hasTable('master_member_tier')) {
-            return null;
-        }
-
-        return DB::table('master_member_tier')
-            ->where('id', $tierId)
-            ->where(function ($q) {
-                $q->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->where(function ($q) {
-                $q->whereNull('is_active')->orWhere('is_active', 1);
-            })
-            ->first();
-    }
-
-    protected function resolveActivePoinRule(): ?object
-    {
-        if (!Schema::hasTable('master_poin_rules')) {
-            return null;
-        }
-
-        return DB::table('master_poin_rules')
-            ->where(function ($q) {
-                $q->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->where(function ($q) {
-                $q->whereNull('is_active')->orWhere('is_active', 1);
-            })
-            ->where(function ($q) {
-                $q->whereNull('berlaku_mulai')->orWhereDate('berlaku_mulai', '<=', Carbon::today());
-            })
-            ->where(function ($q) {
-                $q->whereNull('berlaku_sampai')->orWhereDate('berlaku_sampai', '>=', Carbon::today());
-            })
-            ->orderByDesc('berlaku_mulai')
-            ->orderByDesc('id')
-            ->first();
-    }
-
-    protected function calculatePointEarned(PembayaranInvoice $invoice, ?object $member = null, ?object $tier = null): int
-    {
-        $base = (float) ($invoice->subtotal_treatment ?? 0);
-        if ($base <= 0) {
-            return 0;
-        }
-
-        $tierRate = (float) ($tier->point_rate ?? 0);
-        if ($tierRate > 0) {
-            return max((int) floor($base * $tierRate), 0);
-        }
-
-        $rule = $this->resolveActivePoinRule();
-        if (!$rule) {
-            return 0;
-        }
-
-        $minimal = (float) ($rule->minimal_transaksi ?? 0);
-        if ($minimal > 0 && $base < $minimal) {
-            return 0;
-        }
-
-        $nominalPerPoin = (float) ($rule->nominal_per_poin ?? 0);
-        if ($nominalPerPoin <= 0) {
-            return 0;
-        }
-
-        if ((int) ($rule->is_berlaku_kelipatan ?? 1) === 1) {
-            return max((int) floor($base / $nominalPerPoin), 0);
-        }
-
-        return $base >= $nominalPerPoin ? 1 : 0;
-    }
-
-    protected function processMemberPointLedger(PembayaranInvoice $invoice): void
-    {
-        $pointEarned = (int) round((float) ($invoice->point_earned ?? $invoice->poin ?? 0));
-        if ($pointEarned <= 0 || empty($invoice->pasien_id)) {
-            return;
-        }
-
-        if (Schema::hasTable('member_point_ledger') && !empty($invoice->member_id)) {
-            $exists = DB::table('member_point_ledger')
-                ->where('pembayaran_id', $invoice->id)
-                ->where('transaksi_type', 1)
-                ->where(function ($q) {
-                    $q->whereNull('is_void')->orWhere('is_void', 0);
-                })
-                ->exists();
-
-            if (!$exists) {
-                DB::table('member_point_ledger')->insert($this->onlyExistingColumns('member_point_ledger', [
-                    'member_id' => $invoice->member_id,
-                    'pasien_id' => $invoice->pasien_id,
-                    'pembayaran_id' => $invoice->id,
-                    'registrasi_id' => $invoice->registrasi_id,
-                    'transaksi_type' => 1,
-                    'point_masuk' => $pointEarned,
-                    'point_keluar' => 0,
-                    'nominal_referensi' => $invoice->subtotal_treatment ?? 0,
-                    'catatan' => 'Earn point pembayaran ' . $invoice->no_invoice,
-                    'tanggal_transaksi' => now(),
-                    'is_void' => 0,
-                    'created_by' => $this->username(),
-                    'updated_by' => $this->username(),
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ]));
-
-                if (Schema::hasTable('pasien_member')) {
-                    DB::table('pasien_member')
-                        ->where('id', $invoice->member_id)
-                        ->update($this->onlyExistingColumns('pasien_member', [
-                            'total_spending' => DB::raw('total_spending + ' . (float) ($invoice->grand_total ?? 0)),
-                            'total_point' => DB::raw('total_point + ' . $pointEarned),
-                            'point_sisa' => DB::raw('point_sisa + ' . $pointEarned),
-                            'updated_by' => $this->username(),
-                            'updated_at' => now(),
-                        ]));
-                }
-            }
-        }
-
-        if (Schema::hasTable('pasien_poin_ledger')) {
-            $existsPasienLedger = DB::table('pasien_poin_ledger')
-                ->where('source_table', 'pembayaran_invoice')
-                ->where('source_id', $invoice->id)
-                ->where('tipe_mutasi', 'earn')
-                ->where(function ($q) {
-                    $q->whereNull('is_void')->orWhere('is_void', 0);
-                })
-                ->exists();
-
-            if (!$existsPasienLedger) {
-                $lastSaldo = (int) DB::table('pasien_poin_ledger')
-                    ->where('pasien_id', $invoice->pasien_id)
-                    ->where(function ($q) {
-                        $q->whereNull('is_void')->orWhere('is_void', 0);
-                    })
-                    ->orderByDesc('id')
-                    ->value('saldo_setelah');
-
-                DB::table('pasien_poin_ledger')->insert($this->onlyExistingColumns('pasien_poin_ledger', [
-                    'pasien_id' => $invoice->pasien_id,
-                    'toko_id' => $invoice->toko_id,
-                    'source_table' => 'pembayaran_invoice',
-                    'source_id' => $invoice->id,
-                    'source_no' => $invoice->no_invoice,
-                    'tanggal' => now(),
-                    'tipe_mutasi' => 'earn',
-                    'poin_masuk' => $pointEarned,
-                    'poin_keluar' => 0,
-                    'saldo_sebelum' => $lastSaldo,
-                    'saldo_setelah' => $lastSaldo + $pointEarned,
-                    'nominal_transaksi' => $invoice->subtotal_treatment ?? 0,
-                    'rule_id' => optional($this->resolveActivePoinRule())->id,
-                    'keterangan' => 'Earn point pembayaran ' . $invoice->no_invoice,
-                    'is_void' => 0,
-                    'created_by' => null,
-                    'created_at' => now(),
-                ]));
-            }
-        }
-    }
-
-    protected function rollbackMemberPointLedger(PembayaranInvoice $invoice, string $reason): void
-    {
-        if (Schema::hasTable('member_point_ledger')) {
-            $ledgers = DB::table('member_point_ledger')
-                ->where('pembayaran_id', $invoice->id)
-                ->where(function ($q) {
-                    $q->whereNull('is_void')->orWhere('is_void', 0);
-                })
-                ->lockForUpdate()
-                ->get();
-
-            foreach ($ledgers as $ledger) {
-                DB::table('member_point_ledger')
-                    ->where('id', $ledger->id)
-                    ->update($this->onlyExistingColumns('member_point_ledger', [
-                        'is_void' => 1,
-                        'catatan' => trim((string) ($ledger->catatan ?? '') . ' | VOID: ' . $reason),
-                        'updated_by' => $this->username(),
-                        'updated_at' => now(),
-                    ]));
-
-                if (Schema::hasTable('pasien_member') && (int) ($ledger->transaksi_type ?? 0) === 1) {
-                    DB::table('pasien_member')
-                        ->where('id', $ledger->member_id)
-                        ->update($this->onlyExistingColumns('pasien_member', [
-                            'total_point' => DB::raw('GREATEST(total_point - ' . (float) ($ledger->point_masuk ?? 0) . ', 0)'),
-                            'point_sisa' => DB::raw('GREATEST(point_sisa - ' . (float) ($ledger->point_masuk ?? 0) . ', 0)'),
-                            'updated_by' => $this->username(),
-                            'updated_at' => now(),
-                        ]));
-                }
-            }
-        }
-
-        if (Schema::hasTable('pasien_poin_ledger')) {
-            DB::table('pasien_poin_ledger')
-                ->where('source_table', 'pembayaran_invoice')
-                ->where('source_id', $invoice->id)
-                ->where(function ($q) {
-                    $q->whereNull('is_void')->orWhere('is_void', 0);
-                })
-                ->update($this->onlyExistingColumns('pasien_poin_ledger', [
-                    'is_void' => 1,
-                    'keterangan' => DB::raw("CONCAT(COALESCE(keterangan, ''), ' | VOID: " . addslashes($reason) . "')"),
-                ]));
-        }
-    }
-
     protected function createAccurateSyncPendingLog(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
     {
         if (!Schema::hasTable('accurate_sync_log')) {
@@ -2478,7 +2195,7 @@ class PembayaranController extends Controller
         $this->rollbackDepositPurchaseRecords($invoice);
         $this->rollbackDepositClaimRecords($invoice);
         $this->cancelAccurateSyncLog($invoice, $reason);
-        $this->rollbackMemberPointLedger($invoice, $reason);
+        $this->memberPointService->rollbackPointLedger($invoice, $reason, $this->username());
     }
 
     protected function voidPaymentStockMutations(PembayaranInvoice $invoice, string $reason): void
