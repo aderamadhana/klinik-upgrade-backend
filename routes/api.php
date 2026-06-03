@@ -19,6 +19,9 @@ use App\Http\Controllers\Api\Master\MasterAntrianKategoriController;
 use App\Http\Controllers\Api\Master\MasterAntrianCounterController;
 use App\Http\Controllers\Api\Master\MasterPoinRuleController;
 use App\Http\Controllers\Api\Master\MasterMemberTierController;
+use App\Http\Controllers\Api\Master\MasterTreatmentBahanController;
+use App\Http\Controllers\Api\Master\MasterPerawatBahanController;
+use App\Http\Controllers\Api\Master\MasterTreatmentPerawatBahanController;
 
 use App\Http\Controllers\Api\Administrasi\PasienController;
 use App\Http\Controllers\Api\Administrasi\PasienDepositController;
@@ -64,6 +67,13 @@ Route::middleware('auth:api')->group(function () {
         Route::post('antrian-counter/sync-from-branch', [MasterAntrianCounterController::class, 'syncFromBranch']);
         Route::apiResource('poin-rule', MasterPoinRuleController::class);
         Route::apiResource('member-tier', MasterMemberTierController::class);
+        Route::get('treatment-bahan/options', [MasterTreatmentBahanController::class, 'options']);
+        Route::post('treatment-bahan/sync-by-treatment/{treatmentId}', [MasterTreatmentBahanController::class, 'syncByTreatment'])->whereNumber('treatmentId');
+        Route::apiResource('treatment-bahan', MasterTreatmentBahanController::class);
+        Route::get('perawat-bahan/options', [MasterPerawatBahanController::class, 'options']);
+        Route::apiResource('perawat-bahan', MasterPerawatBahanController::class);
+        Route::get('treatment-bahan/options', [MasterTreatmentPerawatBahanController::class, 'options']);
+        Route::apiResource('treatment-bahan', MasterTreatmentPerawatBahanController::class);
     });
     
     Route::prefix('administrasi')->group(function () {
@@ -193,6 +203,7 @@ Route::prefix('reference')->group(function () {
     Route::get('assessment', [ReferenceController::class, 'assessment']);
     Route::get('jenis-transaksi', [ReferenceController::class, 'jenisTransaksi']);
     Route::get('sumber-informasi', [ReferenceController::class, 'sumberInformasi']);
+    Route::get('bahan-perawat', [ReferenceController::class, 'bahanPerawat']);
 });
 
 Route::prefix('antrian')->group(function () {

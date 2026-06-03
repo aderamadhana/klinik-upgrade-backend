@@ -31,6 +31,7 @@ use App\Models\Master\MasterSubjective;
 use App\Models\Master\MasterAssessment;
 use App\Models\Master\MasterJenisTransaksi;
 use App\Models\Master\MasterSumberInformasi;
+use App\Models\Master\MasterPerawatBahan;   
 use App\Models\Pasien;
 
 class ReferenceController extends Controller
@@ -1459,6 +1460,58 @@ class ReferenceController extends Controller
         return response()->json([
             'status' => true,
             'message' => 'Data sumber informasi berhasil diambil',
+            'data' => $data,
+        ]);
+    }
+    public function bahanPerawat(Request $request)
+    {
+        $search = trim((string) $request->get('search', ''));
+        $limit = (int) $request->get('limit', 100);
+
+        if ($limit <= 0) {
+            $limit = 100;
+        }
+
+        if ($limit > 500) {
+            $limit = 500;
+        }
+
+        $data = MasterPerawatBahan::query()
+            ->where('is_delete', 0)
+            ->where('is_active', 1)
+            ->when($search !== '', function ($q) use ($search) {
+                $q->where(function ($qq) use ($search) {
+                    $qq->where('nama_bahan', 'like', "%{$search}%")
+                        ->orWhere('kode_accurate_obat_bahan', 'like', "%{$search}%")
+                        ->orWhere('satuan', 'like', "%{$search}%");
+                });
+            })
+            ->orderBy('nama_bahan')
+            ->limit($limit)
+            ->get([
+                'id',
+                'nama_bahan',
+                'kode_accurate_obat_bahan',
+                'satuan',
+            ])
+            ->map(function ($item) {
+                $kode = $item->kode_accurate_obat_bahan ?: '-';
+                $satuan = $item->satuan ?: '-';
+
+                return [
+                    'id' => $item->id,
+                    'value' => $item->id,
+                    'nama_bahan' => $item->nama_bahan,
+                    'kode_accurate_obat_bahan' => $item->kode_accurate_obat_bahan,
+                    'satuan' => $item->satuan,
+                    'label' => trim($item->nama_bahan . ' | ' . $kode . ' | ' . $satuan),
+                ];
+            })
+            ->values();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data bahan perawat berhasil diambil',
             'data' => $data,
         ]);
     }
