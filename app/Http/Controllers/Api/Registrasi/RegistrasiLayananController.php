@@ -351,6 +351,9 @@ class RegistrasiLayananController extends Controller
 
                 'konsultasi_source_code' => $row->konsultasi_source_code,
                 'konsultasi_source_name' => $row->konsultasi_source_name,
+                'bukti_chat_konsultasi_online' => $row->bukti_chat_konsultasi_online ?? null,
+                'bukti_chat_konsultasi_online_url' => $this->storagePublicUrl($row->bukti_chat_konsultasi_online ?? null),
+                'is_upload_bukti_chat_konsultasi_online' => !empty($row->bukti_chat_konsultasi_online) ? 1 : 0,
                 'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
 
                 'is_konsultasi' => $hasConsultation ? 1 : 0,
@@ -386,6 +389,9 @@ class RegistrasiLayananController extends Controller
                     ),
                     'konsultasi_source_code' => $row->konsultasi_source_code,
                     'konsultasi_source_name' => $row->konsultasi_source_name,
+                    'bukti_chat_konsultasi_online' => $row->bukti_chat_konsultasi_online ?? null,
+                    'bukti_chat_konsultasi_online_url' => $this->storagePublicUrl($row->bukti_chat_konsultasi_online ?? null),
+                    'is_upload_bukti_chat_konsultasi_online' => !empty($row->bukti_chat_konsultasi_online) ? 1 : 0,
                     'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
 
                     'ada_treatment' => (int) ($row->is_treatment ?? 0),
@@ -623,6 +629,9 @@ class RegistrasiLayananController extends Controller
 
             'konsultasi_source_code' => $row->konsultasi_source_code,
             'konsultasi_source_name' => $row->konsultasi_source_name,
+            'bukti_chat_konsultasi_online' => $row->bukti_chat_konsultasi_online ?? null,
+            'bukti_chat_konsultasi_online_url' => $this->storagePublicUrl($row->bukti_chat_konsultasi_online ?? null),
+            'is_upload_bukti_chat_konsultasi_online' => !empty($row->bukti_chat_konsultasi_online) ? 1 : 0,
             'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
 
             'is_konsultasi' => $hasConsultation ? 1 : 0,
@@ -654,6 +663,9 @@ class RegistrasiLayananController extends Controller
                 ),
                 'konsultasi_source_code' => $row->konsultasi_source_code,
                 'konsultasi_source_name' => $row->konsultasi_source_name,
+                'bukti_chat_konsultasi_online' => $row->bukti_chat_konsultasi_online ?? null,
+                'bukti_chat_konsultasi_online_url' => $this->storagePublicUrl($row->bukti_chat_konsultasi_online ?? null),
+                'is_upload_bukti_chat_konsultasi_online' => !empty($row->bukti_chat_konsultasi_online) ? 1 : 0,
                 'konsultasi_mapping' => $mappingPayload($konsultasiMapping),
 
                 'ada_treatment' => (int) ($row->is_treatment ?? 0),
@@ -1577,6 +1589,132 @@ class RegistrasiLayananController extends Controller
     public function deleteAntrianDokter($id)
     {
         return $this->destroyAntrianDokter($id);
+    }
+
+    public function uploadBuktiChatKonsultasiOnline(Request $request, $id)
+    {
+        if (!Schema::hasColumn('registrasi_kunjungan', 'bukti_chat_konsultasi_online')) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Kolom bukti_chat_konsultasi_online belum tersedia di tabel registrasi_kunjungan',
+            ], 500);
+        }
+
+        $validator = Validator::make($request->all(), [
+            'bukti_chat_konsultasi_online' => 'nullable|file|mimes:jpg,jpeg,png,webp,pdf|max:5120',
+            'bukti_chat' => 'nullable|file|mimes:jpg,jpeg,png,webp,pdf|max:5120',
+            'file' => 'nullable|file|mimes:jpg,jpeg,png,webp,pdf|max:5120',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Validasi gagal',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        $file = $request->file('bukti_chat_konsultasi_online')
+            ?: $request->file('bukti_chat')
+            ?: $request->file('file');
+
+        if (!$file) {
+            return response()->json([
+                'status' => false,
+                'message' => 'File bukti chat wajib diupload',
+            ], 422);
+        }
+
+        $registrasi = RegistrasiKunjungan::query()
+            ->active()
+            ->findOrFail($id);
+
+        if (!$this->isRegistrasiKonsultasiOnline($registrasi)) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Upload bukti chat hanya untuk layanan konsultasi online',
+            ], 422);
+        }
+
+        if ((int) $registrasi->status !== RegistrasiKunjungan::STATUS_SELESAI) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Bukti chat hanya bisa diupload setelah proses konsultasi online selesai',
+            ], 422);
+        }
+
+        DB::beginTransaction();
+
+        try {
+            $oldPath = $registrasi->bukti_chat_konsultasi_online;
+
+            $extension = strtolower($file->getClientOriginalExtension() ?: $file->extension() ?: 'file');
+            $filename = 'bukti-chat-' . $registrasi->id . '-' . now()->format('YmdHis') . '.' . $extension;
+
+            $path = $file->storeAs(
+                'registrasi/konsultasi-online/' . $registrasi->id,
+                $filename,
+                'public'
+            );
+
+            $registrasi->update([
+                'bukti_chat_konsultasi_online' => $path,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+
+            if (
+                $oldPath &&
+                !str_starts_with((string) $oldPath, 'http://') &&
+                !str_starts_with((string) $oldPath, 'https://') &&
+                Storage::disk('public')->exists($oldPath)
+            ) {
+                Storage::disk('public')->delete($oldPath);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Bukti chat konsultasi online berhasil diupload',
+                'data' => [
+                    'id' => $registrasi->id,
+                    'kode_registrasi' => $registrasi->kode_registrasi,
+                    'bukti_chat_konsultasi_online' => $path,
+                    'bukti_chat_konsultasi_online_url' => $this->storagePublicUrl($path),
+                    'is_upload_bukti_chat_konsultasi_online' => 1,
+                ],
+            ]);
+        } catch (\Throwable $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Gagal upload bukti chat konsultasi online',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
+    }
+
+    private function isRegistrasiKonsultasiOnline(RegistrasiKunjungan $registrasi): bool
+    {
+        $sourceCode = strtoupper((string) $registrasi->konsultasi_source_code);
+
+        return (int) $registrasi->channel_konsultasi === RegistrasiKunjungan::CHANNEL_ONLINE
+            || str_contains($sourceCode, 'ONLINE');
+    }
+
+    private function storagePublicUrl(?string $path): ?string
+    {
+        if (!$path) {
+            return null;
+        }
+
+        if (str_starts_with($path, 'http://') || str_starts_with($path, 'https://')) {
+            return $path;
+        }
+
+        return Storage::disk('public')->url($path);
     }
 
     private function resolvePasienId(Request $request)

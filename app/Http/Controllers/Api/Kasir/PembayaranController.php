@@ -24,6 +24,11 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
+use Endroid\QrCode\Encoding\Encoding;
+use Endroid\QrCode\ErrorCorrectionLevel;
+use Endroid\QrCode\QrCode;
+use Endroid\QrCode\RoundBlockSizeMode;
+use Endroid\QrCode\Writer\SvgWriter;
 use Throwable;
 
 class PembayaranController extends Controller
@@ -753,6 +758,54 @@ class PembayaranController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    public function printInvoice($id)
+    {
+        $invoice = $this->resolveInvoice($id);
+
+        if (!$invoice) {
+            return response('Invoice tidak ditemukan.', 404);
+        }
+
+        if ((int) $invoice->status !== PembayaranInvoice::STATUS_LUNAS) {
+            return response('Invoice hanya bisa dicetak setelah pembayaran lunas.', 422);
+        }
+
+        $invoice->load([
+            'registrasi.toko',
+            'registrasi.pasien',
+            'registrasi.dokterAwal',
+            'registrasi.perawatAwal',
+            'items.promos',
+            'items.depositClaims',
+            'metode',
+            'promos',
+            'depositClaims.depositTreatment',
+        ]);
+
+        return response()
+            ->view('kasir.pembayaran.invoice-print', [
+                'invoice' => $invoice,
+                'registrasi' => $invoice->registrasi,
+                'toko' => $invoice->registrasi?->toko,
+                'pasien' => $invoice->registrasi?->pasien,
+                'items' => $invoice->items
+                    ->where('is_delete', 0)
+                    ->values(),
+                'metode' => $invoice->metode
+                    ->where('is_delete', 0)
+                    ->values(),
+                'promos' => $invoice->promos
+                    ->where('is_delete', 0)
+                    ->values(),
+                'depositClaims' => $invoice->depositClaims
+                    ->where('is_delete', 0)
+                    ->values(),
+                'printedBy' => $this->username(),
+                'qrDataUri' => $this->buildInvoiceQrDataUri($invoice),
+            ])
+            ->header('Content-Type', 'text/html; charset=UTF-8');
     }
 
     protected function applyPaymentListFilters($query, Request $request): void
@@ -3589,5 +3642,60 @@ class PembayaranController extends Controller
         return auth()->user()->username
             ?? auth()->user()->name
             ?? 'system';
+    }
+
+    private function buildInvoiceQrDataUri(PembayaranInvoice $invoice): ?string
+    {
+        $qrTargetUrl = $this->buildInvoiceQrTargetUrl($invoice);
+
+        if (!$qrTargetUrl) {
+            return null;
+        }
+
+        $writer = new SvgWriter();
+
+        $qrCode = new QrCode(
+            data: $qrTargetUrl,
+            encoding: new Encoding('UTF-8'),
+            errorCorrectionLevel: ErrorCorrectionLevel::Medium,
+            size: 120,
+            margin: 2,
+            roundBlockSizeMode: RoundBlockSizeMode::Margin
+        );
+
+        $result = $writer->write($qrCode);
+
+        return $result->getDataUri();
+    }
+
+    private function buildInvoiceQrTargetUrl(PembayaranInvoice $invoice): ?string
+    {
+        $baseUrl = rtrim(
+            trim((string) env('SIPUAS_REVIEW_URL', 'https://sipuas.msglowclinic.id')),
+            '/'
+        );
+
+        $tokoId = (int) (
+            $invoice->toko_id
+            ?? $invoice->registrasi?->toko_id
+            ?? 0
+        );
+
+        $pasien = $invoice->registrasi?->pasien;
+
+        $sipuasPasienId = $pasien->new_id
+            ?? $pasien->pasien_new_id
+            ?? $pasien->id_lama
+            ?? $invoice->pasien_new_id
+            ?? $invoice->pasien_id
+            ?? null;
+
+        $sipuasPasienId = trim((string) $sipuasPasienId);
+
+        if ($tokoId <= 0 || $sipuasPasienId === '') {
+            return null;
+        }
+
+        return $baseUrl . '/' . $tokoId . '/' . rawurlencode($sipuasPasienId);
     }
 }

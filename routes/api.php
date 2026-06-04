@@ -101,6 +101,8 @@ Route::middleware('auth:api')->group(function () {
 
         Route::post('/{id}/finish-current-task', [RegistrasiLayananController::class, 'finishCurrentTask'])
             ->whereNumber('id');
+        Route::post('/{id}/upload-bukti-chat-konsultasi-online', [RegistrasiLayananController::class, 'uploadBuktiChatKonsultasiOnline'])
+            ->whereNumber('id');
         Route::get('/{id}', [RegistrasiLayananController::class, 'show'])
             ->whereNumber('id');
 
@@ -133,6 +135,7 @@ Route::middleware('auth:api')->group(function () {
     Route::prefix('kasir')->group(function () {
         Route::prefix('pembayaran')->group(function () {
             Route::get('/', [PembayaranController::class, 'index']);
+            Route::get('/{id}/print-invoice', [PembayaranController::class, 'printInvoice'])->whereNumber('id');
             Route::get('/{id}', [PembayaranController::class, 'show'])->whereNumber('id');
             Route::post('/generate/{registrasiId}', [PembayaranController::class, 'generate'])->whereNumber('registrasiId');
             Route::post('/{id}/start', [PembayaranController::class, 'start'])->whereNumber('id');
