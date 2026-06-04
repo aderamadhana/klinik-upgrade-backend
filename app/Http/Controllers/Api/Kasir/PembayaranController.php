@@ -17,6 +17,7 @@ use App\Services\Pembayaran\PaymentInvoiceItemSyncService;
 use App\Services\Pembayaran\PaymentPatientService;
 use App\Services\Pembayaran\PaymentSubtotalDiscountService;
 use App\Services\Pembayaran\PaymentMemberPointService;
+use App\Services\Pembayaran\PaymentNurseTreatmentMaterialService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -39,6 +40,7 @@ class PembayaranController extends Controller
     protected PaymentPatientService $paymentPatientService;
     protected PaymentSubtotalDiscountService $subtotalDiscountService;
     protected PaymentMemberPointService $memberPointService;
+    protected PaymentNurseTreatmentMaterialService $nurseTreatmentMaterialService;
     
     public function __construct(
         StockTransactionService $stockTransactionService,
@@ -46,7 +48,8 @@ class PembayaranController extends Controller
         PaymentInvoiceItemSyncService $invoiceItemSyncService,
         PaymentPatientService $paymentPatientService,
         PaymentSubtotalDiscountService $subtotalDiscountService,
-        PaymentMemberPointService $memberPointService
+        PaymentMemberPointService $memberPointService,
+        PaymentNurseTreatmentMaterialService $nurseTreatmentMaterialService
     ) {
         $this->stockTransactionService = $stockTransactionService;
         $this->voucherFinalizerService = $voucherFinalizerService;
@@ -54,6 +57,7 @@ class PembayaranController extends Controller
         $this->paymentPatientService = $paymentPatientService;
         $this->subtotalDiscountService = $subtotalDiscountService;
         $this->memberPointService = $memberPointService;
+        $this->nurseTreatmentMaterialService = $nurseTreatmentMaterialService;
     }
 
     public function index(Request $request)
@@ -395,7 +399,15 @@ class PembayaranController extends Controller
                     ]);
                 }
 
-                $this->ensureLegacyInvoiceNumber($invoice, $registrasi);
+                $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
+                $depositExpiredAt = $this->resolveDepositExpiredAt($request);
+
+                $this->ensureLegacyInvoiceNumber($invoice, $registrasi, $jenisTransaksi);
+
+                $registrasi->loadMissing([
+                    'treatmentDetails',
+                    'penjualanDetails',
+                ]);
 
                 $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
                 $this->syncInvoiceItemsFromRegistrasi($invoice, $registrasi);
@@ -416,8 +428,8 @@ class PembayaranController extends Controller
 
                 $this->updatePatientPhoneFromRequest($request, $invoice);
 
-                $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
-                $depositExpiredAt = $this->resolveDepositExpiredAt($request);
+                // $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
+                // $depositExpiredAt = $this->resolveDepositExpiredAt($request);
 
                 $this->validateJenisTransaksiKhusus($request, $invoice, $jenisTransaksi, $depositExpiredAt);
                 $this->syncJenisTransaksiToInvoiceItems($invoice, $jenisTransaksi);
@@ -461,7 +473,7 @@ class PembayaranController extends Controller
                     'promos',
                     'depositClaims',
                 ]);
-
+                $this->nurseTreatmentMaterialService->syncFromInvoice($invoice, $registrasi, $this->username());
                 $metode = $this->normalizeMetodePayload($request, $invoice);
                 $totalBayar = collect($metode)->sum('nominal_dialokasikan');
                 $grandTotal = (float) ($invoice->grand_total ?? 0);
@@ -3071,10 +3083,13 @@ class PembayaranController extends Controller
             $existing = new PembayaranInvoice();
         }
 
+        $jenisTransaksi = (int) ($existing->jenis_transaksi ?? 0);
         $noInvoice = $existing->no_invoice;
 
         if (!$this->isLegacyInvoiceNumber($noInvoice)) {
-            $noInvoice = $this->generateInvoiceNumber($registrasi);
+            $noInvoice = $this->generateInvoiceNumber($registrasi, $jenisTransaksi, (int) $existing->id);
+        } else {
+            $noInvoice = $this->formatInvoiceNumberWithTransactionSuffix($noInvoice, $jenisTransaksi);
         }
 
         $tanggalInvoice = $registrasi->tanggal_kunjungan ?? $registrasi->tanggal ?? Carbon::today()->toDateString();
@@ -3282,48 +3297,122 @@ class PembayaranController extends Controller
         return empty($parts) ? null : implode(' - ', $parts);
     }
 
-    protected function ensureLegacyInvoiceNumber(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
-    {
-        if ($this->isLegacyInvoiceNumber($invoice->no_invoice ?? null)) {
+    protected function ensureLegacyInvoiceNumber(
+        PembayaranInvoice $invoice,
+        RegistrasiKunjungan $registrasi,
+        ?int $jenisTransaksi = null
+    ): void {
+        $jenisTransaksi = $jenisTransaksi ?? (int) ($invoice->jenis_transaksi ?? 0);
+        $currentNumber = trim((string) ($invoice->no_invoice ?? ''));
+
+        if (!$this->isLegacyInvoiceNumber($currentNumber)) {
+            $newNumber = $this->generateInvoiceNumber($registrasi, $jenisTransaksi, (int) $invoice->id);
+        } else {
+            $newNumber = $this->formatInvoiceNumberWithTransactionSuffix($currentNumber, $jenisTransaksi);
+        }
+
+        if ($newNumber === $currentNumber) {
             return;
         }
 
-        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-            'no_invoice' => $this->generateInvoiceNumber($registrasi),
+        if ($this->invoiceNumberExists($newNumber, (int) $invoice->id)) {
+            $newNumber = $this->generateInvoiceNumber($registrasi, $jenisTransaksi, (int) $invoice->id);
+        }
+
+        $invoice->forceFill([
+            'no_invoice' => $newNumber,
             'updated_by' => $this->username(),
             'updated_at' => now(),
-        ]));
+        ])->save();
+
+        $invoice->refresh();
     }
 
-    protected function generateInvoiceNumber(RegistrasiKunjungan $registrasi): string
-    {
-        $invoiceDate = Carbon::parse(
-            $registrasi->tanggal_kunjungan
-            ?? $registrasi->tanggal
-            ?? $registrasi->registered_at
-            ?? now()
-        );
-
+    protected function generateInvoiceNumber(
+        RegistrasiKunjungan $registrasi,
+        int $jenisTransaksi = 0,
+        ?int $ignoreInvoiceId = null
+    ): string {
+        $invoiceDate = $this->resolveInvoiceDate($registrasi);
         $tokoId = (int) ($registrasi->toko_id ?? 0);
         $tokoCode = $this->resolveLegacyInvoiceTokoCode($tokoId);
 
         do {
             $sequence = $this->nextLegacyInvoiceSequence($tokoId, $invoiceDate);
-            $invoiceNumber = $this->formatLegacyInvoiceNumber($tokoCode, $invoiceDate, $sequence);
-        } while ($this->invoiceNumberExists($invoiceNumber));
+            $baseNumber = $this->formatLegacyInvoiceNumber($tokoCode, $invoiceDate, $sequence);
+            $invoiceNumber = $this->formatInvoiceNumberWithTransactionSuffix($baseNumber, $jenisTransaksi);
+        } while ($this->invoiceNumberExists($invoiceNumber, $ignoreInvoiceId));
 
         return $invoiceNumber;
     }
 
+    protected function resolveInvoiceDate(RegistrasiKunjungan $registrasi): Carbon
+    {
+        return Carbon::parse(
+            $registrasi->tanggal_kunjungan
+                ?? $registrasi->tanggal
+                ?? $registrasi->registered_at
+                ?? now()
+        );
+    }
+
     protected function isLegacyInvoiceNumber(?string $invoiceNumber): bool
+    {
+        $baseNumber = $this->normalizeInvoiceNumberWithoutTransactionSuffix($invoiceNumber);
+
+        if ($baseNumber === '') {
+            return false;
+        }
+
+        return !str_starts_with(strtoupper($baseNumber), 'INV-');
+    }
+
+    protected function formatInvoiceNumberWithTransactionSuffix(?string $invoiceNumber, int $jenisTransaksi): string
+    {
+        $baseNumber = $this->normalizeInvoiceNumberWithoutTransactionSuffix($invoiceNumber);
+
+        if ($baseNumber === '') {
+            return '';
+        }
+
+        return $baseNumber . '-' . $this->resolveInvoiceTransactionSuffix($jenisTransaksi);
+    }
+
+    protected function resolveInvoiceTransactionSuffix(int $jenisTransaksi): string
+    {
+        return match ($jenisTransaksi) {
+            4 => 'D',
+            1 => 'F',
+            2 => 'E',
+            3 => 'O',
+            default => 'U',
+        };
+    }
+
+    protected function invoiceNumberExists(string $invoiceNumber, ?int $ignoreInvoiceId = null): bool
+    {
+        $query = PembayaranInvoice::query()
+            ->where('no_invoice', $invoiceNumber)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            });
+
+        if ($ignoreInvoiceId) {
+            $query->where('id', '<>', $ignoreInvoiceId);
+        }
+
+        return $query->exists();
+    }
+
+    protected function normalizeInvoiceNumberWithoutTransactionSuffix(?string $invoiceNumber): string
     {
         $invoiceNumber = trim((string) $invoiceNumber);
 
         if ($invoiceNumber === '') {
-            return false;
+            return '';
         }
 
-        return !str_starts_with(strtoupper($invoiceNumber), 'INV-');
+        return preg_replace('/-[A-Z]$/', '', strtoupper($invoiceNumber)) ?: $invoiceNumber;
     }
 
     protected function resolveLegacyInvoiceTokoCode(int $tokoId): string
@@ -3377,7 +3466,7 @@ class PembayaranController extends Controller
                 ]);
             } catch (Throwable $e) {
                 // Request paralel bisa membuat row sequence lebih dulu.
-                // Ambil ulang dengan lock, jangan langsung gagal sebelum dicek ulang.
+                // Ambil ulang dengan lock.
             }
 
             $sequenceRow = PembayaranInvoiceSequence::query()
@@ -3420,7 +3509,7 @@ class PembayaranController extends Controller
             return 0;
         }
 
-        return (int) substr((string) $lastInvoice, -5);
+        return $this->extractLegacyInvoiceSequence($lastInvoice);
     }
 
     protected function nextLegacyInvoiceSequenceFromInvoiceTable(int $tokoId, Carbon $invoiceDate): int
@@ -3445,9 +3534,20 @@ class PembayaranController extends Controller
             return 1;
         }
 
-        $sequence = (int) substr((string) $lastInvoice, -5);
+        return $this->extractLegacyInvoiceSequence($lastInvoice) + 1;
+    }
 
-        return $sequence + 1;
+    protected function extractLegacyInvoiceSequence(?string $invoiceNumber): int
+    {
+        $baseNumber = $this->normalizeInvoiceNumberWithoutTransactionSuffix($invoiceNumber);
+
+        if ($baseNumber === '') {
+            return 0;
+        }
+
+        preg_match('/(\d{5})$/', $baseNumber, $matches);
+
+        return isset($matches[1]) ? (int) $matches[1] : 0;
     }
 
     protected function formatLegacyInvoiceNumber(string $tokoCode, Carbon $invoiceDate, int $sequence): string
@@ -3459,16 +3559,6 @@ class PembayaranController extends Controller
     protected function legacyInvoicePrefix(string $tokoCode, Carbon $invoiceDate): string
     {
         return $tokoCode . $invoiceDate->format('Ymd');
-    }
-
-    protected function invoiceNumberExists(string $invoiceNumber): bool
-    {
-        return PembayaranInvoice::query()
-            ->where('no_invoice', $invoiceNumber)
-            ->where(function ($q) {
-                $q->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->exists();
     }
 
     protected function resolvePasienUpdaterId(): ?int
