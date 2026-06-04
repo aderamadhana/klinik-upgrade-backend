@@ -1023,49 +1023,41 @@ class ReferenceController extends Controller
         return [
             'id' => $voucher->id,
             'legacy_id' => $voucher->legacy_id,
-
             'nama' => $voucher->nama_voucher,
             'nama_voucher' => $voucher->nama_voucher,
             'deskripsi' => $voucher->deskripsi,
-
             'mode_voucher' => $voucher->mode_voucher,
             'mode_voucher_label' => $voucher->mode_voucher_label,
-
             'toko_id' => $voucher->toko_id,
             'is_all_toko' => (int) $voucher->is_all_toko,
-
             'kategori_voucher_id' => $voucher->kategori_voucher_id,
             'jenis_voucher_id' => (int) $voucher->jenis_voucher_id,
             'jenis_voucher_label' => $voucher->jenis_voucher_label,
-
             'template_voucher_id' => $voucher->template_voucher_id,
-
             'tipe_diskon' => $voucher->tipe_diskon,
             'tipe_diskon_label' => $voucher->tipe_diskon_label,
             'tipe_diskon_kode' => $voucher->tipe_diskon_kode,
-
             'total_diskon' => (float) $voucher->total_diskon,
+            'total_diskon_maksimal' => $voucher->total_diskon_maksimal !== null
+                ? (float) $voucher->total_diskon_maksimal
+                : 0,
+            'diskon_maksimal' => $voucher->total_diskon_maksimal !== null
+                ? (float) $voucher->total_diskon_maksimal
+                : 0,
             'value' => (float) $voucher->total_diskon,
             'mode' => $voucher->tipe_diskon_kode,
-
             'qty_generate' => (int) $voucher->qty_generate,
             'kuota' => (int) $voucher->qty_generate > 0
                 ? (int) $voucher->qty_generate
                 : 'Tidak Terbatas',
-
             'is_bisa_digabung_promo' => (int) $voucher->is_bisa_digabung_promo,
             'is_unlimited_date' => (int) $voucher->is_unlimited_date,
-
             'tanggal_mulai' => $voucher->tanggal_mulai,
             'tanggal_akhir' => $voucher->tanggal_akhir,
-
             'status_voucher' => (int) $voucher->status_voucher,
             'status_voucher_label' => $voucher->status_voucher_label,
-
             'sort_order' => (int) $voucher->sort_order,
-
             'desc' => $this->buildVoucherDesc($voucher),
-
             'items' => $items->map(function ($item) {
                 return [
                     'id' => $item->id,
@@ -1087,9 +1079,14 @@ class ReferenceController extends Controller
     private function buildVoucherDesc($voucher): string
     {
         $diskon = number_format((float) $voucher->total_diskon, 0, ',', '.');
+        $maksimal = (float) ($voucher->total_diskon_maksimal ?? 0);
 
         if ($voucher->tipe_diskon === 'nominal') {
             return 'Diskon Rp ' . $diskon;
+        }
+
+        if ($maksimal > 0) {
+            return 'Diskon ' . $diskon . '% maks Rp ' . number_format($maksimal, 0, ',', '.');
         }
 
         return 'Diskon ' . $diskon . '%';
