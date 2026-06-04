@@ -5,6 +5,7 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ReferenceController;
 use App\Http\Controllers\Api\AuditLogController;
+use App\Http\Controllers\Api\DashboardController;
 
 use App\Http\Controllers\Api\Master\MasterKaryawanController;
 use App\Http\Controllers\Api\Master\MasterUserController;
@@ -49,6 +50,8 @@ Route::middleware('auth:api')->group(function () {
 });
 
 Route::middleware('auth:api')->group(function () {
+    Route::get('/dashboard/summary', [DashboardController::class, 'summary']);
+
     Route::prefix('master')->group(function () {
         Route::apiResource('karyawan', MasterKaryawanController::class);
         Route::apiResource('user', MasterUserController::class);
