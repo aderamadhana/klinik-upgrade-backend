@@ -10,16 +10,6 @@ use Illuminate\Validation\ValidationException;
 
 class VoucherFinalizerService
 {
-    /**
-     * Final validation + persist selected vouchers from cashier payload.
-     *
-     * Expected request payload from FE:
-     * - promo_ids: [1, 2]
-     * - promos: [{ id, voucher_id, kode_voucher, diskon_amount }]
-     *
-     * This method must be called inside DB::transaction() after invoice items are synchronized
-     * and before validatePaymentAmount().
-     */
     public function applySelectedPromosFromRequest(object $invoice, Request $request, string $username = 'system'): array
     {
         $this->assertRequiredTables();
@@ -65,11 +55,13 @@ class VoucherFinalizerService
         $this->assertCombinable($vouchers);
 
         $invoiceItems = $this->loadInvoiceItems((int) $invoice->id);
+
         $totalPromo = 0.0;
         $usedVoucherIds = [];
 
         foreach ($selectedPromos as $selected) {
             $voucher = $this->resolveSelectedVoucher($selected, $vouchers);
+
             if (!$voucher) {
                 throw ValidationException::withMessages([
                     'promo' => 'Voucher ' . ($selected['kode_voucher'] ?: $selected['voucher_id'] ?: '-') . ' tidak valid.',
@@ -83,11 +75,12 @@ class VoucherFinalizerService
 
             if ($voucherAmount <= 0) {
                 throw ValidationException::withMessages([
-                    'promo' => 'Voucher ' . ($voucher->nama_voucher ?? $voucher->kode_voucher ?? '-') . ' tidak memiliki nilai diskon untuk item invoice ini.',
+                    'promo' => 'Voucher ' . $this->voucherName($voucher) . ' tidak memiliki nilai diskon untuk item invoice ini.',
                 ]);
             }
 
             $remainingInvoiceBase = max($this->getInvoicePromoBase($invoiceItems) - $totalPromo, 0);
+
             if ($remainingInvoiceBase <= 0) {
                 break;
             }
@@ -117,10 +110,6 @@ class VoucherFinalizerService
         ];
     }
 
-    /**
-     * Restore voucher side-effects when invoice is cancelled/void.
-     * Call inside cancel DB::transaction() after invoice row is locked.
-     */
     public function restoreVoucherAfterCancel(object $invoice, string $username = 'system'): void
     {
         if (!Schema::hasTable('pembayaran_invoice_promo')) {
@@ -226,6 +215,7 @@ class VoucherFinalizerService
 
         foreach ((array) $request->input('promo_ids', []) as $id) {
             $voucherId = (int) $id;
+
             if ($voucherId > 0) {
                 $rows[] = [
                     'voucher_id' => $voucherId,
@@ -236,9 +226,22 @@ class VoucherFinalizerService
         }
 
         $unique = [];
+
         foreach ($rows as $row) {
             $key = ($row['voucher_id'] ?: 'code') . '|' . strtolower((string) ($row['kode_voucher'] ?? ''));
-            $unique[$key] = $row;
+
+            if (!isset($unique[$key])) {
+                $unique[$key] = $row;
+                continue;
+            }
+
+            if (empty($unique[$key]['kode_voucher']) && !empty($row['kode_voucher'])) {
+                $unique[$key]['kode_voucher'] = $row['kode_voucher'];
+            }
+
+            if ((float) ($unique[$key]['client_amount'] ?? 0) <= 0 && (float) ($row['client_amount'] ?? 0) > 0) {
+                $unique[$key]['client_amount'] = (float) $row['client_amount'];
+            }
         }
 
         return array_values($unique);
@@ -283,6 +286,7 @@ class VoucherFinalizerService
     protected function assertNoDuplicateVoucher(array $selectedPromos): void
     {
         $ids = collect($selectedPromos)->pluck('voucher_id')->filter()->map(fn ($id) => (int) $id);
+
         if ($ids->count() !== $ids->unique()->count()) {
             throw ValidationException::withMessages([
                 'promo' => 'Voucher yang sama tidak boleh digunakan lebih dari satu kali.',
@@ -297,6 +301,7 @@ class VoucherFinalizerService
         }
 
         $hasNonCombine = $vouchers->contains(fn ($voucher) => (int) ($voucher->is_bisa_digabung_promo ?? 0) !== 1);
+
         if ($hasNonCombine) {
             throw ValidationException::withMessages([
                 'promo' => 'Voucher tidak dapat digabung dengan promo lain.',
@@ -311,11 +316,13 @@ class VoucherFinalizerService
         }
 
         $kode = trim((string) ($selected['kode_voucher'] ?? ''));
+
         if ($kode === '') {
             return null;
         }
 
         $direct = $vouchers->first(fn ($voucher) => (string) ($voucher->kode_voucher ?? '') === $kode);
+
         if ($direct) {
             return $direct;
         }
@@ -351,15 +358,18 @@ class VoucherFinalizerService
 
         if ((int) ($voucher->is_unlimited_date ?? 0) !== 1) {
             $tanggalInvoice = Carbon::parse($invoice->tanggal_invoice ?? now())->toDateString();
+
             if (!empty($voucher->tanggal_mulai) && $tanggalInvoice < Carbon::parse($voucher->tanggal_mulai)->toDateString()) {
                 throw ValidationException::withMessages(['promo' => 'Voucher ' . $this->voucherName($voucher) . ' belum berlaku.']);
             }
+
             if (!empty($voucher->tanggal_akhir) && $tanggalInvoice > Carbon::parse($voucher->tanggal_akhir)->toDateString()) {
                 throw ValidationException::withMessages(['promo' => 'Voucher ' . $this->voucherName($voucher) . ' sudah expired.']);
             }
         }
 
         $kode = trim((string) ($selected['kode_voucher'] ?? ''));
+
         if ($kode !== '' && $this->isGenerateVoucher($voucher)) {
             $this->assertVoucherCodeAvailable($voucher, $invoice, $kode);
         }
@@ -415,14 +425,14 @@ class VoucherFinalizerService
 
     protected function calculateVoucherAllocations(object $voucher, $invoiceItems): array
     {
-        $specificItems = collect();
-        if (Schema::hasTable('master_voucher_diskon_item')) {
-            $specificItems = DB::table('master_voucher_diskon_item')
-                ->where('voucher_diskon_id', $voucher->id)
-                ->where(function ($q) {
-                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
-                })
-                ->get();
+        $specificItems = $this->loadVoucherSpecificItems((int) $voucher->id);
+
+        if ($this->isValueVoucher($voucher)) {
+            return $this->calculateInvoiceScopeAllocation($voucher, $invoiceItems);
+        }
+
+        if ($this->isBundlingVoucher($voucher)) {
+            return $this->calculateBundlingAllocations($voucher, $specificItems, $invoiceItems);
         }
 
         if ($specificItems->isNotEmpty()) {
@@ -430,7 +440,28 @@ class VoucherFinalizerService
         }
 
         $eligibleItems = $this->filterItemsByVoucherKind($voucher, $invoiceItems);
-        $base = (float) $eligibleItems->sum(fn ($item) => $this->itemNetBase($item));
+
+        return $this->calculateInvoiceScopeAllocation($voucher, $eligibleItems);
+    }
+
+    protected function loadVoucherSpecificItems(int $voucherId)
+    {
+        if (!Schema::hasTable('master_voucher_diskon_item')) {
+            return collect();
+        }
+
+        return DB::table('master_voucher_diskon_item')
+            ->where('voucher_diskon_id', $voucherId)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->get();
+    }
+
+    protected function calculateInvoiceScopeAllocation(object $voucher, $items): array
+    {
+        $base = (float) $items->sum(fn ($item) => $this->itemNetBase($item));
+
         $amount = $this->calculateDiscountAmount(
             $base,
             (string) ($voucher->tipe_diskon ?? 'nominal'),
@@ -451,24 +482,21 @@ class VoucherFinalizerService
         $allocations = [];
 
         foreach ($specificItems as $specific) {
-            $matched = $invoiceItems->filter(function ($item) use ($specific) {
-                $specificType = strtolower((string) ($specific->item_type ?? ''));
-                if ($specificType === 'treatment') {
-                    return (int) ($item->item_type ?? 0) === 2 && (int) ($item->treatment_id ?? 0) === (int) $specific->item_id;
-                }
-
-                if ($specificType === 'produk' || $specificType === 'product') {
-                    return (int) ($item->item_type ?? 0) === 3 && (int) ($item->produk_id ?? 0) === (int) $specific->item_id;
-                }
-
-                return false;
-            });
+            $matched = $this->matchInvoiceItemsByVoucherSpecificItem($specific, $invoiceItems);
 
             foreach ($matched as $item) {
                 $base = $this->itemNetBase($item);
                 $tipe = $specific->tipe_diskon_item ?: $voucher->tipe_diskon;
-                $nilai = $specific->nilai_diskon_item !== null ? (float) $specific->nilai_diskon_item : (float) $voucher->total_diskon;
-                $amount = $this->calculateDiscountAmount($base, (string) $tipe, $nilai, (float) ($voucher->total_diskon_maksimal ?? 0));
+                $nilai = $specific->nilai_diskon_item !== null
+                    ? (float) $specific->nilai_diskon_item
+                    : (float) $voucher->total_diskon;
+
+                $amount = $this->calculateDiscountAmount(
+                    $base,
+                    (string) $tipe,
+                    $nilai,
+                    (float) ($voucher->total_diskon_maksimal ?? 0)
+                );
 
                 if ($amount > 0) {
                     $allocations[] = [
@@ -478,6 +506,185 @@ class VoucherFinalizerService
                         'base' => $base,
                     ];
                 }
+            }
+        }
+
+        return $allocations;
+    }
+
+    protected function calculateBundlingAllocations(object $voucher, $specificItems, $invoiceItems): array
+    {
+        $treatmentItems = $invoiceItems->filter(fn ($item) => (int) ($item->item_type ?? 0) === 2);
+        $productItems = $invoiceItems->filter(fn ($item) => (int) ($item->item_type ?? 0) === 3);
+
+        if ($specificItems->isNotEmpty()) {
+            $specificTreatmentRows = $specificItems->filter(fn ($row) => strtolower((string) ($row->item_type ?? '')) === 'treatment');
+            $specificProductRows = $specificItems->filter(fn ($row) => in_array(strtolower((string) ($row->item_type ?? '')), ['produk', 'product'], true));
+
+            /*
+             * Bundling in master data can be configured in two valid forms:
+             *
+             * 1. Item-specific bundling:
+             *    master_voucher_diskon_item contains exact items and each row may contain
+             *    tipe_diskon_item / nilai_diskon_item. Example:
+             *    - Treatment A: Rp 20.000
+             *    - Treatment B: Rp 80.000
+             *
+             *    In this form, do not force product + treatment. The selected invoice only
+             *    needs to contain all target rows that exist in the voucher detail.
+             *
+             * 2. General product-treatment bundling:
+             *    master_voucher_diskon_item is empty. In this form, require at least one
+             *    treatment and one product, then apply the voucher nominal/percent rule.
+             */
+            $hasPerItemRule = $specificItems->contains(function ($row) {
+                return $row->tipe_diskon_item !== null || $row->nilai_diskon_item !== null;
+            });
+
+            if ($hasPerItemRule || $specificProductRows->isEmpty() || $specificTreatmentRows->isEmpty()) {
+                return $this->calculateSpecificItemAllocations($voucher, $specificItems, $invoiceItems);
+            }
+
+            $matchedTreatmentItems = $this->filterBundlingSpecificItems($specificTreatmentRows, $treatmentItems);
+            $matchedProductItems = $this->filterBundlingSpecificItems($specificProductRows, $productItems);
+
+            if ($matchedTreatmentItems->isEmpty() || $matchedProductItems->isEmpty()) {
+                return [];
+            }
+
+            $eligibleItems = $matchedTreatmentItems
+                ->merge($matchedProductItems)
+                ->unique('id')
+                ->values();
+
+            $type = strtolower(trim((string) ($voucher->tipe_diskon ?? 'nominal')));
+
+            if (in_array($type, ['percent', 'persen', '%', '1'], true)) {
+                $base = (float) $eligibleItems->sum(fn ($item) => $this->itemNetBase($item));
+
+                $amount = $this->calculateDiscountAmount(
+                    $base,
+                    $type,
+                    (float) ($voucher->total_diskon ?? 0),
+                    (float) ($voucher->total_diskon_maksimal ?? 0)
+                );
+
+                return $this->distributeAmountAcrossItems($eligibleItems, $amount);
+            }
+
+            return $this->distributeAmountAcrossItems(
+                $eligibleItems,
+                (float) ($voucher->total_diskon ?? 0)
+            );
+        }
+
+        if ($treatmentItems->isEmpty() || $productItems->isEmpty()) {
+            return [];
+        }
+
+        $type = strtolower(trim((string) ($voucher->tipe_diskon ?? 'nominal')));
+        $eligibleItems = $treatmentItems->merge($productItems)->unique('id')->values();
+
+        if (in_array($type, ['percent', 'persen', '%', '1'], true)) {
+            $base = (float) $eligibleItems->sum(fn ($item) => $this->itemNetBase($item));
+
+            $amount = $this->calculateDiscountAmount(
+                $base,
+                $type,
+                (float) ($voucher->total_diskon ?? 0),
+                (float) ($voucher->total_diskon_maksimal ?? 0)
+            );
+
+            return $this->distributeAmountAcrossItems($eligibleItems, $amount);
+        }
+
+        /*
+         * For general bundle without item detail, nominal value is applied once to
+         * the eligible bundle set. Do not multiply it silently because that makes
+         * FE and BE difficult to audit.
+         */
+        return $this->distributeAmountAcrossItems(
+            $eligibleItems,
+            (float) ($voucher->total_diskon ?? 0)
+        );
+    }
+
+    protected function filterBundlingSpecificItems($specificItems, $invoiceItems)
+    {
+        $matchedById = [];
+
+        foreach ($specificItems as $specific) {
+            $matched = $this->matchInvoiceItemsByVoucherSpecificItem($specific, $invoiceItems);
+
+            foreach ($matched as $item) {
+                $matchedById[(int) $item->id] = $item;
+            }
+        }
+
+        return collect(array_values($matchedById));
+    }
+
+    protected function matchInvoiceItemsByVoucherSpecificItem(object $specific, $invoiceItems)
+    {
+        return $invoiceItems->filter(function ($item) use ($specific) {
+            $specificType = strtolower((string) ($specific->item_type ?? ''));
+
+            if ($specificType === 'treatment') {
+                return (int) ($item->item_type ?? 0) === 2
+                    && (int) ($item->treatment_id ?? 0) === (int) $specific->item_id;
+            }
+
+            if (in_array($specificType, ['produk', 'product'], true)) {
+                return (int) ($item->item_type ?? 0) === 3
+                    && (int) ($item->produk_id ?? 0) === (int) $specific->item_id;
+            }
+
+            return false;
+        });
+    }
+
+    protected function distributeAmountAcrossItems($items, float $amount): array
+    {
+        $amount = round($amount, 2);
+        $items = $items->values();
+        $base = (float) $items->sum(fn ($item) => $this->itemNetBase($item));
+
+        if ($amount <= 0 || $base <= 0 || $items->isEmpty()) {
+            return [];
+        }
+
+        $allocations = [];
+        $remaining = $amount;
+        $lastIndex = $items->count() - 1;
+
+        foreach ($items as $index => $item) {
+            $itemBase = $this->itemNetBase($item);
+
+            if ($itemBase <= 0) {
+                continue;
+            }
+
+            $itemAmount = $index === $lastIndex
+                ? $remaining
+                : round(($amount * $itemBase) / $base, 2);
+
+            $itemAmount = min($itemAmount, $itemBase, $remaining);
+
+            if ($itemAmount <= 0) {
+                continue;
+            }
+
+            $allocations[] = [
+                'pembayaran_item_id' => (int) $item->id,
+                'scope_type' => 2,
+                'amount' => round($itemAmount, 2),
+                'base' => $itemBase,
+            ];
+
+            $remaining = round($remaining - $itemAmount, 2);
+
+            if ($remaining <= 0) {
+                break;
             }
         }
 
@@ -506,6 +713,7 @@ class VoucherFinalizerService
     protected function itemNetBase(object $item): float
     {
         $afterSubtotalDiscount = (float) ($item->subtotal_after_diskon_subtotal ?? 0);
+
         if ($afterSubtotalDiscount > 0) {
             return $afterSubtotalDiscount;
         }
@@ -525,11 +733,14 @@ class VoucherFinalizerService
         }
 
         $type = strtolower(trim($tipe));
+
         if (in_array($type, ['percent', 'persen', '%', '1'], true)) {
             $amount = round(($base * $nilai) / 100, 2);
+
             if ($maximal > 0) {
                 $amount = min($amount, $maximal);
             }
+
             return min($amount, $base);
         }
 
@@ -547,6 +758,7 @@ class VoucherFinalizerService
             }
 
             $amount = min((float) $allocation['amount'], $remaining);
+
             if ($amount > 0) {
                 $allocation['amount'] = round($amount, 2);
                 $result[] = $allocation;
@@ -603,6 +815,7 @@ class VoucherFinalizerService
     protected function redeemVoucherCodeIfNeeded(object $voucher, object $invoice, array $selected, string $username): void
     {
         $kode = trim((string) ($selected['kode_voucher'] ?? ''));
+
         if ($kode === '' || !$this->isGenerateVoucher($voucher) || !Schema::hasTable('master_voucher_diskon_kode')) {
             return;
         }
@@ -697,6 +910,7 @@ class VoucherFinalizerService
         $subtotal = (float) ($invoice->subtotal ?? 0);
         $diskonSubtotal = (float) ($invoice->diskon_subtotal_amount ?? 0);
         $diskonMember = (float) ($invoice->diskon_member_amount ?? 0);
+
         $grandTotal = max($subtotal - $diskonSubtotal - $totalPromo - $diskonMember, 0);
 
         DB::table('pembayaran_invoice')
@@ -725,6 +939,16 @@ class VoucherFinalizerService
     protected function isGenerateVoucher(object $voucher): bool
     {
         return strtolower((string) ($voucher->mode_voucher ?? 'direct')) === 'generate';
+    }
+
+    protected function isValueVoucher(object $voucher): bool
+    {
+        return (int) ($voucher->jenis_voucher_id ?? 0) === 4;
+    }
+
+    protected function isBundlingVoucher(object $voucher): bool
+    {
+        return (int) ($voucher->jenis_voucher_id ?? 0) === 3;
     }
 
     protected function voucherName(object $voucher): string
