@@ -404,11 +404,6 @@ class PembayaranController extends Controller
 
                 $this->ensureLegacyInvoiceNumber($invoice, $registrasi, $jenisTransaksi);
 
-                $registrasi->loadMissing([
-                    'treatmentDetails',
-                    'penjualanDetails',
-                ]);
-
                 $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
                 $this->syncInvoiceItemsFromRegistrasi($invoice, $registrasi);
                 $this->syncInvoiceItemsFromRequest($request, $invoice);
@@ -427,11 +422,12 @@ class PembayaranController extends Controller
                 ]);
 
                 $this->updatePatientPhoneFromRequest($request, $invoice);
-
-                // $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
-                // $depositExpiredAt = $this->resolveDepositExpiredAt($request);
-
                 $this->validateJenisTransaksiKhusus($request, $invoice, $jenisTransaksi, $depositExpiredAt);
+
+                if ($jenisTransaksi === 4 && $this->shouldSplitDepositInvoice($request, $invoice)) {
+                    return $this->finishSplitDepositInvoice($request, $invoice, $registrasi, $depositExpiredAt);
+                }
+
                 $this->syncJenisTransaksiToInvoiceItems($invoice, $jenisTransaksi);
 
                 if ($jenisTransaksi !== 4) {
@@ -473,13 +469,14 @@ class PembayaranController extends Controller
                     'promos',
                     'depositClaims',
                 ]);
+
                 $this->nurseTreatmentMaterialService->syncFromInvoice($invoice, $registrasi, $this->username());
+
                 $metode = $this->normalizeMetodePayload($request, $invoice);
                 $totalBayar = collect($metode)->sum('nominal_dialokasikan');
                 $grandTotal = (float) ($invoice->grand_total ?? 0);
 
                 $this->validatePaymentAmount($grandTotal, $totalBayar);
-
                 $this->replaceInvoiceMetode($invoice, $metode, $jenisTransaksi);
 
                 if ($jenisTransaksi === 4) {
@@ -487,14 +484,9 @@ class PembayaranController extends Controller
                     $selectedDepositItemIds = array_keys($selectedDepositItems);
                     $this->applyDepositTransactionRules($invoice, $request, $depositExpiredAt, $selectedDepositItemIds);
                     $this->generateDepositTreatmentRecords($invoice, $selectedDepositItems);
-
-                    // Produk/obat dalam transaksi deposit tetap diproses sebagai penjualan normal.
-                    // Guard double stock tetap ada di processStockKeluarPembayaran().
-                    $this->processStockKeluarPembayaran($invoice, $registrasi);
-                } else {
-                    $this->processStockKeluarPembayaran($invoice, $registrasi);
                 }
 
+                $this->processStockKeluarPembayaran($invoice, $registrasi);
                 $this->createAccurateSyncPendingLog($invoice, $registrasi);
 
                 $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
@@ -524,39 +516,7 @@ class PembayaranController extends Controller
                 $invoice->refresh();
                 $this->memberPointService->processEarnedPointLedger($invoice, $this->username());
 
-                $paymentTask = $this->getPaymentTask($registrasi);
-
-                if ($paymentTask) {
-                    $paymentTask->update([
-                        'status' => RegistrasiTask::STATUS_SELESAI,
-                        'started_at' => $paymentTask->started_at ?: now(),
-                        'finished_at' => now(),
-                        'updated_by' => $this->username(),
-                        'updated_at' => now(),
-                    ]);
-                }
-
-                $nextTask = $registrasi->tasks()
-                    ->where('status', RegistrasiTask::STATUS_MENUNGGU)
-                    ->orderBy('task_order')
-                    ->lockForUpdate()
-                    ->first();
-
-                if ($nextTask) {
-                    $registrasi->update([
-                        'current_task' => $nextTask->task_type,
-                        'status' => RegistrasiKunjungan::STATUS_AKTIF,
-                        'updated_by' => $this->username(),
-                        'updated_at' => now(),
-                    ]);
-                } else {
-                    $registrasi->update([
-                        'current_task' => RegistrasiKunjungan::TASK_DRAFT,
-                        'status' => RegistrasiKunjungan::STATUS_SELESAI,
-                        'updated_by' => $this->username(),
-                        'updated_at' => now(),
-                    ]);
-                }
+                $nextTask = $this->completePaymentTask($registrasi);
 
                 return [
                     'invoice_id' => $invoice->id,
@@ -589,12 +549,17 @@ class PembayaranController extends Controller
         $invoiceId = (int) ($result['invoice_id'] ?? 0);
         $nextTaskId = $result['next_task_id'] ?? null;
         $alreadyPaid = (bool) ($result['already_paid'] ?? false);
+        $splitInvoiceIds = $result['split_invoice_ids'] ?? null;
 
         $message = $alreadyPaid
             ? 'Invoice sudah lunas.'
-            : ($nextTaskId
-                ? 'Pembayaran berhasil. Registrasi dilanjutkan ke task berikutnya.'
-                : 'Pembayaran berhasil. Registrasi selesai.');
+            : ($splitInvoiceIds
+                ? ($nextTaskId
+                    ? 'Pembayaran berhasil. Invoice umum dan deposit berhasil dibuat. Registrasi dilanjutkan ke task berikutnya.'
+                    : 'Pembayaran berhasil. Invoice umum dan deposit berhasil dibuat. Registrasi selesai.')
+                : ($nextTaskId
+                    ? 'Pembayaran berhasil. Registrasi dilanjutkan ke task berikutnya.'
+                    : 'Pembayaran berhasil. Registrasi selesai.'));
 
         try {
             $invoice = PembayaranInvoice::query()
@@ -611,10 +576,19 @@ class PembayaranController extends Controller
                 ->find($invoiceId);
 
             if ($invoice) {
+                $data = $this->formatPaymentRow($invoice);
+
+                if ($splitInvoiceIds) {
+                    $data['split_invoice_ids'] = $splitInvoiceIds;
+                    $data['general_invoice_id'] = $result['general_invoice_id'] ?? null;
+                    $data['deposit_invoice_id'] = $result['deposit_invoice_id'] ?? null;
+                    $data['split_invoices'] = $this->formatSplitInvoicesForResponse($splitInvoiceIds);
+                }
+
                 return response()->json([
                     'status' => true,
                     'message' => $message,
-                    'data' => $this->formatPaymentRow($invoice),
+                    'data' => $data,
                 ]);
             }
         } catch (Throwable $e) {
@@ -623,28 +597,75 @@ class PembayaranController extends Controller
 
         $invoice = PembayaranInvoice::query()->find($invoiceId);
 
+        $data = $invoice ? [
+            'id' => $invoice->id,
+            'invoice_id' => $invoice->id,
+            'registrasi_id' => $invoice->registrasi_id,
+            'no_invoice' => $invoice->no_invoice,
+            'status' => $invoice->status,
+            'status_key' => $this->mapInvoiceStatusToKey((int) ($invoice->status ?? 0)),
+            'status_label' => $this->mapInvoiceStatusToLabel((int) ($invoice->status ?? 0)),
+            'grand_total' => (float) ($invoice->grand_total ?? 0),
+            'total_bayar' => (float) ($invoice->total_bayar ?? 0),
+            'sisa_tagihan' => (float) ($invoice->sisa_tagihan ?? 0),
+            'tanggal_lunas' => $invoice->tanggal_lunas,
+        ] : [
+            'id' => $invoiceId,
+            'invoice_id' => $invoiceId,
+            'status_key' => 'lunas',
+            'status_label' => 'Lunas',
+        ];
+
+        if ($splitInvoiceIds) {
+            $data['split_invoice_ids'] = $splitInvoiceIds;
+            $data['general_invoice_id'] = $result['general_invoice_id'] ?? null;
+            $data['deposit_invoice_id'] = $result['deposit_invoice_id'] ?? null;
+        }
+
         return response()->json([
             'status' => true,
             'message' => $message,
-            'data' => $invoice ? [
-                'id' => $invoice->id,
-                'invoice_id' => $invoice->id,
-                'registrasi_id' => $invoice->registrasi_id,
-                'no_invoice' => $invoice->no_invoice,
-                'status' => $invoice->status,
-                'status_key' => $this->mapInvoiceStatusToKey((int) ($invoice->status ?? 0)),
-                'status_label' => $this->mapInvoiceStatusToLabel((int) ($invoice->status ?? 0)),
-                'grand_total' => (float) ($invoice->grand_total ?? 0),
-                'total_bayar' => (float) ($invoice->total_bayar ?? 0),
-                'sisa_tagihan' => (float) ($invoice->sisa_tagihan ?? 0),
-                'tanggal_lunas' => $invoice->tanggal_lunas,
-            ] : [
-                'id' => $invoiceId,
-                'invoice_id' => $invoiceId,
-                'status_key' => 'lunas',
-                'status_label' => 'Lunas',
-            ],
+            'data' => $data,
         ]);
+    }
+
+    protected function formatSplitInvoicesForResponse(array $splitInvoiceIds): array
+    {
+        $ids = collect($splitInvoiceIds)
+            ->filter(fn ($id) => (int) $id > 0)
+            ->map(fn ($id) => (int) $id)
+            ->values()
+            ->all();
+
+        if (count($ids) === 0) {
+            return [];
+        }
+
+        $rows = PembayaranInvoice::query()
+            ->with([
+                'registrasi.pasien',
+                'registrasi.dokterAwal',
+                'registrasi.perawatAwal',
+                'registrasi.tasks',
+                'items',
+                'metode',
+                'promos',
+                'depositClaims',
+            ])
+            ->whereIn('id', $ids)
+            ->get()
+            ->keyBy('id');
+
+        $result = [];
+
+        foreach ($splitInvoiceIds as $key => $id) {
+            $invoice = $rows->get((int) $id);
+            if ($invoice) {
+                $result[$key] = $this->formatPaymentRow($invoice);
+            }
+        }
+
+        return $result;
     }
 
     public function recalculate($id)
@@ -1400,6 +1421,666 @@ class PembayaranController extends Controller
                 'deposit_item_ids' => 'Pilihan treatment deposit tidak valid untuk invoice ini.',
             ]);
         }
+    }
+
+    protected function shouldSplitDepositInvoice(Request $request, PembayaranInvoice $invoice): bool
+    {
+        $selectedDepositItems = $this->resolveDepositItems($request, $invoice);
+
+        if (count($selectedDepositItems) === 0) {
+            return false;
+        }
+
+        $items = $this->activeInvoiceItemsForSplit($invoice);
+
+        foreach ($items as $item) {
+            $itemId = (int) ($item->id ?? 0);
+
+            if (!$this->isTreatmentItem($item)) {
+                return true;
+            }
+
+            if (!array_key_exists($itemId, $selectedDepositItems)) {
+                return true;
+            }
+
+            $invoiceQty = (float) ($item->qty ?? $item->jumlah ?? 0);
+            if ($invoiceQty <= 0) {
+                $invoiceQty = 1;
+            }
+
+            $depositQty = (float) ($selectedDepositItems[$itemId] ?? 0);
+            if ($depositQty > 0 && $depositQty < $invoiceQty) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    protected function finishSplitDepositInvoice(
+        Request $request,
+        PembayaranInvoice $depositInvoice,
+        RegistrasiKunjungan $registrasi,
+        ?string $depositExpiredAt
+    ): array {
+        if ($this->hasPromoPayloadForSplitDeposit($request)) {
+            throw ValidationException::withMessages([
+                'promo' => 'Transaksi campuran deposit + umum belum boleh memakai promo/value dalam satu submit. Selesaikan split invoice deposit dulu agar nilai promo tidak salah alokasi.',
+            ]);
+        }
+
+        $selectedDepositItems = $this->resolveDepositItems($request, $depositInvoice);
+
+        if (count($selectedDepositItems) === 0) {
+            throw ValidationException::withMessages([
+                'deposit_item_ids' => 'Pilih minimal satu treatment yang akan dijadikan deposit.',
+            ]);
+        }
+
+        $generalInvoice = $this->resolveOrCreateGeneralInvoiceForDepositSplit($depositInvoice, $registrasi);
+
+        $this->splitDepositInvoiceItems(
+            $depositInvoice,
+            $generalInvoice,
+            $selectedDepositItems
+        );
+
+        $this->refreshInvoiceTotalsFromItems($depositInvoice);
+        $this->refreshInvoiceTotalsFromItems($generalInvoice);
+
+        $depositInvoice = PembayaranInvoice::query()
+            ->whereKey($depositInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $generalInvoice = PembayaranInvoice::query()
+            ->whereKey($generalInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+
+        $this->applyDepositTransactionRules(
+            $depositInvoice,
+            $request,
+            $depositExpiredAt,
+            array_keys($selectedDepositItems)
+        );
+
+        $this->syncJenisTransaksiToInvoiceItems($generalInvoice, 0);
+        $this->generateDepositTreatmentRecords($depositInvoice, $selectedDepositItems);
+
+        $this->refreshInvoiceTotalsFromItems($depositInvoice);
+        $this->refreshInvoiceTotalsFromItems($generalInvoice);
+
+        $depositInvoice = PembayaranInvoice::query()
+            ->whereKey($depositInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $generalInvoice = PembayaranInvoice::query()
+            ->whereKey($generalInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+
+        $this->memberPointService->applyMemberBenefitToInvoice($generalInvoice, $this->username());
+        $this->memberPointService->applyMemberBenefitToInvoice($depositInvoice, $this->username());
+
+        $this->refreshInvoiceTotalsFromItems($generalInvoice);
+        $this->refreshInvoiceTotalsFromItems($depositInvoice);
+
+        $generalInvoice = PembayaranInvoice::query()
+            ->whereKey($generalInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $depositInvoice = PembayaranInvoice::query()
+            ->whereKey($depositInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+
+        $this->nurseTreatmentMaterialService->syncFromInvoice($generalInvoice, $registrasi, $this->username());
+        $this->nurseTreatmentMaterialService->syncFromInvoice($depositInvoice, $registrasi, $this->username());
+
+        $generalGrandTotal = (float) ($generalInvoice->grand_total ?? 0);
+        $depositGrandTotal = (float) ($depositInvoice->grand_total ?? 0);
+        $totalGrandTotal = $generalGrandTotal + $depositGrandTotal;
+
+        $metode = $this->normalizeMetodePayloadForSplit($request, $totalGrandTotal);
+        $totalBayar = collect($metode)->sum('nominal_dialokasikan');
+
+        $this->validatePaymentAmount($totalGrandTotal, $totalBayar);
+
+        $splitMetode = $this->splitMetodeForDepositInvoices(
+            $metode,
+            $generalGrandTotal,
+            $depositGrandTotal
+        );
+
+        $this->replaceInvoiceMetode($generalInvoice, $splitMetode['general'], 0);
+        $this->replaceInvoiceMetode($depositInvoice, $splitMetode['deposit'], 4);
+
+        $this->processStockKeluarPembayaran($generalInvoice, $registrasi);
+        $this->processStockKeluarPembayaran($depositInvoice, $registrasi);
+
+        $this->createAccurateSyncPendingLog($generalInvoice, $registrasi);
+        $this->createAccurateSyncPendingLog($depositInvoice, $registrasi);
+
+        $this->markSplitInvoiceAsPaid($generalInvoice, $request, 0, null, $generalGrandTotal, 0);
+        $this->markSplitInvoiceAsPaid($depositInvoice, $request, 4, $depositExpiredAt, $depositGrandTotal, 0);
+
+        $generalInvoice->refresh();
+        $depositInvoice->refresh();
+
+        $this->memberPointService->processEarnedPointLedger($generalInvoice, $this->username());
+        $this->memberPointService->processEarnedPointLedger($depositInvoice, $this->username());
+
+        $nextTask = $this->completePaymentTask($registrasi);
+
+        return [
+            'invoice_id' => $depositInvoice->id,
+            'general_invoice_id' => $generalInvoice->id,
+            'deposit_invoice_id' => $depositInvoice->id,
+            'split_invoice_ids' => [
+                'umum' => $generalInvoice->id,
+                'deposit' => $depositInvoice->id,
+            ],
+            'next_task_id' => $nextTask?->id,
+            'already_paid' => false,
+        ];
+    }
+
+    protected function activeInvoiceItemsForSplit(PembayaranInvoice $invoice)
+    {
+        return $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 9);
+            })
+            ->lockForUpdate()
+            ->get();
+    }
+
+    protected function resolveOrCreateGeneralInvoiceForDepositSplit(
+        PembayaranInvoice $depositInvoice,
+        RegistrasiKunjungan $registrasi
+    ): PembayaranInvoice {
+        $baseNo = trim((string) ($depositInvoice->invoice_base_no ?? ''));
+
+        if ($baseNo === '') {
+            $baseNo = $this->normalizeInvoiceNumberWithoutTransactionSuffix($depositInvoice->no_invoice ?? '');
+        }
+
+        if ($baseNo === '') {
+            $baseNo = $this->normalizeInvoiceNumberWithoutTransactionSuffix(
+                $this->generateInvoiceNumber($registrasi, 4, (int) $depositInvoice->id)
+            );
+        }
+
+        $depositNo = $baseNo . '-D';
+        $generalNo = $baseNo . '-U';
+
+        $depositInvoice->forceFill($this->onlyExistingColumns('pembayaran_invoice', [
+            'no_invoice' => $depositNo,
+            'invoice_base_no' => $baseNo,
+            'invoice_suffix' => 'D',
+            'jenis_transaksi' => 4,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]))->save();
+
+        $existingGeneral = PembayaranInvoice::query()
+            ->where('registrasi_id', $depositInvoice->registrasi_id)
+            ->where('id', '<>', $depositInvoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) use ($generalNo) {
+                $q->where('no_invoice', $generalNo)
+                    ->orWhere('invoice_suffix', 'U');
+            })
+            ->lockForUpdate()
+            ->first();
+
+        if ($existingGeneral) {
+            if ((int) $existingGeneral->status === PembayaranInvoice::STATUS_LUNAS) {
+                throw ValidationException::withMessages([
+                    'invoice' => 'Invoice umum hasil split sudah lunas, transaksi deposit campuran tidak bisa diproses ulang.',
+                ]);
+            }
+
+            $existingGeneral->forceFill($this->onlyExistingColumns('pembayaran_invoice', [
+                'no_invoice' => $generalNo,
+                'invoice_base_no' => $baseNo,
+                'invoice_suffix' => 'U',
+                'jenis_transaksi' => 0,
+                'referensi_dokter_id' => null,
+                'deposit_expired_option_id' => null,
+                'deposit_expired_at' => null,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]))->save();
+
+            return $existingGeneral->fresh();
+        }
+
+        if ($this->invoiceNumberExists($generalNo, null)) {
+            throw ValidationException::withMessages([
+                'no_invoice' => 'Nomor invoice umum hasil split sudah digunakan: ' . $generalNo,
+            ]);
+        }
+
+        $generalInvoice = $depositInvoice->replicate();
+
+        $generalInvoice->forceFill($this->onlyExistingColumns('pembayaran_invoice', [
+            'no_invoice' => $generalNo,
+            'invoice_base_no' => $baseNo,
+            'invoice_suffix' => 'U',
+            'jenis_transaksi' => 0,
+            'referensi_dokter_id' => null,
+            'deposit_expired_option_id' => null,
+            'deposit_expired_at' => null,
+            'tanggal_lunas' => null,
+            'subtotal_obat' => 0,
+            'subtotal_produk' => 0,
+            'subtotal_treatment' => 0,
+            'subtotal_konsultasi' => 0,
+            'subtotal' => 0,
+            'diskon_subtotal' => 0,
+            'diskon_subtotal_tipe' => 0,
+            'diskon_subtotal_nilai' => 0,
+            'diskon_subtotal_amount' => 0,
+            'diskon_promo' => 0,
+            'total_diskon_item' => 0,
+            'total_diskon_referral' => 0,
+            'total_promo' => 0,
+            'diskon_member_amount' => 0,
+            'point_earned' => 0,
+            'point_redeemed' => 0,
+            'point_redeem_value' => 0,
+            'grand_total' => 0,
+            'total_bayar' => 0,
+            'sisa_tagihan' => 0,
+            'total_kembalian' => 0,
+            'status' => PembayaranInvoice::STATUS_PROSES,
+            'is_delete' => 0,
+            'created_by' => $this->username(),
+            'updated_by' => $this->username(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]));
+
+        $generalInvoice->save();
+
+        return $generalInvoice->fresh();
+    }
+
+    protected function splitDepositInvoiceItems(
+        PembayaranInvoice $depositInvoice,
+        PembayaranInvoice $generalInvoice,
+        array $selectedDepositItems
+    ): void {
+        $items = $this->activeInvoiceItemsForSplit($depositInvoice);
+
+        foreach ($items as $item) {
+            $itemId = (int) ($item->id ?? 0);
+
+            if (!$this->isTreatmentItem($item)) {
+                $this->moveInvoiceItemToGeneralInvoice($item, $generalInvoice);
+                continue;
+            }
+
+            if (!array_key_exists($itemId, $selectedDepositItems)) {
+                $this->moveInvoiceItemToGeneralInvoice($item, $generalInvoice);
+                continue;
+            }
+
+            $invoiceQty = (float) ($item->qty ?? $item->jumlah ?? 0);
+            if ($invoiceQty <= 0) {
+                $invoiceQty = 1;
+            }
+
+            $depositQty = (float) ($selectedDepositItems[$itemId] ?? 0);
+            if ($depositQty <= 0) {
+                $depositQty = $invoiceQty;
+            }
+
+            if ($depositQty > $invoiceQty) {
+                throw ValidationException::withMessages([
+                    'deposit_treatment_items' => 'Qty deposit untuk ' . ($item->nama_item ?? 'treatment') . ' tidak boleh melebihi qty invoice.',
+                ]);
+            }
+
+            if ($depositQty < $invoiceQty) {
+                $this->splitTreatmentItemQtyToGeneralInvoice(
+                    $item,
+                    $generalInvoice,
+                    $depositQty,
+                    $invoiceQty
+                );
+            } else {
+                $item->forceFill($this->onlyExistingColumns('pembayaran_invoice_item', [
+                    'jenis_transaksi' => 4,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]))->save();
+            }
+        }
+
+        $depositInvoice->load('items');
+        $generalInvoice->load('items');
+    }
+
+    protected function moveInvoiceItemToGeneralInvoice($item, PembayaranInvoice $generalInvoice): void
+    {
+        $item->forceFill($this->onlyExistingColumns('pembayaran_invoice_item', [
+            'pembayaran_id' => $generalInvoice->id,
+            'pembayaran_invoice_id' => $generalInvoice->id,
+            'invoice_id' => $generalInvoice->id,
+            'jenis_transaksi' => 0,
+            'deposit_treatment_id' => null,
+            'deposit_claim_id' => null,
+            'expired_at' => null,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]))->save();
+    }
+
+    protected function splitTreatmentItemQtyToGeneralInvoice(
+        $item,
+        PembayaranInvoice $generalInvoice,
+        float $depositQty,
+        float $invoiceQty
+    ): void {
+        $remainingQty = round($invoiceQty - $depositQty, 4);
+
+        if ($remainingQty <= 0) {
+            return;
+        }
+
+        $generalItem = $item->replicate();
+
+        $generalPayload = array_merge(
+            $this->prorateInvoiceItemPayload($item, $remainingQty, $invoiceQty),
+            [
+                'pembayaran_id' => $generalInvoice->id,
+                'pembayaran_invoice_id' => $generalInvoice->id,
+                'invoice_id' => $generalInvoice->id,
+                'jenis_transaksi' => 0,
+                'deposit_treatment_id' => null,
+                'deposit_claim_id' => null,
+                'expired_at' => null,
+                'created_by' => $this->username(),
+                'updated_by' => $this->username(),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ]
+        );
+
+        $generalItem->forceFill(
+            $this->onlyExistingColumns('pembayaran_invoice_item', $generalPayload)
+        )->save();
+
+        $depositPayload = array_merge(
+            $this->prorateInvoiceItemPayload($item, $depositQty, $invoiceQty),
+            [
+                'jenis_transaksi' => 4,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]
+        );
+
+        $item->forceFill(
+            $this->onlyExistingColumns('pembayaran_invoice_item', $depositPayload)
+        )->save();
+    }
+
+    protected function prorateInvoiceItemPayload($item, float $targetQty, float $originalQty): array
+    {
+        if ($originalQty <= 0) {
+            $originalQty = 1;
+        }
+
+        $ratio = $targetQty / $originalQty;
+
+        $payload = [
+            'qty' => round($targetQty, 4),
+            'jumlah' => round($targetQty, 4),
+        ];
+
+        foreach ([
+            'gross_subtotal',
+            'total_harga_awal',
+            'diskon_amount',
+            'diskon_referral',
+            'subtotal_before_diskon_subtotal',
+            'diskon_subtotal_amount',
+            'subtotal_after_diskon_subtotal',
+            'subtotal',
+            'total',
+            'total_harga',
+            'hpp_total',
+        ] as $column) {
+            if (Schema::hasColumn('pembayaran_invoice_item', $column)) {
+                $payload[$column] = round(((float) ($item->{$column} ?? 0)) * $ratio, 2);
+            }
+        }
+
+        return $payload;
+    }
+
+    protected function hasPromoPayloadForSplitDeposit(Request $request): bool
+    {
+        if ((float) $request->input('diskon_subtotal_nilai', 0) > 0) {
+            return true;
+        }
+
+        if ($request->filled('promo_code')) {
+            return true;
+        }
+
+        foreach (['promo_ids', 'promos', 'selected_promos', 'applied_promos'] as $key) {
+            $rows = $request->input($key, []);
+
+            if (is_array($rows) && count($rows) > 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    protected function normalizeMetodePayloadForSplit(Request $request, float $totalGrandTotal): array
+    {
+        $metode = $request->input('metode', []);
+
+        if (is_array($metode) && count($metode) > 0) {
+            return collect($metode)
+                ->map(function ($item) {
+                    $dialokasikan = (float) ($item['nominal_dialokasikan'] ?? $item['nominal'] ?? 0);
+                    $diterima = (float) ($item['nominal_diterima'] ?? $dialokasikan);
+                    $tipe = $item['metode_bayar_tipe'] ?? 1;
+
+                    if ($tipe === null || $tipe === '') {
+                        $tipe = 1;
+                    }
+
+                    return [
+                        'metode_bayar_id' => $item['metode_bayar_id'] ?? null,
+                        'metode_bayar_nama' => $item['metode_bayar_nama'] ?? 'CASH',
+                        'metode_bayar_tipe' => (int) $tipe,
+                        'nominal_dialokasikan' => $dialokasikan,
+                        'nominal_diterima' => $diterima,
+                        'nominal_kembalian' => max(0, $diterima - $dialokasikan),
+                        'no_referensi' => $item['no_referensi'] ?? null,
+                        'catatan' => $item['catatan'] ?? null,
+                    ];
+                })
+                ->filter(fn ($item) => (float) $item['nominal_dialokasikan'] > 0)
+                ->values()
+                ->all();
+        }
+
+        $jumlahBayar = (float) $request->input('jumlah_bayar', $totalGrandTotal);
+        $nama = $request->input('metode_pembayaran', 'CASH');
+
+        return [[
+            'metode_bayar_id' => null,
+            'metode_bayar_nama' => $nama,
+            'metode_bayar_tipe' => 1,
+            'nominal_dialokasikan' => $jumlahBayar,
+            'nominal_diterima' => $jumlahBayar,
+            'nominal_kembalian' => 0,
+            'no_referensi' => null,
+            'catatan' => null,
+        ]];
+    }
+
+    protected function splitMetodeForDepositInvoices(array $metode, float $generalAmount, float $depositAmount): array
+    {
+        $pool = collect($metode)
+            ->map(function ($row) {
+                $row['nominal_dialokasikan'] = round((float) ($row['nominal_dialokasikan'] ?? 0), 2);
+                $row['nominal_diterima'] = round((float) ($row['nominal_diterima'] ?? $row['nominal_dialokasikan']), 2);
+                $row['nominal_kembalian'] = round((float) ($row['nominal_kembalian'] ?? 0), 2);
+                return $row;
+            })
+            ->values()
+            ->all();
+
+        $generalMetode = $this->consumeMetodeAllocation($pool, $generalAmount);
+        $depositMetode = $this->consumeMetodeAllocation($pool, $depositAmount);
+
+        return [
+            'general' => $generalMetode,
+            'deposit' => $depositMetode,
+        ];
+    }
+
+    protected function consumeMetodeAllocation(array &$pool, float $targetAmount): array
+    {
+        $targetAmount = round(max($targetAmount, 0), 2);
+        $remaining = $targetAmount;
+        $result = [];
+
+        foreach ($pool as $index => $row) {
+            if ($remaining <= 0) {
+                break;
+            }
+
+            $available = round((float) ($row['nominal_dialokasikan'] ?? 0), 2);
+
+            if ($available <= 0) {
+                continue;
+            }
+
+            $amount = min($available, $remaining);
+
+            $allocated = $row;
+            $allocated['nominal_dialokasikan'] = $amount;
+            $allocated['nominal_diterima'] = $amount;
+            $allocated['nominal_kembalian'] = 0;
+
+            $result[] = $allocated;
+
+            $pool[$index]['nominal_dialokasikan'] = round($available - $amount, 2);
+            $pool[$index]['nominal_diterima'] = round(max(((float) ($row['nominal_diterima'] ?? 0)) - $amount, 0), 2);
+
+            $remaining = round($remaining - $amount, 2);
+        }
+
+        if ($remaining > 0) {
+            throw ValidationException::withMessages([
+                'jumlah_bayar' => 'Alokasi metode pembayaran tidak cukup untuk invoice hasil split.',
+            ]);
+        }
+
+        return $result;
+    }
+
+    protected function markSplitInvoiceAsPaid(
+        PembayaranInvoice $invoice,
+        Request $request,
+        int $jenisTransaksi,
+        ?string $depositExpiredAt,
+        float $totalBayar,
+        float $totalKembalian = 0
+    ): void {
+        $grandTotal = (float) ($invoice->grand_total ?? 0);
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'tanggal_lunas' => now(),
+            'jenis_transaksi' => $jenisTransaksi,
+            'referensi_dokter_id' => $jenisTransaksi === 4
+                ? $request->input('referensi_dokter_id')
+                : null,
+            'deposit_expired_option_id' => $jenisTransaksi === 4
+                ? $request->input('deposit_expired_option_id')
+                : null,
+            'deposit_expired_at' => $jenisTransaksi === 4
+                ? $depositExpiredAt
+                : null,
+            'sumber_informasi_id' => $request->input('sumber_informasi_id', $invoice->sumber_informasi_id ?? null),
+            'sumber_kedatangan' => $request->input('sumber_kedatangan', $invoice->sumber_kedatangan ?? null),
+            'catatan' => $request->input('catatan_pembayaran', $invoice->catatan ?? null),
+            'grand_total' => $grandTotal,
+            'total_bayar' => $totalBayar,
+            'sisa_tagihan' => 0,
+            'total_kembalian' => $totalKembalian,
+            'status' => PembayaranInvoice::STATUS_LUNAS,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function completePaymentTask(RegistrasiKunjungan $registrasi): ?RegistrasiTask
+    {
+        $registrasi->loadMissing('tasks');
+        $paymentTask = $this->getPaymentTask($registrasi);
+
+        if ($paymentTask) {
+            $paymentTask->update([
+                'status' => RegistrasiTask::STATUS_SELESAI,
+                'started_at' => $paymentTask->started_at ?: now(),
+                'finished_at' => now(),
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+        }
+
+        $nextTask = $registrasi->tasks()
+            ->where('status', RegistrasiTask::STATUS_MENUNGGU)
+            ->orderBy('task_order')
+            ->lockForUpdate()
+            ->first();
+
+        if ($nextTask) {
+            $registrasi->update([
+                'current_task' => $nextTask->task_type,
+                'status' => RegistrasiKunjungan::STATUS_AKTIF,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+        } else {
+            $registrasi->update([
+                'current_task' => RegistrasiKunjungan::TASK_DRAFT,
+                'status' => RegistrasiKunjungan::STATUS_SELESAI,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+        }
+
+        return $nextTask;
     }
 
     protected function resolveDepositExpiredAt(Request $request): ?string
@@ -3303,34 +3984,112 @@ class PembayaranController extends Controller
         ?int $jenisTransaksi = null
     ): void {
         $jenisTransaksi = $jenisTransaksi ?? (int) ($invoice->jenis_transaksi ?? 0);
-        $currentNumber = trim((string) ($invoice->no_invoice ?? ''));
 
-        if (!$this->isLegacyInvoiceNumber($currentNumber)) {
-            $newNumber = $this->generateInvoiceNumber($registrasi, $jenisTransaksi, (int) $invoice->id);
-        } else {
-            $newNumber = $this->formatInvoiceNumberWithTransactionSuffix($currentNumber, $jenisTransaksi);
+        $currentNumber = trim((string) ($invoice->no_invoice ?? ''));
+        $currentBase = $this->normalizeInvoiceNumberWithoutTransactionSuffix($currentNumber);
+        $expectedSuffix = $this->resolveInvoiceTransactionSuffix($jenisTransaksi);
+
+        $baseNumber = $this->resolveInvoiceBaseNumber($invoice, $registrasi);
+
+        if ($baseNumber === '') {
+            $baseNumber = $this->generateInvoiceBaseNumber($registrasi, (int) $invoice->id);
         }
 
+        $newNumber = $baseNumber . '-' . $expectedSuffix;
+
         if ($newNumber === $currentNumber) {
+            $payload = [
+                'invoice_base_no' => $baseNumber,
+                'invoice_suffix' => $expectedSuffix,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ];
+
+            $invoice->forceFill(
+                $this->onlyExistingColumns('pembayaran_invoice', $payload)
+            )->save();
+
+            $invoice->refresh();
             return;
         }
 
         if ($this->invoiceNumberExists($newNumber, (int) $invoice->id)) {
-            $newNumber = $this->generateInvoiceNumber($registrasi, $jenisTransaksi, (int) $invoice->id);
+            $baseNumber = $this->generateInvoiceBaseNumber($registrasi, (int) $invoice->id);
+            $newNumber = $baseNumber . '-' . $expectedSuffix;
         }
 
-        $invoice->forceFill([
+        $payload = [
             'no_invoice' => $newNumber,
+            'invoice_base_no' => $baseNumber,
+            'invoice_suffix' => $expectedSuffix,
             'updated_by' => $this->username(),
             'updated_at' => now(),
-        ])->save();
+        ];
+
+        $invoice->forceFill(
+            $this->onlyExistingColumns('pembayaran_invoice', $payload)
+        )->save();
 
         $invoice->refresh();
+    }
+
+    protected function resolveInvoiceBaseNumber(
+        PembayaranInvoice $invoice,
+        RegistrasiKunjungan $registrasi
+    ): string {
+        $existingBase = trim((string) ($invoice->invoice_base_no ?? ''));
+
+        if ($existingBase !== '') {
+            return $this->normalizeInvoiceNumberWithoutTransactionSuffix($existingBase);
+        }
+
+        $currentNumber = trim((string) ($invoice->no_invoice ?? ''));
+        $currentBase = $this->normalizeInvoiceNumberWithoutTransactionSuffix($currentNumber);
+
+        if ($currentBase !== '' && $this->isLegacyInvoiceNumber($currentBase)) {
+            return $currentBase;
+        }
+
+        $siblingInvoice = PembayaranInvoice::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('id', '<>', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->whereNotNull('no_invoice')
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->first();
+
+        if ($siblingInvoice) {
+            $siblingBase = trim((string) ($siblingInvoice->invoice_base_no ?? ''));
+
+            if ($siblingBase !== '') {
+                return $this->normalizeInvoiceNumberWithoutTransactionSuffix($siblingBase);
+            }
+
+            $siblingNumber = trim((string) ($siblingInvoice->no_invoice ?? ''));
+
+            if ($siblingNumber !== '') {
+                return $this->normalizeInvoiceNumberWithoutTransactionSuffix($siblingNumber);
+            }
+        }
+
+        return '';
     }
 
     protected function generateInvoiceNumber(
         RegistrasiKunjungan $registrasi,
         int $jenisTransaksi = 0,
+        ?int $ignoreInvoiceId = null
+    ): string {
+        $baseNumber = $this->generateInvoiceBaseNumber($registrasi, $ignoreInvoiceId);
+
+        return $baseNumber . '-' . $this->resolveInvoiceTransactionSuffix($jenisTransaksi);
+    }
+
+    protected function generateInvoiceBaseNumber(
+        RegistrasiKunjungan $registrasi,
         ?int $ignoreInvoiceId = null
     ): string {
         $invoiceDate = $this->resolveInvoiceDate($registrasi);
@@ -3340,10 +4099,9 @@ class PembayaranController extends Controller
         do {
             $sequence = $this->nextLegacyInvoiceSequence($tokoId, $invoiceDate);
             $baseNumber = $this->formatLegacyInvoiceNumber($tokoCode, $invoiceDate, $sequence);
-            $invoiceNumber = $this->formatInvoiceNumberWithTransactionSuffix($baseNumber, $jenisTransaksi);
-        } while ($this->invoiceNumberExists($invoiceNumber, $ignoreInvoiceId));
+        } while ($this->invoiceBaseNumberExists($baseNumber, $ignoreInvoiceId));
 
-        return $invoiceNumber;
+        return $baseNumber;
     }
 
     protected function resolveInvoiceDate(RegistrasiKunjungan $registrasi): Carbon
@@ -3392,9 +4150,32 @@ class PembayaranController extends Controller
     protected function invoiceNumberExists(string $invoiceNumber, ?int $ignoreInvoiceId = null): bool
     {
         $query = PembayaranInvoice::query()
-            ->where('no_invoice', $invoiceNumber)
-            ->where(function ($q) {
-                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            ->where('no_invoice', $invoiceNumber);
+
+        if ($ignoreInvoiceId) {
+            $query->where('id', '<>', $ignoreInvoiceId);
+        }
+
+        return $query->exists();
+    }
+
+    protected function invoiceBaseNumberExists(string $baseNumber, ?int $ignoreInvoiceId = null): bool
+    {
+        $baseNumber = $this->normalizeInvoiceNumberWithoutTransactionSuffix($baseNumber);
+
+        if ($baseNumber === '') {
+            return false;
+        }
+
+        $query = PembayaranInvoice::query()
+            ->where(function ($q) use ($baseNumber) {
+                $q->where('invoice_base_no', $baseNumber)
+                    ->orWhere('no_invoice', $baseNumber)
+                    ->orWhere('no_invoice', $baseNumber . '-U')
+                    ->orWhere('no_invoice', $baseNumber . '-D')
+                    ->orWhere('no_invoice', $baseNumber . '-F')
+                    ->orWhere('no_invoice', $baseNumber . '-E')
+                    ->orWhere('no_invoice', $baseNumber . '-O');
             });
 
         if ($ignoreInvoiceId) {
