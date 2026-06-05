@@ -309,27 +309,33 @@ class ReferenceController extends Controller
                     return null;
                 }
 
-                $stock = $produkToko->stockProdukToko
-                    ? $produkToko->stockProdukToko->sortByDesc('id')->first()
-                    : null;
+                $preferredTempatProdukId = $tempatProdukId ?: ($produk->tempat_produk_id ?? null);
 
-                $resolvedTempatProdukId = $tempatProdukId
-                    ?: ($stock->tempat_produk_id ?? $produk->tempat_produk_id ?? 1);
+                $stockRows = $produkToko->stockProdukToko
+                    ? $produkToko->stockProdukToko->sortByDesc('id')->values()
+                    : collect();
 
-                $namaTempatProduk =
-                    $stock?->tempatProduk?->nama_tempat_produk
+                $stock = null;
+
+                if ($preferredTempatProdukId) {
+                    $stock = $stockRows->first(function ($row) use ($preferredTempatProdukId) {
+                        return (int) $row->tempat_produk_id === (int) $preferredTempatProdukId;
+                    });
+                }
+
+                if (!$stock) {
+                    $stock = $stockRows->first();
+                }
+
+                $resolvedTempatProdukId = $stock->tempat_produk_id
+                    ?? $preferredTempatProdukId
+                    ?? 1;
+
+                $namaTempatProduk = $stock?->tempatProduk?->nama_tempat_produk
                     ?? $produk?->tempatProduk?->nama_tempat_produk
                     ?? $produk?->tempatProduk?->nama
                     ?? '-';
 
-                /*
-                * Aturan stok reference:
-                * 1. Kalau stock_produk_toko ada, pakai stock_produk_toko.
-                * 2. Kalau belum ada, fallback ke master_produk_toko.stok_awal.
-                *
-                * Ini membuat dropdown registrasi, stok produk, dan stok tersedia
-                * membaca angka yang sama untuk masa transisi.
-                */
                 $stokAwalMaster = (float) ($produkToko->stok_awal ?? 0);
 
                 if ($stock) {

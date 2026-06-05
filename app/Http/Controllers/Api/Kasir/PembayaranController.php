@@ -62,14 +62,16 @@ class PembayaranController extends Controller
 
     public function index(Request $request)
     {
-        if ($request->boolean('sync_pending')) {
+        if ($this->shouldSyncPendingInvoicesOnList($request)) {
             $this->syncPendingInvoicesLite($request);
         }
 
         $perPage = (int) $request->get('per_page', 15);
+
         if ($perPage <= 0) {
             $perPage = 15;
         }
+
         if ($perPage > 50) {
             $perPage = 50;
         }
@@ -4580,12 +4582,71 @@ class PembayaranController extends Controller
                 ->first();
     }
 
+    protected function shouldSyncPendingInvoicesOnList(Request $request): bool
+    {
+        if ($request->boolean('sync_pending')) {
+            return true;
+        }
+
+        $status = strtolower(trim((string) $request->get('status', '')));
+
+        if (in_array($status, ['lunas', 'paid', 'selesai'], true)) {
+            return false;
+        }
+
+        return true;
+    }
+
     protected function syncPendingInvoicesLite(Request $request): void
     {
+        $dateColumn = Schema::hasColumn('registrasi_kunjungan', 'tanggal_kunjungan')
+            ? 'tanggal_kunjungan'
+            : (Schema::hasColumn('registrasi_kunjungan', 'tanggal') ? 'tanggal' : 'created_at');
+
         $query = RegistrasiKunjungan::query()
             ->active()
-            ->whereHas('tasks', function ($q) {
-                $q->where('task_type', RegistrasiTask::TYPE_PEMBAYARAN);
+            ->where(function ($q) {
+                $q->where('current_task', RegistrasiTask::TYPE_PEMBAYARAN)
+                    ->orWhereHas('tasks', function ($task) {
+                        $task->where('task_type', RegistrasiTask::TYPE_PEMBAYARAN);
+                    })
+                    ->orWhere('is_penjualan', 1)
+                    ->orWhere('is_treatment', 1)
+                    ->orWhere('total_penjualan', '>', 0)
+                    ->orWhere('total_treatment', '>', 0)
+                    ->orWhere('total_konsultasi', '>', 0)
+                    ->orWhereHas('penjualanDetails', function ($detail) {
+                        $detail->where(function ($q) {
+                            $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                        });
+
+                        if (Schema::hasColumn('registrasi_penjualan_detail', 'jumlah')) {
+                            $detail->where('jumlah', '>', 0);
+                        }
+                    })
+                    ->orWhereHas('treatmentDetails', function ($detail) {
+                        $detail->where(function ($q) {
+                            $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                        });
+
+                        if (Schema::hasColumn('registrasi_treatment_detail', 'jumlah')) {
+                            $detail->where('jumlah', '>', 0);
+                        }
+                    });
+            })
+            ->whereNotExists(function ($sub) {
+                $sub->select(DB::raw(1))
+                    ->from('pembayaran_invoice')
+                    ->whereColumn('pembayaran_invoice.registrasi_id', 'registrasi_kunjungan.id')
+                    ->where(function ($q) {
+                        $q->whereNull('pembayaran_invoice.is_delete')
+                            ->orWhere('pembayaran_invoice.is_delete', 0);
+                    })
+                    ->whereIn('pembayaran_invoice.status', [
+                        PembayaranInvoice::STATUS_MENUNGGU,
+                        PembayaranInvoice::STATUS_PROSES,
+                        PembayaranInvoice::STATUS_LUNAS,
+                    ]);
             });
 
         if ($request->filled('toko_id')) {
@@ -4593,33 +4654,67 @@ class PembayaranController extends Controller
         }
 
         if ($request->filled('tanggal')) {
-            if (Schema::hasColumn('registrasi_kunjungan', 'tanggal')) {
-                $query->whereDate('tanggal', $request->tanggal);
-            } else {
-                $query->whereDate('tanggal_kunjungan', $request->tanggal);
-            }
+            $query->whereDate($dateColumn, $request->tanggal);
         }
 
-        $query->limit(50)->get()->each(function ($registrasi) {
-            if (!$this->resolveInvoice($registrasi->id)) {
-                try {
-                    DB::transaction(function () use ($registrasi) {
-                        $lockedRegistrasi = RegistrasiKunjungan::query()
-                            ->with(['pasien', 'tasks', 'treatmentDetails', 'penjualanDetails'])
-                            ->whereKey($registrasi->id)
-                            ->lockForUpdate()
-                            ->firstOrFail();
+        if ($request->filled('tanggal_mulai')) {
+            $query->whereDate($dateColumn, '>=', $request->tanggal_mulai);
+        }
 
-                        $this->generateInvoiceFromRegistrasi($lockedRegistrasi, false);
-                    }, 3);
-                } catch (Throwable $e) {
-                    Log::warning('Gagal sync invoice pending', [
-                        'registrasi_id' => $registrasi->id,
-                        'error' => $e->getMessage(),
-                    ]);
-                }
+        if ($request->filled('tanggal_selesai')) {
+            $query->whereDate($dateColumn, '<=', $request->tanggal_selesai);
+        }
+
+        $registrasiIds = $query
+            ->orderBy('id')
+            ->limit(100)
+            ->pluck('id');
+
+        foreach ($registrasiIds as $registrasiId) {
+            try {
+                DB::transaction(function () use ($registrasiId) {
+                    $registrasi = RegistrasiKunjungan::query()
+                        ->with([
+                            'pasien',
+                            'tasks',
+                            'treatmentDetails',
+                            'penjualanDetails',
+                        ])
+                        ->active()
+                        ->whereKey($registrasiId)
+                        ->lockForUpdate()
+                        ->first();
+
+                    if (!$registrasi) {
+                        return;
+                    }
+
+                    $invoiceExists = PembayaranInvoice::query()
+                        ->where('registrasi_id', $registrasi->id)
+                        ->where(function ($q) {
+                            $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                        })
+                        ->whereIn('status', [
+                            PembayaranInvoice::STATUS_MENUNGGU,
+                            PembayaranInvoice::STATUS_PROSES,
+                            PembayaranInvoice::STATUS_LUNAS,
+                        ])
+                        ->lockForUpdate()
+                        ->exists();
+
+                    if ($invoiceExists) {
+                        return;
+                    }
+
+                    $this->generateInvoiceFromRegistrasi($registrasi, true);
+                }, 3);
+            } catch (Throwable $e) {
+                Log::warning('Gagal sync pending invoice pada list pembayaran', [
+                    'registrasi_id' => $registrasiId,
+                    'error' => $e->getMessage(),
+                ]);
             }
-        });
+        }
     }
 
     protected function generateInvoiceFromRegistrasi(RegistrasiKunjungan $registrasi, bool $force = false): PembayaranInvoice
