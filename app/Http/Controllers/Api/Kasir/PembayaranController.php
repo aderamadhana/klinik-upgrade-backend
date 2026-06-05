@@ -114,16 +114,20 @@ class PembayaranController extends Controller
             ->map(fn ($invoice) => $this->formatPaymentListRow($invoice))
             ->values();
 
+        $groupedItems = $this->buildGroupedPaymentListRows($items);
+
         return response()->json([
             'status' => true,
             'message' => 'Data pembayaran berhasil diambil',
-            'rows' => $items,
-            'total' => $rows->total(),
+            'rows' => $groupedItems,
+            'total' => $groupedItems->count(),
+            'total_invoice' => $rows->total(),
+            'total_group' => $groupedItems->count(),
             'per_page' => $rows->perPage(),
             'current_page' => $rows->currentPage(),
             'last_page' => $rows->lastPage(),
             'from' => $rows->firstItem(),
-            'to' => $rows->lastItem(),
+            'to' => $rows->firstItem() ? ($rows->firstItem() + $groupedItems->count() - 1) : null,
             'summary' => $this->buildSummaryFast($summaryQuery),
         ]);
     }
@@ -920,6 +924,217 @@ class PembayaranController extends Controller
         });
     }
 
+    protected function buildGroupedPaymentListRows($items)
+    {
+        return collect($items)
+            ->groupBy(fn ($row) => $this->resolvePaymentGroupKey($row))
+            ->map(fn ($groupRows) => $this->formatPaymentGroupRow($groupRows->values()))
+            ->sortByDesc(fn ($row) => $row['tanggal_lunas'] ?? $row['tanggal_invoice'] ?? $row['created_at'] ?? '')
+            ->values();
+    }
+
+    protected function resolvePaymentGroupKey(array $row): string
+    {
+        $baseNo = $this->resolveInvoiceBaseNoFromRow($row);
+
+        if ($baseNo !== '') {
+            return 'invoice_base:' . $baseNo;
+        }
+
+        $registrasiId = (int) ($row['registrasi_id'] ?? 0);
+        if ($registrasiId > 0) {
+            return 'registrasi:' . $registrasiId;
+        }
+
+        return 'invoice:' . ($row['invoice_id'] ?? $row['id'] ?? $row['no_invoice'] ?? uniqid('', true));
+    }
+
+    protected function resolveInvoiceBaseNoFromRow(array $row): string
+    {
+        $baseNo = trim((string) ($row['invoice_base_no'] ?? $row['invoice_group_no'] ?? ''));
+
+        if ($baseNo !== '') {
+            return $this->normalizeInvoiceNumberWithoutTransactionSuffix($baseNo);
+        }
+
+        $invoiceNo = trim((string) ($row['no_invoice'] ?? $row['nomor_invoice'] ?? $row['invoice_number'] ?? ''));
+
+        if ($invoiceNo === '') {
+            return '';
+        }
+
+        return $this->normalizeInvoiceNumberWithoutTransactionSuffix($invoiceNo);
+    }
+
+    protected function formatPaymentGroupRow($groupRows): array
+    {
+        $rows = collect($groupRows)
+            ->sortBy(function ($row) {
+                $suffix = strtoupper((string) ($row['invoice_suffix'] ?? $this->resolveInvoiceSuffixFromNumber($row['no_invoice'] ?? '')));
+
+                return match ($suffix) {
+                    'U' => 1,
+                    'D' => 2,
+                    'F' => 3,
+                    'E' => 4,
+                    'O' => 5,
+                    default => 9,
+                };
+            })
+            ->values();
+
+        $primary = $rows->first() ?? [];
+        $baseNo = $this->resolveInvoiceBaseNoFromRow($primary);
+        $grandTotal = (float) $rows->sum(fn ($row) => (float) ($row['grand_total'] ?? $row['total_tagihan'] ?? 0));
+        $totalBayar = (float) $rows->sum(fn ($row) => (float) ($row['total_bayar'] ?? 0));
+        $subtotalProduk = (float) $rows->sum(fn ($row) => (float) ($row['subtotal_produk'] ?? $row['subtotal_obat'] ?? 0));
+        $subtotalTreatment = (float) $rows->sum(fn ($row) => (float) ($row['subtotal_treatment'] ?? 0));
+        $subtotalKonsultasi = (float) $rows->sum(fn ($row) => (float) ($row['subtotal_konsultasi'] ?? 0));
+        $status = $this->resolvePaymentGroupStatus($rows);
+        $layanan = $this->buildPaymentGroupLayananLabel($rows, $subtotalProduk, $subtotalTreatment, $subtotalKonsultasi);
+        $metodePembayaran = $rows
+            ->pluck('metode_pembayaran')
+            ->filter()
+            ->flatMap(fn ($value) => array_map('trim', explode(',', (string) $value)))
+            ->filter()
+            ->unique()
+            ->values()
+            ->implode(', ');
+
+        $invoiceChildren = $rows->map(function ($row) {
+            $invoiceNo = (string) ($row['no_invoice'] ?? $row['nomor_invoice'] ?? $row['invoice_number'] ?? '');
+            $suffix = strtoupper((string) ($row['invoice_suffix'] ?? $this->resolveInvoiceSuffixFromNumber($invoiceNo)));
+
+            return [
+                'id' => $row['id'] ?? $row['invoice_id'] ?? null,
+                'invoice_id' => $row['invoice_id'] ?? $row['id'] ?? null,
+                'no_invoice' => $invoiceNo,
+                'invoice_suffix' => $suffix,
+                'label' => $this->resolveInvoiceChildLabel($suffix),
+                'jenis_transaksi' => (int) ($row['jenis_transaksi'] ?? 0),
+                'grand_total' => (float) ($row['grand_total'] ?? $row['total_tagihan'] ?? 0),
+                'total_bayar' => (float) ($row['total_bayar'] ?? 0),
+                'status' => (int) ($row['status'] ?? 0),
+                'status_key' => $row['status_key'] ?? null,
+                'status_label' => $row['status_label'] ?? null,
+                'subtotal_produk' => (float) ($row['subtotal_produk'] ?? $row['subtotal_obat'] ?? 0),
+                'subtotal_treatment' => (float) ($row['subtotal_treatment'] ?? 0),
+                'subtotal_konsultasi' => (float) ($row['subtotal_konsultasi'] ?? 0),
+            ];
+        })->values();
+
+        $group = $primary;
+        $group['id'] = $primary['id'] ?? $primary['invoice_id'] ?? null;
+        $group['invoice_id'] = $primary['invoice_id'] ?? $primary['id'] ?? null;
+        $group['pembayaran_id'] = $group['invoice_id'];
+        $group['invoice_base_no'] = $baseNo;
+        $group['invoice_group_no'] = $baseNo;
+        $group['no_invoice'] = $baseNo !== '' ? $baseNo : ($primary['no_invoice'] ?? null);
+        $group['nomor_invoice'] = $group['no_invoice'];
+        $group['invoice_number'] = $group['no_invoice'];
+        $group['is_grouped_invoice'] = $rows->count() > 1;
+        $group['invoice_count'] = $rows->count();
+        $group['invoice_children'] = $invoiceChildren;
+        $group['invoices'] = $invoiceChildren;
+        $group['child_invoice_ids'] = $invoiceChildren->pluck('invoice_id')->filter()->values()->all();
+        $group['subtotal_obat'] = $subtotalProduk;
+        $group['subtotal_produk'] = $subtotalProduk;
+        $group['subtotal_treatment'] = $subtotalTreatment;
+        $group['subtotal_konsultasi'] = $subtotalKonsultasi;
+        $group['total_tagihan'] = $grandTotal;
+        $group['grand_total'] = $grandTotal;
+        $group['total_pembayaran'] = $grandTotal;
+        $group['total_bayar'] = $totalBayar;
+        $group['sisa_tagihan'] = max($grandTotal - $totalBayar, 0);
+        $group['status'] = $status['status'];
+        $group['status_key'] = $status['status_key'];
+        $group['status_label'] = $status['status_label'];
+        $group['status_pembayaran_key'] = $status['status_key'];
+        $group['status_pembayaran'] = $status['status_label'];
+        $group['status_pembayaran_label'] = $status['status_label'];
+        $group['metode_pembayaran'] = $metodePembayaran !== '' ? $metodePembayaran : ($primary['metode_pembayaran'] ?? null);
+        $group['layanan_label'] = $layanan;
+        $group['ada_treatment'] = $subtotalTreatment > 0;
+        $group['ada_penjualan'] = $subtotalProduk > 0;
+        $group['is_treatment'] = $subtotalTreatment > 0;
+        $group['is_penjualan'] = $subtotalProduk > 0;
+        $group['can_process_pembayaran'] = $rows->contains(fn ($row) => (bool) ($row['can_process_pembayaran'] ?? false));
+
+        return $group;
+    }
+
+    protected function resolvePaymentGroupStatus($rows): array
+    {
+        $statuses = collect($rows)->pluck('status')->map(fn ($status) => (int) $status)->values();
+
+        if ($statuses->contains(PembayaranInvoice::STATUS_PROSES)) {
+            return [
+                'status' => PembayaranInvoice::STATUS_PROSES,
+                'status_key' => $this->mapInvoiceStatusToKey(PembayaranInvoice::STATUS_PROSES),
+                'status_label' => $this->mapInvoiceStatusToLabel(PembayaranInvoice::STATUS_PROSES),
+            ];
+        }
+
+        if ($statuses->contains(PembayaranInvoice::STATUS_MENUNGGU)) {
+            return [
+                'status' => PembayaranInvoice::STATUS_MENUNGGU,
+                'status_key' => $this->mapInvoiceStatusToKey(PembayaranInvoice::STATUS_MENUNGGU),
+                'status_label' => $this->mapInvoiceStatusToLabel(PembayaranInvoice::STATUS_MENUNGGU),
+            ];
+        }
+
+        return [
+            'status' => PembayaranInvoice::STATUS_LUNAS,
+            'status_key' => $this->mapInvoiceStatusToKey(PembayaranInvoice::STATUS_LUNAS),
+            'status_label' => $this->mapInvoiceStatusToLabel(PembayaranInvoice::STATUS_LUNAS),
+        ];
+    }
+
+    protected function buildPaymentGroupLayananLabel($rows, float $subtotalProduk, float $subtotalTreatment, float $subtotalKonsultasi): string
+    {
+        $hasConsultation = $subtotalKonsultasi > 0 || $rows->contains(fn ($row) => (bool) ($row['ada_konsultasi'] ?? false));
+        $hasTreatment = $subtotalTreatment > 0;
+        $hasSales = $subtotalProduk > 0;
+        $hasDeposit = $rows->contains(fn ($row) => (int) ($row['jenis_transaksi'] ?? 0) === 4 || strtoupper((string) ($row['invoice_suffix'] ?? $this->resolveInvoiceSuffixFromNumber($row['no_invoice'] ?? ''))) === 'D');
+
+        $labels = [];
+
+        if ($hasConsultation) {
+            $labels[] = 'Konsultasi';
+        }
+        if ($hasTreatment) {
+            $labels[] = $hasDeposit ? 'Treatment + Deposit' : 'Treatment';
+        }
+        if ($hasSales) {
+            $labels[] = 'Penjualan';
+        }
+
+        return count($labels) > 0 ? implode(' + ', $labels) : '-';
+    }
+
+    protected function resolveInvoiceSuffixFromNumber(?string $invoiceNumber): string
+    {
+        $invoiceNumber = strtoupper(trim((string) $invoiceNumber));
+
+        if (preg_match('/-([A-Z])$/', $invoiceNumber, $matches)) {
+            return $matches[1];
+        }
+
+        return '';
+    }
+
+    protected function resolveInvoiceChildLabel(string $suffix): string
+    {
+        return match (strtoupper($suffix)) {
+            'U' => 'Umum',
+            'D' => 'Deposit',
+            'F' => 'Faskar',
+            'E' => 'EliteGlowbal',
+            'O' => 'Owner',
+            default => 'Invoice',
+        };
+    }
+
     protected function buildSummaryFast($query): array
     {
         $summaryQuery = clone $query;
@@ -1464,12 +1679,6 @@ class PembayaranController extends Controller
         RegistrasiKunjungan $registrasi,
         ?string $depositExpiredAt
     ): array {
-        if ($this->hasPromoPayloadForSplitDeposit($request)) {
-            throw ValidationException::withMessages([
-                'promo' => 'Transaksi campuran deposit + umum belum boleh memakai promo/value dalam satu submit. Selesaikan split invoice deposit dulu agar nilai promo tidak salah alokasi.',
-            ]);
-        }
-
         $selectedDepositItems = $this->resolveDepositItems($request, $depositInvoice);
 
         if (count($selectedDepositItems) === 0) {
@@ -1510,6 +1719,26 @@ class PembayaranController extends Controller
         );
 
         $this->syncJenisTransaksiToInvoiceItems($generalInvoice, 0);
+
+        $this->applyDiscountsAndPromosForSplitDepositInvoices(
+            $request,
+            $generalInvoice,
+            $depositInvoice
+        );
+
+        $depositInvoice = PembayaranInvoice::query()
+            ->whereKey($depositInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $generalInvoice = PembayaranInvoice::query()
+            ->whereKey($generalInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+
         $this->generateDepositTreatmentRecords($depositInvoice, $selectedDepositItems);
 
         $this->refreshInvoiceTotalsFromItems($depositInvoice);
@@ -1898,6 +2127,657 @@ class PembayaranController extends Controller
         }
 
         return false;
+    }
+
+
+    protected function applyDiscountsAndPromosForSplitDepositInvoices(
+        Request $request,
+        PembayaranInvoice $generalInvoice,
+        PembayaranInvoice $depositInvoice
+    ): void {
+        $this->applySubtotalDiscountForSplitInvoices($request, $generalInvoice, $depositInvoice);
+
+        $this->refreshInvoiceTotalsFromItems($generalInvoice);
+        $this->refreshInvoiceTotalsFromItems($depositInvoice);
+
+        $generalInvoice = PembayaranInvoice::query()
+            ->whereKey($generalInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $depositInvoice = PembayaranInvoice::query()
+            ->whereKey($depositInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $this->applySelectedPromosForSplitInvoices($request, $generalInvoice, $depositInvoice);
+
+        $this->refreshInvoiceTotalsFromItems($generalInvoice);
+        $this->refreshInvoiceTotalsFromItems($depositInvoice);
+
+        $generalInvoice = PembayaranInvoice::query()
+            ->whereKey($generalInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $depositInvoice = PembayaranInvoice::query()
+            ->whereKey($depositInvoice->id)
+            ->lockForUpdate()
+            ->firstOrFail();
+
+        $this->updateSplitPromoAttribution($generalInvoice, $depositInvoice);
+    }
+
+    protected function applySubtotalDiscountForSplitInvoices(
+        Request $request,
+        PembayaranInvoice $generalInvoice,
+        PembayaranInvoice $depositInvoice
+    ): void {
+        $discountValue = (float) $request->input('diskon_subtotal_nilai', 0);
+        $discountType = $this->normalizeSubtotalDiscountType($request->input('diskon_subtotal_tipe'));
+
+        $generalBase = $this->getSplitInvoiceSubtotalDiscountBase($generalInvoice);
+        $depositBase = $this->getSplitInvoiceSubtotalDiscountBase($depositInvoice);
+        $totalBase = $generalBase + $depositBase;
+
+        if ($discountValue <= 0 || $discountType === 0 || $totalBase <= 0) {
+            $this->applySubtotalDiscountFromRequest($this->buildSplitSubtotalDiscountRequest($request, 0), $generalInvoice);
+            $this->applySubtotalDiscountFromRequest($this->buildSplitSubtotalDiscountRequest($request, 0), $depositInvoice);
+            return;
+        }
+
+        $discountAmount = $discountType === 1
+            ? round(($totalBase * $discountValue) / 100, 2)
+            : round($discountValue, 2);
+
+        $discountAmount = min(max($discountAmount, 0), $totalBase);
+
+        $generalAmount = $totalBase > 0 ? round(($generalBase / $totalBase) * $discountAmount, 2) : 0;
+        $depositAmount = round($discountAmount - $generalAmount, 2);
+
+        $generalAmount = min(max($generalAmount, 0), $generalBase);
+        $depositAmount = min(max($depositAmount, 0), $depositBase);
+
+        $this->applySubtotalDiscountFromRequest($this->buildSplitSubtotalDiscountRequest($request, $generalAmount), $generalInvoice);
+        $this->applySubtotalDiscountFromRequest($this->buildSplitSubtotalDiscountRequest($request, $depositAmount), $depositInvoice);
+    }
+
+    protected function buildSplitSubtotalDiscountRequest(Request $request, float $amount): Request
+    {
+        $payload = $request->all();
+        $payload['diskon_subtotal_tipe'] = 2;
+        $payload['diskon_subtotal_nilai'] = round(max($amount, 0), 2);
+
+        return Request::create('/', 'POST', $payload);
+    }
+
+    protected function getSplitInvoiceSubtotalDiscountBase(PembayaranInvoice $invoice): float
+    {
+        if (!Schema::hasTable('pembayaran_invoice_item')) {
+            return 0;
+        }
+
+        return (float) DB::table('pembayaran_invoice_item')
+            ->where('pembayaran_id', $invoice->id)
+            ->whereIn('item_type', [2, 3])
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 9);
+            })
+            ->sum('subtotal');
+    }
+
+    protected function applySelectedPromosForSplitInvoices(
+        Request $request,
+        PembayaranInvoice $generalInvoice,
+        PembayaranInvoice $depositInvoice
+    ): void {
+        $this->resetSplitInvoicePromosAndAmount($generalInvoice);
+        $this->resetSplitInvoicePromosAndAmount($depositInvoice);
+
+        $references = $this->normalizeSelectedPromoReferences($request);
+        if (count($references) === 0) {
+            return;
+        }
+
+        $selectedVouchers = [];
+        foreach ($references as $reference) {
+            $voucher = $this->findVoucherByReference($reference);
+            if (!$voucher) {
+                throw ValidationException::withMessages([
+                    'promo' => 'Voucher tidak ditemukan atau tidak aktif.',
+                ]);
+            }
+
+            $voucherId = (int) $voucher->id;
+            if (isset($selectedVouchers[$voucherId])) {
+                $existingReference = $selectedVouchers[$voucherId]['reference'] ?? [];
+                $existingCode = trim((string) ($existingReference['kode'] ?? $existingReference['kode_voucher'] ?? ''));
+                $newCode = trim((string) ($reference['kode'] ?? $reference['kode_voucher'] ?? ''));
+
+                if ($existingCode === '' && $newCode !== '') {
+                    $selectedVouchers[$voucherId]['reference'] = $reference;
+                }
+
+                continue;
+            }
+
+            $selectedVouchers[$voucherId] = [
+                'voucher' => $voucher,
+                'reference' => $reference,
+            ];
+        }
+
+        $nonCombine = collect($selectedVouchers)
+            ->filter(fn ($row) => (int) ($row['voucher']->is_bisa_digabung_promo ?? 0) !== 1);
+
+        if ($nonCombine->count() > 0 && count($selectedVouchers) > 1) {
+            throw ValidationException::withMessages([
+                'promo' => 'Voucher tidak bisa digabung dengan promo lain.',
+            ]);
+        }
+
+        $combinedPromoBase = $this->getSplitCombinedPromoBase($generalInvoice, $depositInvoice);
+        $totalPromo = 0.0;
+        $layerOrder = 1;
+
+        foreach ($selectedVouchers as $selected) {
+            $voucher = $selected['voucher'];
+            $reference = $selected['reference'];
+
+            $this->validateVoucherForInvoice($voucher, $generalInvoice);
+
+            $items = $this->loadSplitVoucherInvoiceItems($generalInvoice, $depositInvoice);
+            $eligibleItems = $this->resolveSplitVoucherEligibleItems($voucher, $items);
+
+            if ($eligibleItems->isEmpty()) {
+                throw ValidationException::withMessages([
+                    'promo' => 'Voucher ' . ($voucher->nama_voucher ?? $voucher->kode_voucher ?? '-') . ' tidak sesuai dengan item transaksi.',
+                ]);
+            }
+
+            $eligibleBase = (float) $eligibleItems->sum(fn ($item) => $this->splitItemNetBase($item));
+            if ($eligibleBase <= 0) {
+                throw ValidationException::withMessages([
+                    'promo' => 'Voucher ' . ($voucher->nama_voucher ?? $voucher->kode_voucher ?? '-') . ' tidak memiliki nilai eligible.',
+                ]);
+            }
+
+            $voucherAmount = $this->calculateSplitVoucherDiscountAmount($voucher, $eligibleBase);
+            $remainingBase = max($combinedPromoBase - $totalPromo, 0);
+            $voucherAmount = min($voucherAmount, $remainingBase);
+
+            if ($voucherAmount <= 0) {
+                continue;
+            }
+
+            if ($this->isSplitValueVoucher($voucher)) {
+                $allocations = $this->distributeSplitVoucherAmountAcrossInvoices($eligibleItems, $voucherAmount);
+                foreach ($allocations as $allocation) {
+                    $this->insertSplitInvoicePromoRow(
+                        (int) $allocation['pembayaran_id'],
+                        null,
+                        $voucher,
+                        (float) $allocation['amount'],
+                        1,
+                        $layerOrder,
+                        'VALUE',
+                        (float) $allocation['base'],
+                        $eligibleBase,
+                        max((float) $allocation['base'] - (float) $allocation['amount'], 0)
+                    );
+                }
+            } else {
+                $allocations = $this->distributeSplitVoucherAmountAcrossItems($eligibleItems, $voucherAmount);
+                foreach ($allocations as $allocation) {
+                    $this->insertSplitInvoicePromoRow(
+                        (int) $allocation['pembayaran_id'],
+                        (int) $allocation['pembayaran_item_id'],
+                        $voucher,
+                        (float) $allocation['amount'],
+                        2,
+                        $layerOrder,
+                        $this->resolveSplitPromoScopeCode($voucher),
+                        (float) $allocation['base'],
+                        $eligibleBase,
+                        max((float) $allocation['base'] - (float) $allocation['amount'], 0)
+                    );
+                }
+            }
+
+            $this->consumeVoucherQuotaIfNeeded($voucher, $generalInvoice);
+            $this->redeemSplitVoucherCodeIfNeeded($voucher, $generalInvoice, $depositInvoice, $reference);
+
+            $totalPromo += $voucherAmount;
+            $layerOrder++;
+        }
+
+        $this->updateSplitInvoicePromoAmount($generalInvoice);
+        $this->updateSplitInvoicePromoAmount($depositInvoice);
+    }
+
+    protected function resetSplitInvoicePromosAndAmount(PembayaranInvoice $invoice): void
+    {
+        if (Schema::hasTable('pembayaran_invoice_promo')) {
+            DB::table('pembayaran_invoice_promo')
+                ->where('pembayaran_id', $invoice->id)
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                })
+                ->update($this->onlyExistingColumns('pembayaran_invoice_promo', [
+                    'is_delete' => 1,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+        }
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'total_promo' => 0,
+            'diskon_promo' => 0,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function getSplitCombinedPromoBase(PembayaranInvoice $generalInvoice, PembayaranInvoice $depositInvoice): float
+    {
+        return (float) $this->loadSplitVoucherInvoiceItems($generalInvoice, $depositInvoice)
+            ->sum(fn ($item) => $this->splitItemNetBase($item));
+    }
+
+    protected function loadSplitVoucherInvoiceItems(PembayaranInvoice $generalInvoice, PembayaranInvoice $depositInvoice)
+    {
+        return $this->loadSingleInvoiceItemsForSplitVoucher($generalInvoice)
+            ->merge($this->loadSingleInvoiceItemsForSplitVoucher($depositInvoice))
+            ->values();
+    }
+
+    protected function loadSingleInvoiceItemsForSplitVoucher(PembayaranInvoice $invoice)
+    {
+        return $invoice->items()
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', '!=', 9);
+            })
+            ->whereIn('item_type', [2, 3])
+            ->lockForUpdate()
+            ->get()
+            ->map(function ($item) use ($invoice) {
+                $item->setAttribute('split_pembayaran_id', (int) $invoice->id);
+                return $item;
+            });
+    }
+
+    protected function resolveSplitVoucherEligibleItems(object $voucher, $items)
+    {
+        $items = collect($items)->filter(fn ($item) => $this->isProductItem($item) || $this->isTreatmentItem($item))->values();
+
+        $specificItems = collect();
+        if (Schema::hasTable('master_voucher_diskon_item')) {
+            $specificItems = DB::table('master_voucher_diskon_item')
+                ->where('voucher_diskon_id', $voucher->id)
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                })
+                ->get();
+        }
+
+        if ($specificItems->isNotEmpty()) {
+            return $items->filter(function ($item) use ($specificItems) {
+                return $specificItems->contains(function ($rule) use ($item) {
+                    $ruleType = strtolower((string) ($rule->item_type ?? ''));
+                    $ruleItemId = (int) ($rule->item_id ?? 0);
+
+                    if ($ruleType === 'produk') {
+                        return $this->isProductItem($item)
+                            && in_array($ruleItemId, [
+                                (int) ($item->produk_id ?? 0),
+                                (int) ($item->item_id ?? 0),
+                                (int) ($item->master_produk_id ?? 0),
+                            ], true);
+                    }
+
+                    if ($ruleType === 'treatment') {
+                        return $this->isTreatmentItem($item)
+                            && in_array($ruleItemId, [
+                                (int) ($item->treatment_id ?? 0),
+                                (int) ($item->item_id ?? 0),
+                                (int) ($item->master_treatment_id ?? 0),
+                            ], true);
+                    }
+
+                    return false;
+                });
+            })->values();
+        }
+
+        $jenisVoucherId = (int) ($voucher->jenis_voucher_id ?? 0);
+
+        if ($jenisVoucherId === 1) {
+            return $items->filter(fn ($item) => $this->isTreatmentItem($item))->values();
+        }
+
+        if ($jenisVoucherId === 2) {
+            return $items->filter(fn ($item) => $this->isProductItem($item))->values();
+        }
+
+        if ($jenisVoucherId === 3) {
+            $hasTreatment = $items->contains(fn ($item) => $this->isTreatmentItem($item));
+            $hasProduct = $items->contains(fn ($item) => $this->isProductItem($item));
+
+            return $hasTreatment && $hasProduct ? $items->values() : collect();
+        }
+
+        return $items->values();
+    }
+
+    protected function calculateSplitVoucherDiscountAmount(object $voucher, float $eligibleBase): float
+    {
+        if ($eligibleBase <= 0) {
+            return 0;
+        }
+
+        $tipe = strtolower((string) ($voucher->tipe_diskon ?? 'nominal'));
+        $nilai = (float) ($voucher->total_diskon ?? 0);
+        $max = (float) ($voucher->total_diskon_maksimal ?? 0);
+
+        if (in_array($tipe, ['percent', 'persen', '%', '1'], true)) {
+            $amount = round(($eligibleBase * $nilai) / 100, 2);
+            if ($max > 0) {
+                $amount = min($amount, $max);
+            }
+            return min(max($amount, 0), $eligibleBase);
+        }
+
+        return min(max(round($nilai, 2), 0), $eligibleBase);
+    }
+
+    protected function distributeSplitVoucherAmountAcrossItems($items, float $amount): array
+    {
+        $items = collect($items)->values();
+        $base = (float) $items->sum(fn ($item) => $this->splitItemNetBase($item));
+        $amount = min(max(round($amount, 2), 0), max($base, 0));
+
+        if ($items->isEmpty() || $base <= 0 || $amount <= 0) {
+            return [];
+        }
+
+        $allocations = [];
+        $allocated = 0.0;
+        $lastIndex = $items->count() - 1;
+
+        foreach ($items as $index => $item) {
+            $itemBase = $this->splitItemNetBase($item);
+            $itemAmount = $index === $lastIndex
+                ? round($amount - $allocated, 2)
+                : round(($itemBase / $base) * $amount, 2);
+
+            $itemAmount = min(max($itemAmount, 0), $itemBase);
+            $allocated += $itemAmount;
+
+            if ($itemAmount <= 0) {
+                continue;
+            }
+
+            $allocations[] = [
+                'pembayaran_id' => (int) ($item->split_pembayaran_id ?? $item->pembayaran_id ?? 0),
+                'pembayaran_item_id' => (int) ($item->id ?? 0),
+                'amount' => $itemAmount,
+                'base' => $itemBase,
+            ];
+        }
+
+        return $allocations;
+    }
+
+    protected function distributeSplitVoucherAmountAcrossInvoices($items, float $amount): array
+    {
+        $groups = collect($items)
+            ->groupBy(fn ($item) => (int) ($item->split_pembayaran_id ?? $item->pembayaran_id ?? 0))
+            ->map(function ($rows, $invoiceId) {
+                return [
+                    'pembayaran_id' => (int) $invoiceId,
+                    'base' => (float) collect($rows)->sum(fn ($item) => $this->splitItemNetBase($item)),
+                ];
+            })
+            ->filter(fn ($row) => (float) $row['base'] > 0)
+            ->values();
+
+        $base = (float) $groups->sum('base');
+        $amount = min(max(round($amount, 2), 0), max($base, 0));
+
+        if ($groups->isEmpty() || $base <= 0 || $amount <= 0) {
+            return [];
+        }
+
+        $allocations = [];
+        $allocated = 0.0;
+        $lastIndex = $groups->count() - 1;
+
+        foreach ($groups as $index => $group) {
+            $groupAmount = $index === $lastIndex
+                ? round($amount - $allocated, 2)
+                : round(((float) $group['base'] / $base) * $amount, 2);
+
+            $groupAmount = min(max($groupAmount, 0), (float) $group['base']);
+            $allocated += $groupAmount;
+
+            if ($groupAmount <= 0) {
+                continue;
+            }
+
+            $allocations[] = [
+                'pembayaran_id' => (int) $group['pembayaran_id'],
+                'amount' => $groupAmount,
+                'base' => (float) $group['base'],
+            ];
+        }
+
+        return $allocations;
+    }
+
+    protected function insertSplitInvoicePromoRow(
+        int $invoiceId,
+        ?int $itemId,
+        object $voucher,
+        float $amount,
+        int $scopeType,
+        int $layerOrder,
+        string $scopeCode,
+        float $eligibleBaseAmount,
+        float $baseAfterPreviousPromo,
+        float $netAfterPromo
+    ): void {
+        if (!Schema::hasTable('pembayaran_invoice_promo') || $amount <= 0) {
+            return;
+        }
+
+        DB::table('pembayaran_invoice_promo')->insert($this->onlyExistingColumns('pembayaran_invoice_promo', [
+            'pembayaran_id' => $invoiceId,
+            'pembayaran_item_id' => $itemId,
+            'voucher_id' => $voucher->id,
+            'kode_voucher' => $voucher->kode_voucher ?? null,
+            'nama_voucher' => $voucher->nama_voucher ?? null,
+            'scope_type' => $scopeType,
+            'promo_scope_code' => $scopeCode,
+            'promo_layer_order' => $layerOrder,
+            'diskon_tipe' => $this->normalizePromoDiscountType($voucher->tipe_diskon ?? $voucher->diskon_tipe ?? 2),
+            'diskon_nilai' => $voucher->total_diskon ?? 0,
+            'diskon_amount' => round($amount, 2),
+            'eligible_base_amount' => round($eligibleBaseAmount, 2),
+            'base_after_previous_promo' => round($baseAfterPreviousPromo, 2),
+            'net_after_promo' => round($netAfterPromo, 2),
+            'final_net_attribution' => 0,
+            'attribution_method' => 'discount_weighted',
+            'catatan' => 'Validated by backend split finalizer',
+            'is_delete' => 0,
+            'created_by' => $this->username(),
+            'updated_by' => $this->username(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function updateSplitInvoicePromoAmount(PembayaranInvoice $invoice): void
+    {
+        if (!Schema::hasTable('pembayaran_invoice_promo')) {
+            return;
+        }
+
+        $totalPromo = (float) DB::table('pembayaran_invoice_promo')
+            ->where('pembayaran_id', $invoice->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->sum('diskon_amount');
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'total_promo' => round($totalPromo, 2),
+            'diskon_promo' => round($totalPromo, 2),
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
+    protected function updateSplitPromoAttribution(PembayaranInvoice $generalInvoice, PembayaranInvoice $depositInvoice): void
+    {
+        if (!Schema::hasTable('pembayaran_invoice_promo') || !Schema::hasColumn('pembayaran_invoice_promo', 'final_net_attribution')) {
+            return;
+        }
+
+        $invoiceIds = [(int) $generalInvoice->id, (int) $depositInvoice->id];
+        $promoRows = DB::table('pembayaran_invoice_promo')
+            ->whereIn('pembayaran_id', $invoiceIds)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->lockForUpdate()
+            ->get();
+
+        if ($promoRows->isEmpty()) {
+            return;
+        }
+
+        $totalDiscount = (float) $promoRows->sum(fn ($row) => (float) ($row->diskon_amount ?? 0));
+        if ($totalDiscount <= 0) {
+            return;
+        }
+
+        $generalInvoice->refresh();
+        $depositInvoice->refresh();
+
+        $totalNetRevenue = (float) ($generalInvoice->grand_total ?? 0) + (float) ($depositInvoice->grand_total ?? 0);
+        $allocated = 0.0;
+        $lastIndex = $promoRows->count() - 1;
+
+        foreach ($promoRows->values() as $index => $row) {
+            $amount = (float) ($row->diskon_amount ?? 0);
+            $attribution = $index === $lastIndex
+                ? round($totalNetRevenue - $allocated, 2)
+                : round(($amount / $totalDiscount) * $totalNetRevenue, 2);
+
+            $attribution = max($attribution, 0);
+            $allocated += $attribution;
+
+            DB::table('pembayaran_invoice_promo')
+                ->where('id', $row->id)
+                ->update($this->onlyExistingColumns('pembayaran_invoice_promo', [
+                    'final_net_attribution' => $attribution,
+                    'attribution_method' => 'discount_weighted',
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+        }
+    }
+
+    protected function redeemSplitVoucherCodeIfNeeded(
+        object $voucher,
+        PembayaranInvoice $generalInvoice,
+        PembayaranInvoice $depositInvoice,
+        array $reference = []
+    ): void {
+        if (!Schema::hasTable('master_voucher_diskon_kode')) {
+            return;
+        }
+
+        $kode = trim((string) ($reference['kode'] ?? $reference['kode_voucher'] ?? ''));
+        $query = DB::table('master_voucher_diskon_kode')
+            ->where('voucher_diskon_id', $voucher->id)
+            ->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($q) use ($generalInvoice, $depositInvoice) {
+                $q->where('status_kode', 1)
+                    ->orWhere(function ($sub) use ($generalInvoice, $depositInvoice) {
+                        $sub->where('status_kode', 2)
+                            ->whereIn('redeemed_invoice_no', array_filter([
+                                $generalInvoice->no_invoice,
+                                $depositInvoice->no_invoice,
+                                $generalInvoice->invoice_base_no,
+                                $depositInvoice->invoice_base_no,
+                            ]));
+                    });
+            });
+
+        if ($kode !== '') {
+            $query->where('kode_voucher', $kode);
+        }
+
+        $row = $query->orderBy('id')->lockForUpdate()->first();
+        if (!$row) {
+            return;
+        }
+
+        $redeemedInvoiceNo = $generalInvoice->invoice_base_no
+            ?: $depositInvoice->invoice_base_no
+            ?: $generalInvoice->no_invoice;
+
+        DB::table('master_voucher_diskon_kode')
+            ->where('id', $row->id)
+            ->update($this->onlyExistingColumns('master_voucher_diskon_kode', [
+                'status_kode' => 2,
+                'used_at' => now(),
+                'redeemed_invoice_no' => $redeemedInvoiceNo,
+                'redeemed_pasien_id' => $generalInvoice->pasien_id ?? $depositInvoice->pasien_id,
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]));
+    }
+
+    protected function splitItemNetBase($item): float
+    {
+        $subtotalAfter = (float) ($item->subtotal_after_diskon_subtotal ?? 0);
+        if ($subtotalAfter > 0) {
+            return $subtotalAfter;
+        }
+
+        $subtotalBefore = (float) ($item->subtotal_before_diskon_subtotal ?? 0);
+        $diskonSubtotal = (float) ($item->diskon_subtotal_amount ?? 0);
+        if ($subtotalBefore > 0) {
+            return max($subtotalBefore - $diskonSubtotal, 0);
+        }
+
+        return max((float) ($item->subtotal ?? $item->total ?? 0), 0);
+    }
+
+    protected function isSplitValueVoucher(object $voucher): bool
+    {
+        return (int) ($voucher->jenis_voucher_id ?? 0) === 4;
+    }
+
+    protected function resolveSplitPromoScopeCode(object $voucher): string
+    {
+        return match ((int) ($voucher->jenis_voucher_id ?? 0)) {
+            1 => 'TREATMENT',
+            2 => 'PRODUK',
+            3 => 'BUNDLING',
+            4 => 'VALUE',
+            default => 'ITEM',
+        };
     }
 
     protected function normalizeMetodePayloadForSplit(Request $request, float $totalGrandTotal): array
