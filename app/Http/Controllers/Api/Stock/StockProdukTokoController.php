@@ -2,478 +2,350 @@
 
 namespace App\Http\Controllers\Api\Stock;
 
-use App\Models\Stock\StockProdukToko;
-use App\Models\Stock\StockMutasiProduk;
 use App\Models\Master\MasterProdukToko;
-use App\Models\Master\MasterTempatProduk;
+use App\Models\Stock\StockMutasiProduk;
+use App\Models\Stock\StockProdukToko;
 use Illuminate\Http\Request;
 
 class StockProdukTokoController extends BaseStockController
 {
     public function index(Request $request)
     {
-        try {
-            $query = StockProdukToko::with([
-                    'produk',
-                    'produkToko',
-                    'toko',
-                    'tempatProduk',
-                ])
-                ->active();
+        $request->validate([
+            'toko_id' => 'required|integer',
+            'produk_id' => 'nullable',
+            'produk_toko_id' => 'nullable',
+            'keyword' => 'nullable|string|max:100',
+            'limit' => 'nullable|integer|min:1|max:500',
+            'per_page' => 'nullable|integer|min:1|max:500',
+        ]);
 
-            if ($request->filled('toko_id')) {
-                $query->where('toko_id', $request->toko_id);
+        $query = StockProdukToko::with([
+                'produkToko.produk',
+                'produk',
+                'toko',
+            ])
+            ->active()
+            ->where('toko_id', $request->toko_id);
+
+        if ($request->filled('produk_id')) {
+            $produkIds = is_array($request->produk_id)
+                ? $request->produk_id
+                : explode(',', (string) $request->produk_id);
+
+            $produkIds = array_values(array_filter($produkIds, function ($value) {
+                return $value !== null && $value !== '';
+            }));
+
+            if (!empty($produkIds)) {
+                $query->whereIn('produk_id', $produkIds);
             }
-
-            if ($request->filled('tempat_produk_id')) {
-                $query->where('tempat_produk_id', $request->tempat_produk_id);
-            }
-
-            if ($request->filled('produk_id')) {
-                $query->where('produk_id', $request->produk_id);
-            }
-
-            if ($request->filled('search')) {
-                $search = $request->search;
-
-                $query->whereHas('produk', function ($q) use ($search) {
-                    $q->where('nama', 'like', "%{$search}%")
-                        ->orWhere('kode_accurate', 'like', "%{$search}%");
-                });
-            }
-
-            $data = $query
-                ->orderBy('toko_id')
-                ->orderBy('tempat_produk_id')
-                ->orderBy('produk_id')
-                ->paginate($request->get('per_page', 15));
-
-            return $this->successResponse($data, 'Data stok berhasil diambil');
-        } catch (\Throwable $e) {
-            return $this->errorResponse('Gagal mengambil data stok', $e->getMessage());
         }
+
+        if ($request->filled('produk_toko_id')) {
+            $produkTokoIds = is_array($request->produk_toko_id)
+                ? $request->produk_toko_id
+                : explode(',', (string) $request->produk_toko_id);
+
+            $produkTokoIds = array_values(array_filter($produkTokoIds, function ($value) {
+                return $value !== null && $value !== '';
+            }));
+
+            if (!empty($produkTokoIds)) {
+                $query->whereIn('produk_toko_id', $produkTokoIds);
+            }
+        }
+
+        if ($request->filled('keyword')) {
+            $keyword = $request->keyword;
+            $query->where(function ($q) use ($keyword) {
+                $q->whereHas('produkToko.produk', function ($produkQuery) use ($keyword) {
+                    $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
+                        ->orWhere('nama', 'like', "%{$keyword}%")
+                        ->orWhere('kode_produk', 'like', "%{$keyword}%")
+                        ->orWhere('kode_obat', 'like', "%{$keyword}%");
+                })->orWhereHas('produk', function ($produkQuery) use ($keyword) {
+                    $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
+                        ->orWhere('nama', 'like', "%{$keyword}%")
+                        ->orWhere('kode_produk', 'like', "%{$keyword}%")
+                        ->orWhere('kode_obat', 'like', "%{$keyword}%");
+                });
+            });
+        }
+
+        $query->orderByDesc('stok_akhir')
+            ->orderByDesc('updated_at')
+            ->orderByDesc('id');
+
+        if ($request->filled('per_page')) {
+            $data = $query->paginate((int) $request->per_page);
+        } else {
+            $data = $query->limit((int) ($request->limit ?: 200))->get();
+        }
+
+        return $this->successResponse($data);
     }
 
     public function show($id)
     {
-        try {
-            $data = StockProdukToko::with([
-                    'produk',
-                    'produkToko',
-                    'toko',
-                    'tempatProduk',
-                ])
-                ->active()
-                ->findOrFail($id);
+        $stock = StockProdukToko::with([
+                'produkToko.produk',
+                'produk',
+                'toko',
+            ])
+            ->active()
+            ->findOrFail($id);
 
-            return $this->successResponse($data, 'Detail stok berhasil diambil');
-        } catch (\Throwable $e) {
-            return $this->errorResponse('Gagal mengambil detail stok', $e->getMessage(), 404);
-        }
+        return $this->successResponse($stock);
     }
 
     public function kartuStok(Request $request)
     {
         $request->validate([
             'toko_id' => 'required|integer',
-            'produk_toko_id' => 'required|integer',
-            'tempat_produk_id' => 'required|integer',
+            'produk_id' => 'nullable|integer',
+            'produk_toko_id' => 'nullable|integer',
             'tanggal_awal' => 'nullable|date',
             'tanggal_akhir' => 'nullable|date',
+            'limit' => 'nullable|integer|min:1|max:1000',
         ]);
 
-        try {
-            $query = StockMutasiProduk::with([
-                    'produk',
-                    'produkToko',
-                    'toko',
-                    'tempatProduk',
-                ])
-                ->where('toko_id', $request->toko_id)
-                ->where('produk_toko_id', $request->produk_toko_id)
-                ->where('tempat_produk_id', $request->tempat_produk_id)
-                ->notVoid();
-
-            if ($request->filled('tanggal_awal') && $request->filled('tanggal_akhir')) {
-                $query->whereBetween('tanggal', [
-                    $request->tanggal_awal . ' 00:00:00',
-                    $request->tanggal_akhir . ' 23:59:59',
-                ]);
-            }
-
-            $data = $query
-                ->orderBy('tanggal')
-                ->orderBy('id')
-                ->get();
-
-            return $this->successResponse($data, 'Kartu stok berhasil diambil');
-        } catch (\Throwable $e) {
-            return $this->errorResponse('Gagal mengambil kartu stok', $e->getMessage());
+        if (!$request->filled('produk_id') && !$request->filled('produk_toko_id')) {
+            return $this->errorResponse('Produk wajib dipilih.', [
+                'produk_id' => ['produk_id atau produk_toko_id wajib diisi.'],
+            ], 422);
         }
+
+        $produkToko = $this->resolveProdukTokoFromRequest($request);
+        $produkId = $request->filled('produk_id')
+            ? (int) $request->produk_id
+            : optional($produkToko)->produk_id;
+
+        if (!$produkId) {
+            return $this->errorResponse('Produk tidak ditemukan untuk toko yang dipilih.', [
+                'produk_id' => ['Produk tidak ditemukan.'],
+            ], 404);
+        }
+
+        $query = StockMutasiProduk::with([
+                'produkToko.produk',
+                'produk',
+                'toko',
+                'stockProdukToko',
+            ])
+            ->where('toko_id', $request->toko_id)
+            ->where('produk_id', $produkId)
+            ->notVoid();
+
+        if ($request->filled('tanggal_awal')) {
+            $query->whereDate('tanggal', '>=', $request->tanggal_awal);
+        }
+
+        if ($request->filled('tanggal_akhir')) {
+            $query->whereDate('tanggal', '<=', $request->tanggal_akhir);
+        }
+
+        $mutasi = $query->orderByDesc('tanggal')
+            ->orderByDesc('id')
+            ->limit((int) ($request->limit ?: 200))
+            ->get();
+
+        return $this->successResponse([
+            'produk_toko_id' => optional($produkToko)->id,
+            'produk_id' => $produkId,
+            'toko_id' => (int) $request->toko_id,
+            'items' => $mutasi,
+        ]);
     }
 
     public function stokTersedia(Request $request)
     {
         $request->validate([
             'toko_id' => 'required|integer',
-            'produk_toko_id' => 'required|integer',
-            'tempat_produk_id' => 'required|integer',
+            'produk_toko_id' => 'nullable|integer',
+            'produk_id' => 'nullable|integer',
         ]);
 
-        try {
-            /*
-            * Prioritas 1:
-            * Ambil stok resmi dari stock_produk_toko.
-            */
-            $stock = StockProdukToko::with([
-                    'produk',
-                    'produkToko',
-                    'tempatProduk',
-                ])
-                ->active()
-                ->where('toko_id', $request->toko_id)
-                ->where('produk_toko_id', $request->produk_toko_id)
-                ->where('tempat_produk_id', $request->tempat_produk_id)
-                ->first();
-
-            if ($stock) {
-                $stokAwal = (float) ($stock->stok_awal ?? 0);
-                $stokMasuk = (float) ($stock->stok_masuk ?? 0);
-                $stokKeluar = (float) ($stock->stok_keluar ?? 0);
-                $stokPenyesuaian = (float) ($stock->stok_penyesuaian ?? 0);
-                $stokAkhir = (float) ($stock->stok_akhir ?? 0);
-                $stokReserved = (float) ($stock->stok_reserved ?? 0);
-                $stokTersedia = max($stokAkhir - $stokReserved, 0);
-
-                return $this->successResponse([
-                    'id' => $stock->id,
-                    'produk_toko_id' => $stock->produk_toko_id,
-                    'produk_id' => $stock->produk_id,
-                    'toko_id' => $stock->toko_id,
-                    'tempat_produk_id' => $stock->tempat_produk_id,
-
-                    'stok_awal' => $stokAwal,
-                    'stok_masuk' => $stokMasuk,
-                    'stok_keluar' => $stokKeluar,
-                    'stok_penyesuaian' => $stokPenyesuaian,
-                    'stok_akhir' => $stokAkhir,
-                    'stok_reserved' => $stokReserved,
-                    'stok_tersedia' => $stokTersedia,
-                    'stok_minimum' => (float) ($stock->stok_minimum ?? 0),
-
-                    'harga_beli_terakhir' => (float) ($stock->harga_beli_terakhir ?? 0),
-                    'harga_jual_terakhir' => (float) ($stock->harga_jual_terakhir ?? 0),
-
-                    'sumber_stok' => 'stock_produk_toko',
-                    'belum_ada_saldo_stok' => 0,
-
-                    'produk' => $stock->produk,
-                    'produk_toko' => $stock->produkToko,
-                    'tempat_produk' => $stock->tempatProduk,
-                ], 'Stok tersedia berhasil diambil');
-            }
-
-            /*
-            * Prioritas 2:
-            * Jika belum ada record di stock_produk_toko,
-            * fallback ambil stok awal dari master_produk_toko.
-            *
-            * Ini mengikuti permintaan Tuan:
-            * "jika tidak ada di stock maka ambil stock dari master_produk".
-            *
-            * Secara struktur database, stok awalnya ada di master_produk_toko.
-            */
-            $produkToko = MasterProdukToko::with([
-                    'produk',
-                    'produk.tempatProduk',
-                    'toko',
-                    'supplier',
-                ])
-                ->active()
-                ->where('id', $request->produk_toko_id)
-                ->where('toko_id', $request->toko_id)
-                ->first();
-
-            if (!$produkToko) {
-                return $this->successResponse([
-                    'id' => null,
-                    'produk_toko_id' => $request->produk_toko_id,
-                    'produk_id' => null,
-                    'toko_id' => $request->toko_id,
-                    'tempat_produk_id' => $request->tempat_produk_id,
-
-                    'stok_awal' => 0,
-                    'stok_masuk' => 0,
-                    'stok_keluar' => 0,
-                    'stok_penyesuaian' => 0,
-                    'stok_akhir' => 0,
-                    'stok_reserved' => 0,
-                    'stok_tersedia' => 0,
-                    'stok_minimum' => 0,
-
-                    'harga_beli_terakhir' => 0,
-                    'harga_jual_terakhir' => 0,
-
-                    'sumber_stok' => 'produk_toko_tidak_ditemukan',
-                    'belum_ada_saldo_stok' => 1,
-
-                    'produk' => null,
-                    'produk_toko' => null,
-                    'tempat_produk' => null,
-                ], 'Produk toko tidak ditemukan');
-            }
-
-            $produk = $produkToko->produk;
-
-            $stokAwalMaster = (float) ($produkToko->stok_awal ?? 0);
-            $stokReserved = 0;
-            $stokTersedia = max($stokAwalMaster - $stokReserved, 0);
-
-            /*
-            * Karena belum ada stock_produk_toko,
-            * stok_akhir sementara disamakan dengan stok_awal master.
-            */
-            return $this->successResponse([
-                'id' => null,
-                'produk_toko_id' => $produkToko->id,
-                'produk_id' => $produkToko->produk_id,
-                'toko_id' => $produkToko->toko_id,
-                'tempat_produk_id' => $request->tempat_produk_id,
-
-                'stok_awal' => $stokAwalMaster,
-                'stok_masuk' => 0,
-                'stok_keluar' => 0,
-                'stok_penyesuaian' => 0,
-                'stok_akhir' => $stokAwalMaster,
-                'stok_reserved' => $stokReserved,
-                'stok_tersedia' => $stokTersedia,
-                'stok_minimum' => (float) ($produkToko->stok_minimum ?? 0),
-
-                'harga_beli_terakhir' => (float) ($produkToko->harga_beli ?? 0),
-                'harga_jual_terakhir' => (float) ($produkToko->harga_jual ?? 0),
-
-                'sumber_stok' => 'master_produk_toko',
-                'belum_ada_saldo_stok' => 1,
-
-                'produk' => $produk,
-                'produk_toko' => $produkToko,
-                'tempat_produk' => $produk?->tempatProduk ?? null,
-            ], 'Stok diambil dari master produk toko');
-        } catch (\Throwable $e) {
-            return $this->errorResponse('Gagal mengambil stok tersedia', $e->getMessage());
+        if (!$request->filled('produk_id') && !$request->filled('produk_toko_id')) {
+            return $this->errorResponse('Produk wajib dipilih.', [
+                'produk_id' => ['produk_id atau produk_toko_id wajib diisi.'],
+            ], 422);
         }
+
+        $produkToko = $this->resolveProdukTokoFromRequest($request);
+        $produkId = $request->filled('produk_id')
+            ? (int) $request->produk_id
+            : optional($produkToko)->produk_id;
+
+        if (!$produkId) {
+            return $this->errorResponse('Produk tidak ditemukan untuk toko yang dipilih.', [
+                'produk_id' => ['Produk tidak ditemukan.'],
+            ], 404);
+        }
+
+        $stockRows = StockProdukToko::with([
+                'produkToko.produk',
+                'produk',
+                'toko',
+            ])
+            ->active()
+            ->where('toko_id', $request->toko_id)
+            ->where('produk_id', $produkId)
+            ->when($produkToko, function ($query) use ($produkToko) {
+                $query->where(function ($q) use ($produkToko) {
+                    $q->where('produk_toko_id', $produkToko->id)
+                        ->orWhereNull('produk_toko_id');
+                });
+            })
+            ->get();
+
+        $stock = $stockRows->sortByDesc('updated_at')->first();
+
+        return $this->successResponse([
+            'produk_toko_id' => optional($produkToko)->id,
+            'produk_id' => $produkId,
+            'toko_id' => (int) $request->toko_id,
+            'stok_awal' => $stockRows->sum('stok_awal'),
+            'stok_masuk' => $stockRows->sum('stok_masuk'),
+            'stok_keluar' => $stockRows->sum('stok_keluar'),
+            'stok_penyesuaian' => $stockRows->sum('stok_penyesuaian'),
+            'stok_akhir' => $stockRows->sum('stok_akhir'),
+            'stok_reserved' => $stockRows->sum('stok_reserved'),
+            'stok_tersedia' => $stockRows->sum('stok_tersedia') ?: max($stockRows->sum('stok_akhir') - $stockRows->sum('stok_reserved'), 0),
+            'produk_toko' => $stock ? $stock->produkToko : $produkToko,
+            'produk' => $stock ? $stock->produk : optional($produkToko)->produk,
+            'stock' => $stock,
+            'stock_rows' => $stockRows,
+        ]);
     }
 
     public function stockHariIni(Request $request)
     {
         $request->validate([
             'toko_id' => 'required|integer',
-            'tempat_produk_id' => 'nullable|integer',
-            'search' => 'nullable|string',
-            'per_page' => 'nullable|integer|min:1|max:100',
+            'keyword' => 'nullable|string|max:100',
+            'limit' => 'nullable|integer|min:1|max:1000',
         ]);
 
-        try {
-            $tokoId = (int) $request->toko_id;
-            $tempatProdukId = $request->filled('tempat_produk_id')
-                ? (int) $request->tempat_produk_id
-                : null;
+        $tokoId = (int) $request->toko_id;
+        $limit = (int) ($request->limit ?: 500);
 
-            $perPage = (int) $request->get('per_page', 10);
+        $produkQuery = MasterProdukToko::with(['produk', 'toko'])
+            ->active()
+            ->where('toko_id', $tokoId);
 
-            $tempatMap = MasterTempatProduk::query()
-                ->active()
-                ->pluck('nama_tempat_produk', 'id')
-                ->toArray();
-
-            $query = MasterProdukToko::query()
-                ->with([
-                    'produk' => function ($q) {
-                        $q->select([
-                            'id',
-                            'kode_accurate',
-                            'nama',
-                            'tempat_produk_id',
-                            'kategori_produk_id',
-                            'golongan_produk_id',
-                            'is_delete',
-                        ]);
-                    },
-                    'produk.tempatProduk',
-                    'stockProdukToko' => function ($q) use ($tokoId, $tempatProdukId) {
-                        $q->active()
-                            ->where('toko_id', $tokoId);
-
-                        if ($tempatProdukId) {
-                            $q->where('tempat_produk_id', $tempatProdukId);
-                        }
-                    },
-                    'stockProdukToko.tempatProduk',
-                ])
-                ->active()
-                ->where('toko_id', $tokoId)
-                ->whereHas('produk', function ($q) {
-                    $q->where(function ($sub) {
-                        $sub->where('is_delete', 0)
-                            ->orWhereNull('is_delete');
-                    });
+        if ($request->filled('keyword')) {
+            $keyword = $request->keyword;
+            $produkQuery->where(function ($q) use ($keyword) {
+                $q->whereHas('produk', function ($produkQuery) use ($keyword) {
+                    $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
+                        ->orWhere('nama', 'like', "%{$keyword}%")
+                        ->orWhere('kode_produk', 'like', "%{$keyword}%")
+                        ->orWhere('kode_obat', 'like', "%{$keyword}%");
                 });
+            });
+        }
 
-            if ($tempatProdukId) {
-                $query->where(function ($q) use ($tokoId, $tempatProdukId) {
-                    $q->whereHas('produk', function ($produkQuery) use ($tempatProdukId) {
-                        $produkQuery->where(function ($sub) use ($tempatProdukId) {
-                            $sub->where('tempat_produk_id', $tempatProdukId);
+        $produkToko = $produkQuery->orderByDesc('id')
+            ->limit($limit)
+            ->get();
 
-                            if ((int) $tempatProdukId === 1) {
-                                $sub->orWhereNull('tempat_produk_id');
-                            }
-                        });
-                    })
-                    ->orWhereHas('stockProdukToko', function ($stockQuery) use ($tokoId, $tempatProdukId) {
-                        $stockQuery->active()
-                            ->where('toko_id', $tokoId)
-                            ->where('tempat_produk_id', $tempatProdukId);
-                    });
-                });
-            }
+        $produkTokoIds = $produkToko->pluck('id')->filter()->values();
+        $produkIds = $produkToko->pluck('produk_id')->filter()->unique()->values();
 
-            if ($request->filled('search')) {
-                $search = $request->search;
+        $stockQuery = StockProdukToko::query()
+            ->active()
+            ->where('toko_id', $tokoId);
 
-                $query->whereHas('produk', function ($q) use ($search) {
-                    $q->where('nama', 'like', "%{$search}%")
-                        ->orWhere('kode_accurate', 'like', "%{$search}%");
-                });
-            }
+        if ($produkTokoIds->isNotEmpty()) {
+            $stockQuery->where(function ($query) use ($produkTokoIds, $produkIds) {
+                $query->whereIn('produk_toko_id', $produkTokoIds);
 
-            $data = $query
-                ->orderBy(
-                    MasterProdukToko::query()
-                        ->getModel()
-                        ->getTable() . '.id',
-                    'asc'
-                )
-                ->paginate($perPage);
-
-            $data->getCollection()->transform(function ($produkToko) use ($tempatProdukId, $tempatMap) {
-                $produk = $produkToko->produk;
-
-                $stock = $produkToko->stockProdukToko
-                    ->sortByDesc('id')
-                    ->first();
-
-                $resolvedTempatId = $stock
-                    ? $stock->tempat_produk_id
-                    : ($produk->tempat_produk_id ?? 1);
-
-                if ($tempatProdukId) {
-                    $resolvedTempatId = $tempatProdukId;
+                if ($produkIds->isNotEmpty()) {
+                    $query->orWhereIn('produk_id', $produkIds);
                 }
+            });
+        } elseif ($produkIds->isNotEmpty()) {
+            $stockQuery->whereIn('produk_id', $produkIds);
+        }
 
-                /*
-                * Aturan:
-                * - Jika stock_produk_toko ada, stok berjalan ambil dari stock_produk_toko.
-                * - Jika stock_produk_toko belum ada, stok berjalan fallback dari master_produk_toko.stok_awal.
-                * - stok_awal tampilan selalu ambil dari master_produk_toko.stok_awal.
-                */
-                $stokAwalMaster = (float) ($produkToko->stok_awal ?? 0);
-
-                if ($stock) {
-                    $stokAwal = $stokAwalMaster;
-                    $stokMasuk = (float) ($stock->stok_masuk ?? 0);
-                    $stokKeluar = (float) ($stock->stok_keluar ?? 0);
-                    $stokPenyesuaian = (float) ($stock->stok_penyesuaian ?? 0);
-                    $stokAkhir = (float) ($stock->stok_akhir ?? 0);
-                    $stokReserved = (float) ($stock->stok_reserved ?? 0);
-
-                    $stokMinimum = (float) ($stock->stok_minimum ?? $produkToko->stok_minimum ?? 0);
-                    $hargaBeliTerakhir = (float) ($stock->harga_beli_terakhir ?? $produkToko->harga_beli ?? 0);
-                    $hargaJualTerakhir = (float) ($stock->harga_jual_terakhir ?? $produkToko->harga_jual ?? 0);
-
-                    $lastMutationAt = $stock->last_mutation_at;
-                    $belumAdaSaldoStok = 0;
-                    $sumberStok = 'stock_produk_toko';
-                    $stockProdukTokoId = $stock->id;
-                } else {
-                    $stokAwal = $stokAwalMaster;
-                    $stokMasuk = 0;
-                    $stokKeluar = 0;
-                    $stokPenyesuaian = 0;
-                    $stokAkhir = $stokAwalMaster;
-                    $stokReserved = 0;
-
-                    $stokMinimum = (float) ($produkToko->stok_minimum ?? 0);
-                    $hargaBeliTerakhir = (float) ($produkToko->harga_beli ?? 0);
-                    $hargaJualTerakhir = (float) ($produkToko->harga_jual ?? 0);
-
-                    $lastMutationAt = null;
-                    $belumAdaSaldoStok = 1;
-                    $sumberStok = 'master_produk_toko';
-                    $stockProdukTokoId = null;
-                }
-
-                $stokTersedia = max($stokAkhir - $stokReserved, 0);
-
-                $isStokHabis = $stokTersedia <= 0 ? 1 : 0;
-                $isStokMinimum = $stokTersedia > 0 && $stokMinimum > 0 && $stokTersedia <= $stokMinimum ? 1 : 0;
-
-                if ($isStokHabis) {
-                    $statusStok = 'KOSONG';
-                } elseif ($isStokMinimum) {
-                    $statusStok = 'MINIMUM';
-                } else {
-                    $statusStok = 'AMAN';
-                }
-
-                return [
-                    'id' => $stockProdukTokoId ?: 'master-' . $produkToko->id . '-' . $resolvedTempatId,
-
-                    'produk_toko_id' => $produkToko->id,
-                    'produk_id' => $produkToko->produk_id,
-                    'toko_id' => $produkToko->toko_id,
-
-                    'tempat_produk_id' => $resolvedTempatId,
-                    'nama_tempat_produk' => $stock && $stock->tempatProduk
-                        ? $stock->tempatProduk->nama_tempat_produk
-                        : ($tempatMap[$resolvedTempatId] ?? '-'),
-
-                    'kode_produk' => $produk->kode_accurate ?? '-',
-                    'nama_produk' => $produk->nama ?? '-',
-
-                    'harga_jual' => (float) ($produkToko->harga_jual ?? 0),
-                    'harga_beli' => (float) ($produkToko->harga_beli ?? 0),
-
-                    'stok_awal' => $stokAwal,
-                    'stok_masuk' => $stokMasuk,
-                    'stok_keluar' => $stokKeluar,
-                    'stok_penyesuaian' => $stokPenyesuaian,
-                    'stok_akhir' => $stokAkhir,
-                    'stok_reserved' => $stokReserved,
-                    'stok_tersedia' => $stokTersedia,
-                    'stok_minimum' => $stokMinimum,
-
-                    'harga_beli_terakhir' => $hargaBeliTerakhir,
-                    'harga_jual_terakhir' => $hargaJualTerakhir,
-
-                    'last_mutation_at' => $lastMutationAt,
-
-                    'belum_ada_saldo_stok' => $belumAdaSaldoStok,
-                    'sumber_stok' => $sumberStok,
-
-                    'is_stok_habis' => $isStokHabis,
-                    'is_stok_minimum' => $isStokMinimum,
-                    'status_stok' => $statusStok,
-
-                    'produk' => $produk,
-                    'produk_toko' => $produkToko,
-                    'stock_produk_toko' => $stock,
-                ];
+        $stockRows = $stockQuery->get()
+            ->groupBy(function ($stock) {
+                return $stock->produk_toko_id ?: 'produk-' . $stock->produk_id;
             });
 
-            return $this->successResponse($data, 'Stock hari ini berhasil diambil');
-        } catch (\Throwable $e) {
-            return $this->errorResponse('Gagal mengambil stock hari ini', $e->getMessage());
+        $items = $produkToko->map(function ($produk) use ($stockRows) {
+            $stockByProdukToko = $stockRows->get($produk->id, collect());
+            $stockByProdukId = $stockRows->get('produk-' . $produk->produk_id, collect());
+            $stockCollection = $stockByProdukToko->merge($stockByProdukId);
+
+            $latestStock = $stockCollection->sortByDesc('updated_at')->first();
+
+            $stokAkhir = $stockCollection->sum('stok_akhir');
+            $stokReserved = $stockCollection->sum('stok_reserved');
+            $stokTersedia = $stockCollection->sum('stok_tersedia');
+
+            if (!$stokTersedia && $stokAkhir > 0) {
+                $stokTersedia = max($stokAkhir - $stokReserved, 0);
+            }
+
+            $produkMaster = $produk->produk;
+            $namaProduk = optional($produkMaster)->nama_produk
+                ?: optional($produkMaster)->nama
+                ?: $produk->nama_produk
+                ?: $produk->nama
+                ?: '-';
+
+            return [
+                'id' => optional($latestStock)->id,
+                'produk_toko_id' => $produk->id,
+                'produk_id' => $produk->produk_id,
+                'toko_id' => $produk->toko_id,
+                'kode_produk' => optional($produkMaster)->kode_produk ?: optional($produkMaster)->kode_obat ?: $produk->kode_produk ?: $produk->kode_obat,
+                'nama_produk' => $namaProduk,
+                'satuan' => optional($produkMaster)->satuan ?: optional($produkMaster)->unit ?: $produk->satuan,
+                'stok_awal' => $stockCollection->sum('stok_awal'),
+                'stok_masuk' => $stockCollection->sum('stok_masuk'),
+                'stok_keluar' => $stockCollection->sum('stok_keluar'),
+                'stok_penyesuaian' => $stockCollection->sum('stok_penyesuaian'),
+                'stok_akhir' => $stokAkhir,
+                'stok_reserved' => $stokReserved,
+                'stok_tersedia' => $stokTersedia,
+                'stok_minimal' => optional($latestStock)->stok_minimal ?: optional($latestStock)->stok_minimum ?: 0,
+                'harga_beli' => $produk->harga_beli,
+                'harga_jual' => $produk->harga_jual,
+                'produk_toko' => $produk,
+                'produk' => $produkMaster,
+                'updated_at' => optional($latestStock)->updated_at,
+            ];
+        })->values();
+
+        return $this->successResponse($items);
+    }
+
+    private function resolveProdukTokoFromRequest(Request $request): ?MasterProdukToko
+    {
+        $query = MasterProdukToko::with(['produk'])
+            ->active()
+            ->where('toko_id', $request->toko_id);
+
+        if ($request->filled('produk_toko_id')) {
+            $produkToko = (clone $query)
+                ->where('id', $request->produk_toko_id)
+                ->first();
+
+            if ($produkToko) {
+                return $produkToko;
+            }
         }
+
+        if ($request->filled('produk_id')) {
+            return $query
+                ->where('produk_id', $request->produk_id)
+                ->orderByDesc('id')
+                ->first();
+        }
+
+        return null;
     }
 }
