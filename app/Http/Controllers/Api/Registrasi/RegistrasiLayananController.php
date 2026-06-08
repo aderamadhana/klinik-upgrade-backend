@@ -769,6 +769,9 @@ class RegistrasiLayananController extends Controller
             'konsultasi_online.produk_sebelumnya' => 'nullable|string',
             'konsultasi_online.sedang_hamil' => 'nullable',
             'konsultasi_online.sedang_menyusui' => 'nullable',
+            'konsultasi_online.bukti_foto_kiri' => 'nullable|file|mimes:jpg,jpeg,png,webp|max:5120',
+            'konsultasi_online.bukti_foto_depan' => 'nullable|file|mimes:jpg,jpeg,png,webp|max:5120',
+            'konsultasi_online.bukti_foto_kanan' => 'nullable|file|mimes:jpg,jpeg,png,webp|max:5120',
 
             'treatment' => 'nullable|array',
             'treatment.items' => 'nullable|array',
@@ -1080,6 +1083,13 @@ class RegistrasiLayananController extends Controller
                 );
 
                 $this->reservePenjualanStock($registrasi, $createdPenjualanDetails);
+            }
+
+            if (
+                $adaKonsultasi
+                && (int) $channelKonsultasi === RegistrasiKunjungan::CHANNEL_ONLINE
+            ) {
+                $this->saveKonsultasiOnlineIntake($request, $registrasi);
             }
 
             DB::commit();
@@ -1709,6 +1719,363 @@ class RegistrasiLayananController extends Controller
                 'error' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    public function riwayatKonsultasiPasien(Request $request, $pasien)
+    {
+        $limit = (int) $request->get('limit', 10);
+        $limit = max(1, min($limit, 50));
+
+        $pasienRow = Pasien::query()
+            ->where(function ($query) {
+                $query->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            })
+            ->findOrFail($pasien);
+
+        $registrasiRows = RegistrasiKunjungan::query()
+            ->with([
+                'toko:id,nama_toko',
+                'dokterAwal:id,nama',
+                'perawatAwal:id,nama',
+            ])
+            ->active()
+            ->where('pasien_id', $pasienRow->id)
+            ->where(function ($query) {
+                $query->whereIn('channel_konsultasi', [1, 2])
+                    ->orWhereNotNull('konsultasi_source_code')
+                    ->orWhereExists(function ($subQuery) {
+                        $subQuery->select(DB::raw(1))
+                            ->from('registrasi_konsultasi_intake')
+                            ->whereColumn(
+                                'registrasi_konsultasi_intake.registrasi_id',
+                                'registrasi_kunjungan.id'
+                            );
+                    })
+                    ->orWhereExists(function ($subQuery) {
+                        $subQuery->select(DB::raw(1))
+                            ->from('registrasi_dokter_soap')
+                            ->whereColumn(
+                                'registrasi_dokter_soap.registrasi_id',
+                                'registrasi_kunjungan.id'
+                            )
+                            ->where(function ($statusQuery) {
+                                $statusQuery->where('registrasi_dokter_soap.status', '<>', 9)
+                                    ->orWhereNull('registrasi_dokter_soap.status');
+                            });
+                    });
+            })
+            ->orderByDesc('tanggal_kunjungan')
+            ->orderByDesc('id')
+            ->limit($limit)
+            ->get();
+
+        $registrasiIds = $registrasiRows->pluck('id')->filter()->values();
+
+        if ($registrasiIds->isEmpty()) {
+            return response()->json([
+                'status' => true,
+                'message' => 'Riwayat konsultasi pasien berhasil diambil',
+                'data' => [],
+            ]);
+        }
+
+        $getGroupedRows = function (string $table) use ($registrasiIds) {
+            if (!Schema::hasTable($table)) {
+                return collect();
+            }
+
+            $query = DB::table($table)
+                ->whereIn('registrasi_id', $registrasiIds);
+
+            if (Schema::hasColumn($table, 'is_delete')) {
+                $query->where(function ($subQuery) use ($table) {
+                    $subQuery->where($table . '.is_delete', 0)
+                        ->orWhereNull($table . '.is_delete');
+                });
+            }
+
+            if (Schema::hasColumn($table, 'status')) {
+                $query->where(function ($subQuery) use ($table) {
+                    $subQuery->where($table . '.status', '<>', 9)
+                        ->orWhereNull($table . '.status');
+                });
+            }
+
+            return $query
+                ->orderBy('id')
+                ->get()
+                ->groupBy('registrasi_id');
+        };
+
+        $intakeRows = $getGroupedRows('registrasi_konsultasi_intake')
+            ->map(function ($rows) {
+                return $rows->last();
+            });
+
+        $soapRows = $getGroupedRows('registrasi_dokter_soap')
+            ->map(function ($rows) {
+                return $rows->last();
+            });
+
+        $soapIds = $soapRows->pluck('id')->filter()->values();
+
+        $soapSubjectives = collect();
+        if ($soapIds->isNotEmpty() && Schema::hasTable('registrasi_dokter_soap_subjective')) {
+            $soapSubjectives = DB::table('registrasi_dokter_soap_subjective')
+                ->whereIn('soap_id', $soapIds)
+                ->orderBy('sort_order')
+                ->orderBy('id')
+                ->get()
+                ->groupBy('soap_id');
+        }
+
+        $soapDiagnosas = collect();
+        if ($soapIds->isNotEmpty() && Schema::hasTable('registrasi_dokter_soap_diagnosa')) {
+            $soapDiagnosas = DB::table('registrasi_dokter_soap_diagnosa')
+                ->whereIn('soap_id', $soapIds)
+                ->orderBy('sort_order')
+                ->orderBy('id')
+                ->get()
+                ->groupBy('soap_id');
+        }
+
+        $treatmentRows = $getGroupedRows('registrasi_treatment_detail');
+        $penjualanRows = $getGroupedRows('registrasi_penjualan_detail');
+        $resepRows = $getGroupedRows('registrasi_dokter_resep_detail');
+
+        $soapDoctorIds = $soapRows
+            ->pluck('dokter_id')
+            ->filter()
+            ->unique()
+            ->values();
+
+        $soapDoctorNames = collect();
+        if ($soapDoctorIds->isNotEmpty() && Schema::hasTable('master_karyawan')) {
+            $soapDoctorNames = DB::table('master_karyawan')
+                ->whereIn('id', $soapDoctorIds)
+                ->pluck('nama', 'id');
+        }
+
+        $treatmentKaryawanIds = $treatmentRows
+            ->flatMap(function ($rows) {
+                return $rows;
+            })
+            ->pluck('source_karyawan_id')
+            ->filter()
+            ->unique()
+            ->values();
+
+        $treatmentKaryawanNames = collect();
+        if ($treatmentKaryawanIds->isNotEmpty() && Schema::hasTable('master_karyawan')) {
+            $treatmentKaryawanNames = DB::table('master_karyawan')
+                ->whereIn('id', $treatmentKaryawanIds)
+                ->pluck('nama', 'id');
+        }
+
+        $formatQty = function ($qty) {
+            $qty = (float) $qty;
+
+            if ($qty <= 1) {
+                return '';
+            }
+
+            return ' x ' . rtrim(rtrim(number_format($qty, 2, '.', ''), '0'), '.');
+        };
+
+        $smallLine = function ($value) {
+            $value = trim((string) $value);
+
+            if ($value === '') {
+                return '';
+            }
+
+            return '<br><small>' . nl2br(e($value)) . '</small>';
+        };
+
+        $pushCatatan = function (array &$rows, string $label, $value) {
+            $value = trim((string) $value);
+
+            if ($value === '') {
+                return;
+            }
+
+            $rows[] = '<div><strong>' . e($label) . ':</strong> ' . nl2br(e($value)) . '</div>';
+        };
+
+        $data = $registrasiRows->map(function ($row) use (
+            $intakeRows,
+            $soapRows,
+            $soapSubjectives,
+            $soapDiagnosas,
+            $treatmentRows,
+            $penjualanRows,
+            $resepRows,
+            $soapDoctorNames,
+            $treatmentKaryawanNames,
+            $formatQty,
+            $smallLine,
+            $pushCatatan
+        ) {
+            $intake = $intakeRows->get($row->id);
+            $soap = $soapRows->get($row->id);
+
+            $tindakanHtml = collect($treatmentRows->get($row->id, collect()))
+                ->map(function ($item) use ($formatQty, $smallLine, $treatmentKaryawanNames) {
+                    $nama = trim((string) ($item->nama_treatment ?? ''));
+
+                    if ($nama === '') {
+                        return null;
+                    }
+
+                    $html = '<div>' . e($nama . $formatQty($item->jumlah ?? 1));
+
+                    $perawatNama = !empty($item->source_karyawan_id)
+                        ? ($treatmentKaryawanNames[$item->source_karyawan_id] ?? null)
+                        : null;
+
+                    if ($perawatNama) {
+                        $html .= $smallLine('Perawat: ' . $perawatNama);
+                    } elseif (
+                        (int) ($item->perlu_tindakan_perawat ?? 0) === 1 ||
+                        strtolower((string) ($item->route_treatment ?? '')) === 'nurse_station'
+                    ) {
+                        $html .= $smallLine('Perawat: Perlu tindakan perawat');
+                    }
+
+                    if (!empty($item->catatan)) {
+                        $html .= $smallLine('Catatan: ' . $item->catatan);
+                    }
+
+                    $html .= '</div>';
+
+                    return $html;
+                })
+                ->filter()
+                ->implode('');
+
+            $obatHtmlRows = [];
+
+            foreach (collect($penjualanRows->get($row->id, collect())) as $item) {
+                $nama = trim((string) ($item->nama_produk ?? ''));
+
+                if ($nama === '') {
+                    continue;
+                }
+
+                $usageParts = array_filter([
+                    $item->frekuensi_penggunaan ?? null,
+                    $item->waktu_penggunaan ?? null,
+                    $item->instruksi_pemakaian ?? null,
+                ]);
+
+                $html = '<div>' . e($nama . $formatQty($item->jumlah ?? 1));
+
+                if (!empty($usageParts)) {
+                    $html .= $smallLine(implode(' - ', $usageParts));
+                }
+
+                $html .= '</div>';
+
+                $obatHtmlRows[] = $html;
+            }
+
+            foreach (collect($resepRows->get($row->id, collect())) as $item) {
+                $nama = trim((string) ($item->nama_produk ?? ''));
+
+                if ($nama === '') {
+                    continue;
+                }
+
+                $usageParts = array_filter([
+                    $item->frekuensi ?? null,
+                    $item->waktu_pakai ?? null,
+                    $item->penggunaan ?? null,
+                ]);
+
+                $html = '<div>' . e($nama . $formatQty($item->jumlah ?? 1));
+
+                if (!empty($usageParts)) {
+                    $html .= $smallLine(implode(' - ', $usageParts));
+                }
+
+                $html .= '</div>';
+
+                $obatHtmlRows[] = $html;
+            }
+
+            $catatanRows = [];
+
+            if ($intake) {
+                $pushCatatan($catatanRows, 'Keluhan', $intake->keluhan_utama ?? $intake->keluhan_awal ?? null);
+                $pushCatatan($catatanRows, 'Alergi', $intake->alergi ?? null);
+                $pushCatatan($catatanRows, 'Produk sebelumnya', $intake->produk_obat_sebelumnya ?? null);
+                $pushCatatan($catatanRows, 'Catatan CS', $intake->catatan_cs ?? null);
+                $pushCatatan($catatanRows, 'Catatan awal', $intake->catatan_awal ?? null);
+            }
+
+            if ($soap) {
+                $subjectiveText = collect($soapSubjectives->get($soap->id, collect()))
+                    ->map(function ($item) {
+                        return trim((string) ($item->subjective_text ?? ''));
+                    })
+                    ->filter()
+                    ->implode(', ');
+
+                $diagnosaText = collect($soapDiagnosas->get($soap->id, collect()))
+                    ->map(function ($item) {
+                        return trim((string) ($item->diagnosa_text ?? ''));
+                    })
+                    ->filter()
+                    ->implode(', ');
+
+                $pushCatatan($catatanRows, 'Subjective', $subjectiveText);
+                $pushCatatan($catatanRows, 'Subjective lainnya', $soap->subjective_lainnya ?? null);
+                $pushCatatan($catatanRows, 'Objective', $soap->objective ?? null);
+                $pushCatatan($catatanRows, 'Diagnosa', $diagnosaText);
+                $pushCatatan($catatanRows, 'Assessment lainnya', $soap->assessment_lainnya ?? null);
+                $pushCatatan($catatanRows, 'Plan', $soap->plan ?? null);
+
+                if (!empty($soap->next_konsultasi_date)) {
+                    $pushCatatan(
+                        $catatanRows,
+                        'Next konsultasi',
+                        Carbon::parse($soap->next_konsultasi_date)->format('d/m/Y')
+                    );
+                }
+            }
+
+            $dokterNama = optional($row->dokterAwal)->nama;
+
+            if (!$dokterNama && $soap && !empty($soap->dokter_id)) {
+                $dokterNama = $soapDoctorNames[$soap->dokter_id] ?? null;
+            }
+
+            if (!$dokterNama && $intake) {
+                $dokterNama = $intake->request_dokter_nama ?? null;
+            }
+
+            $tanggal = Carbon::parse($row->tanggal_kunjungan);
+
+            return [
+                'id' => $row->id,
+                'registrasi_id' => $row->id,
+                'kode_registrasi' => $row->kode_registrasi,
+                'tgl' => $tanggal->format('d/m/Y'),
+                'tanggal' => $tanggal->format('Y-m-d'),
+                'dokter' => $dokterNama ?: '-',
+                'tindakan_html' => $tindakanHtml ?: '-',
+                'obat_html' => implode('', $obatHtmlRows) ?: '-',
+                'catatan_html' => implode('', $catatanRows) ?: '-',
+                'lokasi' => optional($row->toko)->nama_toko ?: '-',
+            ];
+        })->values();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Riwayat konsultasi pasien berhasil diambil',
+            'data' => $data,
+        ]);
     }
 
     private function isRegistrasiKonsultasiOnline(RegistrasiKunjungan $registrasi): bool
@@ -2660,5 +3027,172 @@ class RegistrasiLayananController extends Controller
         return auth()->user()->username
             ?? auth()->user()->name
             ?? 'system';
+    }
+
+    private function saveKonsultasiOnlineIntake(Request $request, RegistrasiKunjungan $registrasi): void
+    {
+        $payload = $request->input('konsultasi_online', []);
+
+        [$requestDokterId, $requestDokterNama] = $this->resolveRequestDokterOnline(
+            $payload['request_dokter'] ?? null
+        );
+
+        $intake = RegistrasiKonsultasiIntake::query()->updateOrCreate(
+            [
+                'registrasi_id' => $registrasi->id,
+            ],
+            [
+                'request_dokter_id' => $requestDokterId,
+                'request_dokter_nama' => $requestDokterNama,
+                'alergi' => $this->emptyToNull($payload['alergi'] ?? null),
+                'keluhan_utama' => $this->emptyToNull($payload['keluhan'] ?? null),
+                'produk_obat_sebelumnya' => $this->emptyToNull($payload['produk_sebelumnya'] ?? null),
+                'sedang_hamil' => $this->toNullableTinyBool($payload['sedang_hamil'] ?? null),
+                'sedang_menyusui' => $this->toNullableTinyBool($payload['sedang_menyusui'] ?? null),
+                'jenis_konsultasi' => RegistrasiKonsultasiIntake::JENIS_ONLINE,
+                'keluhan_awal' => $this->emptyToNull($payload['keluhan'] ?? null),
+                'catatan_awal' => $this->emptyToNull($request->input('catatan_registrasi')),
+                'status' => RegistrasiKonsultasiIntake::STATUS_MENUNGGU,
+                'created_by' => $this->username(),
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]
+        );
+
+        $this->saveKonsultasiOnlineFotos($request, $registrasi, $intake);
+    }
+
+    private function saveKonsultasiOnlineFotos(
+        Request $request,
+        RegistrasiKunjungan $registrasi,
+        RegistrasiKonsultasiIntake $intake
+    ): void {
+        $photoFields = [
+            RegistrasiKonsultasiFoto::POSISI_KIRI => 'bukti_foto_kiri',
+            RegistrasiKonsultasiFoto::POSISI_DEPAN => 'bukti_foto_depan',
+            RegistrasiKonsultasiFoto::POSISI_KANAN => 'bukti_foto_kanan',
+        ];
+
+        foreach ($photoFields as $position => $field) {
+            $file = $this->getKonsultasiOnlineFile($request, $field);
+
+            if (!$file) {
+                continue;
+            }
+
+            $oldPhoto = RegistrasiKonsultasiFoto::query()
+                ->where('registrasi_id', $registrasi->id)
+                ->where('posisi_foto', $position)
+                ->first();
+
+            if (
+                $oldPhoto
+                && $oldPhoto->file_path
+                && Storage::disk('public')->exists($oldPhoto->file_path)
+            ) {
+                Storage::disk('public')->delete($oldPhoto->file_path);
+            }
+
+            $path = $file->store(
+                "registrasi/konsultasi-online/{$registrasi->id}",
+                'public'
+            );
+
+            RegistrasiKonsultasiFoto::query()->updateOrCreate(
+                [
+                    'registrasi_id' => $registrasi->id,
+                    'posisi_foto' => $position,
+                ],
+                [
+                    'konsultasi_id' => $intake->id,
+                    'file_name' => $file->getClientOriginalName(),
+                    'file_path' => $path,
+                    'file_url' => Storage::url($path),
+                    'mime_type' => $file->getMimeType(),
+                    'file_size' => $file->getSize(),
+                    'is_delete' => 0,
+                    'created_by' => $this->username(),
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]
+            );
+        }
+    }
+
+    private function getKonsultasiOnlineFile(Request $request, string $field)
+    {
+        $dotKey = "konsultasi_online.{$field}";
+
+        if ($request->hasFile($dotKey)) {
+            return $request->file($dotKey);
+        }
+
+        $files = $request->file('konsultasi_online');
+
+        if (is_array($files) && isset($files[$field])) {
+            return $files[$field];
+        }
+
+        return null;
+    }
+
+    private function resolveRequestDokterOnline($value): array
+    {
+        if ($value === null || $value === '') {
+            return [null, null];
+        }
+
+        if (is_array($value)) {
+            $id = $value['id'] ?? $value['value'] ?? null;
+            $name = $value['nama'] ?? $value['label'] ?? $value['text'] ?? null;
+
+            if ($id && !$name) {
+                $name = DB::table('master_karyawan')
+                    ->where('id', $id)
+                    ->value('nama');
+            }
+
+            return [$id ? (int) $id : null, $name ?: null];
+        }
+
+        if (is_numeric($value)) {
+            $name = DB::table('master_karyawan')
+                ->where('id', (int) $value)
+                ->value('nama');
+
+            return [(int) $value, $name ?: null];
+        }
+
+        return [null, trim((string) $value)];
+    }
+
+    private function toNullableTinyBool($value): ?int
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_bool($value)) {
+            return $value ? 1 : 0;
+        }
+
+        $normalized = strtolower(trim((string) $value));
+
+        if (in_array($normalized, ['1', 'true', 'ya', 'yes'], true)) {
+            return 1;
+        }
+
+        if (in_array($normalized, ['0', 'false', 'tidak', 'no'], true)) {
+            return 0;
+        }
+
+        return null;
+    }
+
+    private function emptyToNull($value): ?string
+    {
+        $value = trim((string) $value);
+
+        return $value === '' ? null : $value;
     }
 }

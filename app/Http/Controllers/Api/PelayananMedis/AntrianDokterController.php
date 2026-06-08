@@ -13,6 +13,7 @@ use App\Models\Registrasi\RegistrasiKunjungan;
 use App\Models\Registrasi\RegistrasiPenjualanDetail;
 use App\Models\Registrasi\RegistrasiTask;
 use App\Models\Registrasi\RegistrasiTreatmentDetail;
+use App\Models\Registrasi\RegistrasiKonsultasiFoto;
 use App\Models\Stock\StockProdukToko;
 use App\Models\Stock\StockReservasiProduk;
 use Carbon\Carbon;
@@ -1275,7 +1276,236 @@ class AntrianDokterController extends Controller
             RegistrasiTask::STATUS_PROSES,
         ], true));
 
+        $row->setAttribute('online_registration', $this->formatOnlineRegistrationPayload($row));
         return $row;
+    }
+
+    private function formatOnlineRegistrationPayload(RegistrasiKunjungan $row): array
+    {
+        $intake = $row->relationLoaded('konsultasiIntake')
+            ? $row->konsultasiIntake
+            : $row->konsultasiIntake()->first();
+
+        $photos = collect();
+
+        if ($row->relationLoaded('konsultasiFotos')) {
+            $photos = $row->konsultasiFotos;
+        } elseif ($intake && $intake->relationLoaded('fotos')) {
+            $photos = $intake->fotos;
+        } else {
+            $photos = $row->konsultasiFotos()
+                ->where('is_delete', 0)
+                ->orderBy('posisi_foto')
+                ->get();
+        }
+
+        $photoMap = $this->formatOnlineRegistrationPhotoMap($photos);
+
+        return [
+            'registrasi_id' => $row->id,
+
+            'request_dokter_id' => $intake?->request_dokter_id,
+            'request_dokter_nama' => $intake?->request_dokter_nama,
+            'request_dokter' => $intake?->request_dokter_nama,
+
+            'alergi' => $intake?->alergi,
+
+            'keluhan_utama' => $intake?->keluhan_utama,
+            'keluhan' => $intake?->keluhan_utama ?: $intake?->keluhan_awal,
+            'keluhan_awal' => $intake?->keluhan_awal,
+
+            'produk_obat_sebelumnya' => $intake?->produk_obat_sebelumnya,
+            'produk_sebelumnya' => $intake?->produk_obat_sebelumnya,
+
+            'sedang_hamil' => $this->formatYesNoValue($intake?->sedang_hamil),
+            'sedang_hamil_raw' => $intake?->sedang_hamil,
+
+            'sedang_menyusui' => $this->formatYesNoValue($intake?->sedang_menyusui),
+            'sedang_menyusui_raw' => $intake?->sedang_menyusui,
+
+            'catatan_cs' => $intake?->catatan_cs,
+            'catatan_awal' => $intake?->catatan_awal,
+            'catatan_registrasi' => $row->catatan_registrasi,
+
+            'jenis_konsultasi' => $intake?->jenis_konsultasi,
+            'jenis_konsultasi_label' => $row->jenis_konsultasi_label,
+            'channel_konsultasi' => $row->channel_konsultasi,
+            'channel_label' => $row->channel_konsultasi_label,
+            'konsultasi_source_code' => $row->konsultasi_source_code,
+            'konsultasi_source_name' => $row->konsultasi_source_name,
+
+            'bukti_chat_konsultasi_online' => $row->bukti_chat_konsultasi_online,
+            'bukti_chat_konsultasi_online_url' => $this->storagePublicUrlForDoctorQueue($row->bukti_chat_konsultasi_online),
+
+            'foto_kiri' => $photoMap[RegistrasiKonsultasiFoto::POSISI_KIRI] ?? null,
+            'foto_depan' => $photoMap[RegistrasiKonsultasiFoto::POSISI_DEPAN] ?? null,
+            'foto_kanan' => $photoMap[RegistrasiKonsultasiFoto::POSISI_KANAN] ?? null,
+            'fotos' => array_values($photoMap),
+        ];
+    }
+
+    private function formatOnlineRegistrationPhotoMap($photos): array
+    {
+        $result = [];
+
+        foreach ($photos as $photo) {
+            if ((int) ($photo->is_delete ?? 0) === 1) {
+                continue;
+            }
+
+            $position = (int) ($photo->posisi_foto ?? 0);
+
+            if (!in_array($position, [
+                RegistrasiKonsultasiFoto::POSISI_KIRI,
+                RegistrasiKonsultasiFoto::POSISI_DEPAN,
+                RegistrasiKonsultasiFoto::POSISI_KANAN,
+            ], true)) {
+                continue;
+            }
+
+            $filePath = $photo->file_path ?? null;
+            $fileUrl = $photo->file_url ?: $this->storagePublicUrlForDoctorQueue($filePath);
+
+            $result[$position] = [
+                'id' => $photo->id,
+                'posisi_foto' => $position,
+                'label' => match ($position) {
+                    RegistrasiKonsultasiFoto::POSISI_KIRI => 'Foto Kiri',
+                    RegistrasiKonsultasiFoto::POSISI_DEPAN => 'Foto Depan',
+                    RegistrasiKonsultasiFoto::POSISI_KANAN => 'Foto Kanan',
+                    default => 'Foto',
+                },
+                'file_name' => $photo->file_name,
+                'file_path' => $filePath,
+                'file_url' => $fileUrl,
+                'url' => $fileUrl,
+                'mime_type' => $photo->mime_type,
+                'file_size' => $photo->file_size,
+            ];
+        }
+
+        ksort($result);
+
+        return $result;
+    }
+
+    private function formatYesNoValue($value): ?string
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        return (int) $value === 1 ? 'Ya' : 'Tidak';
+    }
+
+    private function storagePublicUrlForDoctorQueue(?string $path): ?string
+    {
+        if (!$path) {
+            return null;
+        }
+
+        if (preg_match('/^https?:\/\//i', $path)) {
+            return $path;
+        }
+
+        return asset('storage/' . ltrim(str_replace('public/', '', $path), '/'));
+    }
+
+    private function formatOnlineRegistration(RegistrasiKunjungan $row): array
+    {
+        $intake = $row->relationLoaded('konsultasiIntake')
+            ? $row->konsultasiIntake
+            : $row->konsultasiIntake()->first();
+
+        $photos = $row->relationLoaded('konsultasiFotos')
+            ? $row->konsultasiFotos
+            : $row->konsultasiFotos()
+                ->where('is_delete', 0)
+                ->orderBy('posisi_foto')
+                ->get();
+
+        $photoMap = $this->formatOnlineRegistrationPhotos($photos);
+
+        return [
+            'request_dokter' => $intake?->request_dokter_nama,
+            'request_dokter_id' => $intake?->request_dokter_id,
+
+            'alergi' => $intake?->alergi,
+
+            'keluhan' => $intake?->keluhan_utama ?: $intake?->keluhan_awal,
+            'keluhan_utama' => $intake?->keluhan_utama ?: $intake?->keluhan_awal,
+            'keluhan_awal' => $intake?->keluhan_awal,
+
+            'produk_sebelumnya' => $intake?->produk_obat_sebelumnya,
+            'produk_obat_sebelumnya' => $intake?->produk_obat_sebelumnya,
+
+            'sedang_hamil' => $this->formatBooleanLabel($intake?->sedang_hamil),
+            'sedang_menyusui' => $this->formatBooleanLabel($intake?->sedang_menyusui),
+
+            'catatan_cs' => $intake?->catatan_cs,
+            'catatan_awal' => $intake?->catatan_awal,
+            'catatan_registrasi' => $row->catatan_registrasi,
+
+            'jenis_konsultasi' => $intake?->jenis_konsultasi,
+            'jenis_konsultasi_label' => $row->jenis_konsultasi_label,
+
+            'channel_konsultasi' => $row->channel_konsultasi,
+            'channel_label' => $row->channel_konsultasi_label,
+
+            'source_code' => $row->konsultasi_source_code,
+            'source_name' => $row->konsultasi_source_name,
+
+            'bukti_chat_konsultasi_online' => $row->bukti_chat_konsultasi_online,
+
+            'foto_kiri' => $photoMap[1] ?? null,
+            'foto_depan' => $photoMap[2] ?? null,
+            'foto_kanan' => $photoMap[3] ?? null,
+            'fotos' => array_values($photoMap),
+        ];
+    }
+
+    private function formatOnlineRegistrationPhotos($photos): array
+    {
+        $result = [];
+
+        foreach ($photos as $photo) {
+            if ((int) ($photo->is_delete ?? 0) === 1) {
+                continue;
+            }
+
+            $position = (int) ($photo->posisi_foto ?? 0);
+
+            if (!$position) {
+                continue;
+            }
+
+            $result[$position] = [
+                'id' => $photo->id,
+                'posisi_foto' => $position,
+                'label' => match ($position) {
+                    1 => 'Foto Kiri',
+                    2 => 'Foto Depan',
+                    3 => 'Foto Kanan',
+                    default => 'Foto',
+                },
+                'file_name' => $photo->file_name,
+                'file_path' => $photo->file_path,
+                'file_url' => $photo->file_url ?: $photo->file_path,
+                'mime_type' => $photo->mime_type,
+                'file_size' => $photo->file_size,
+            ];
+        }
+
+        return $result;
+    }
+
+    private function formatBooleanLabel($value): ?string
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        return (int) $value === 1 ? 'Ya' : 'Tidak';
     }
 
     private function hasConsultation(RegistrasiKunjungan $row): bool

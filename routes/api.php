@@ -93,6 +93,7 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/', [RegistrasiLayananController::class, 'index']);
         Route::post('/', [RegistrasiLayananController::class, 'store']);
         Route::get('/antrian-dokter', [RegistrasiLayananController::class, 'antrianDokter']);
+        Route::get('/pasien/{pasien}/riwayat-konsultasi', [RegistrasiLayananController::class, 'riwayatKonsultasiPasien']);
         Route::delete('/antrian-dokter/{id}', [RegistrasiLayananController::class, 'destroyAntrianDokter'])
             ->whereNumber('id');
         Route::post('/task/{taskId}/start', [RegistrasiLayananController::class, 'startTask'])
