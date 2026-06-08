@@ -461,6 +461,8 @@ class PembayaranController extends Controller
                     ->firstOrFail();
                 $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
 
+                $memberBeforeLedger = $this->snapshotPaymentMemberReward($invoice);
+
                 $this->memberPointService->applyMemberBenefitToInvoice($invoice, $this->username());
                 $this->refreshInvoiceTotalsFromItems($invoice);
 
@@ -520,7 +522,10 @@ class PembayaranController extends Controller
                 ]));
 
                 $invoice->refresh();
+
                 $this->memberPointService->processEarnedPointLedger($invoice, $this->username());
+
+                $memberReward = $this->buildPaymentMemberRewardResponse($invoice, $memberBeforeLedger);
 
                 $nextTask = $this->completePaymentTask($registrasi);
 
@@ -528,6 +533,7 @@ class PembayaranController extends Controller
                     'invoice_id' => $invoice->id,
                     'next_task_id' => $nextTask?->id,
                     'already_paid' => false,
+                    'member_reward' => $memberReward,
                 ];
             }, 3);
 
@@ -583,6 +589,8 @@ class PembayaranController extends Controller
 
             if ($invoice) {
                 $data = $this->formatPaymentRow($invoice);
+                $data['member_reward'] = $result['member_reward']
+                    ?? $this->buildPaymentMemberRewardResponse($invoice);
 
                 if ($splitInvoiceIds) {
                     $data['split_invoice_ids'] = $splitInvoiceIds;
@@ -622,6 +630,8 @@ class PembayaranController extends Controller
             'status_label' => 'Lunas',
         ];
 
+        $data['member_reward'] = $result['member_reward'] ?? null;
+
         if ($splitInvoiceIds) {
             $data['split_invoice_ids'] = $splitInvoiceIds;
             $data['general_invoice_id'] = $result['general_invoice_id'] ?? null;
@@ -634,6 +644,332 @@ class PembayaranController extends Controller
             'data' => $data,
         ]);
     }
+
+
+    protected function snapshotPaymentMemberReward(PembayaranInvoice $invoice, bool $lock = true): array
+    {
+        $pasienId = $this->resolveMemberRewardPasienId($invoice);
+        $member = $this->resolveActivePasienMember($pasienId, $lock);
+
+        if (!$member) {
+            return [
+                'member_id' => null,
+                'member_no' => null,
+                'member_tier_id' => null,
+                'member_tier_nama' => null,
+                'point_sisa' => 0,
+                'total_point' => 0,
+                'total_spending' => 0,
+            ];
+        }
+
+        $tier = $this->resolveMemberRewardTier((int) ($member->member_tier_id ?? 0));
+
+        return [
+            'member_id' => (int) ($member->id ?? 0),
+            'member_no' => $member->no_member ?? null,
+            'member_tier_id' => (int) ($member->member_tier_id ?? 0),
+            'member_tier_nama' => $tier?->nama ?? null,
+            'point_sisa' => (float) ($member->point_sisa ?? 0),
+            'total_point' => (float) ($member->total_point ?? 0),
+            'total_spending' => (float) ($member->total_spending ?? 0),
+        ];
+    }
+
+    protected function buildPaymentMemberRewardResponse(
+        PembayaranInvoice $invoice,
+        ?array $before = null,
+        array $invoiceIds = []
+    ): array {
+        $invoiceIds = collect($invoiceIds)
+            ->push((int) ($invoice->id ?? 0))
+            ->filter(fn ($id) => (int) $id > 0)
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values()
+            ->all();
+
+        $invoiceRows = PembayaranInvoice::query()
+            ->whereIn('id', $invoiceIds)
+            ->get();
+
+        $freshInvoice = $invoiceRows->firstWhere('id', (int) ($invoice->id ?? 0)) ?: $invoice;
+        $pasienId = $this->resolveMemberRewardPasienId($freshInvoice);
+
+        if ($pasienId <= 0 && $invoiceRows->isNotEmpty()) {
+            foreach ($invoiceRows as $row) {
+                $pasienId = $this->resolveMemberRewardPasienId($row);
+                if ($pasienId > 0) {
+                    break;
+                }
+            }
+        }
+
+        $before = $before ?? $this->snapshotPaymentMemberReward($freshInvoice, false);
+        $member = $this->resolveActivePasienMember($pasienId);
+        $currentTier = $member
+            ? $this->resolveMemberRewardTier((int) ($member->member_tier_id ?? 0))
+            : null;
+
+        $previousTierId = (int) ($before['member_tier_id'] ?? 0);
+        $currentTierId = (int) ($member->member_tier_id ?? 0);
+
+        $memberCreated = empty($before['member_id']) && $member;
+        $tierChanged = $previousTierId > 0
+            && $currentTierId > 0
+            && $previousTierId !== $currentTierId;
+
+        $pasienLedger = $this->resolveLatestPaymentPointLedger($invoiceIds, $pasienId);
+        $memberLedger = $this->resolveLatestMemberPointLedger($invoiceIds, $pasienId);
+
+        $invoicePointEarned = (float) $invoiceRows->sum(fn ($row) => (float) ($row->point_earned ?? $row->poin ?? 0));
+        $ledgerPointEarned = (float) ($pasienLedger['total_point_earned'] ?? 0);
+        $memberLedgerPointEarned = (float) ($memberLedger['total_point_earned'] ?? 0);
+        $pointEarned = (int) round(max($invoicePointEarned, $ledgerPointEarned, $memberLedgerPointEarned));
+
+        $pointBalance = $member
+            ? (float) ($member->point_sisa ?? 0)
+            : (float) ($pasienLedger['saldo_setelah'] ?? 0);
+
+        $totalPoint = $member
+            ? (float) ($member->total_point ?? 0)
+            : $pointBalance;
+
+        $totalSpending = $member
+            ? (float) ($member->total_spending ?? 0)
+            : 0;
+
+        $shouldShow = (bool) ($memberCreated || $tierChanged || $pointEarned > 0);
+
+        return [
+            'should_show' => $shouldShow,
+            'member_created' => (bool) $memberCreated,
+            'tier_changed' => (bool) $tierChanged,
+
+            'pasien_id' => $pasienId,
+            'invoice_id' => (int) ($freshInvoice->id ?? 0),
+            'invoice_ids' => $invoiceIds,
+            'no_invoice' => $freshInvoice->no_invoice ?? null,
+
+            'member_id' => $member ? (int) ($member->id ?? 0) : null,
+            'member_no' => $member->no_member ?? ($freshInvoice->member_no ?? null),
+
+            'previous_tier_id' => $previousTierId ?: null,
+            'previous_tier_nama' => $before['member_tier_nama'] ?? null,
+
+            'current_tier_id' => $currentTierId ?: null,
+            'current_tier_nama' => $currentTier?->nama ?? ($freshInvoice->member_tier_nama ?? null),
+
+            'point_earned' => $pointEarned,
+            'point_balance' => $pointBalance,
+            'total_point' => $totalPoint,
+            'total_spending' => $totalSpending,
+
+            'ledger' => $pasienLedger,
+            'member_ledger' => $memberLedger,
+        ];
+    }
+
+    protected function resolveMemberRewardPasienId(PembayaranInvoice $invoice): int
+    {
+        $pasienId = (int) ($invoice->pasien_id ?? 0);
+
+        if ($pasienId > 0) {
+            return $pasienId;
+        }
+
+        if ($invoice->relationLoaded('registrasi') && $invoice->registrasi) {
+            $pasienId = (int) ($invoice->registrasi->pasien_id ?? $invoice->registrasi->pasien_new_id ?? 0);
+
+            if ($pasienId > 0) {
+                return $pasienId;
+            }
+        }
+
+        $registrasiId = (int) ($invoice->registrasi_id ?? 0);
+
+        if ($registrasiId > 0 && Schema::hasTable('registrasi_kunjungan')) {
+            $columns = ['id'];
+
+            foreach (['pasien_id', 'pasien_new_id'] as $column) {
+                if (Schema::hasColumn('registrasi_kunjungan', $column)) {
+                    $columns[] = $column;
+                }
+            }
+
+            $registrasi = DB::table('registrasi_kunjungan')
+                ->where('id', $registrasiId)
+                ->first($columns);
+
+            return (int) ($registrasi->pasien_id ?? $registrasi->pasien_new_id ?? 0);
+        }
+
+        return 0;
+    }
+
+    protected function resolveActivePasienMember(int $pasienId, bool $lock = false): ?object
+    {
+        if ($pasienId <= 0 || !Schema::hasTable('pasien_member')) {
+            return null;
+        }
+
+        $query = DB::table('pasien_member')
+            ->where('pasien_id', $pasienId);
+
+        if (Schema::hasColumn('pasien_member', 'is_delete')) {
+            $query->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            });
+        }
+
+        if (Schema::hasColumn('pasien_member', 'status')) {
+            $query->where(function ($q) {
+                $q->whereNull('status')->orWhere('status', 1);
+            });
+        }
+
+        if ($lock) {
+            $query->lockForUpdate();
+        }
+
+        return $query
+            ->orderByDesc('id')
+            ->first();
+    }
+
+    protected function resolveMemberRewardTier(int $tierId): ?object
+    {
+        if ($tierId <= 0 || !Schema::hasTable('master_member_tier')) {
+            return null;
+        }
+
+        $query = DB::table('master_member_tier')
+            ->where('id', $tierId);
+
+        if (Schema::hasColumn('master_member_tier', 'is_delete')) {
+            $query->where(function ($q) {
+                $q->whereNull('is_delete')->orWhere('is_delete', 0);
+            });
+        }
+
+        if (Schema::hasColumn('master_member_tier', 'is_active')) {
+            $query->where(function ($q) {
+                $q->whereNull('is_active')->orWhere('is_active', 1);
+            });
+        }
+
+        return $query->first();
+    }
+
+    protected function resolveLatestPaymentPointLedger(array $invoiceIds, int $pasienId = 0): ?array
+    {
+        $invoiceIds = collect($invoiceIds)
+            ->filter(fn ($id) => (int) $id > 0)
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values()
+            ->all();
+
+        if (count($invoiceIds) === 0 || !Schema::hasTable('pasien_poin_ledger')) {
+            return null;
+        }
+
+        $query = DB::table('pasien_poin_ledger')
+            ->whereIn('source_id', $invoiceIds);
+
+        if (Schema::hasColumn('pasien_poin_ledger', 'source_table')) {
+            $query->where('source_table', 'pembayaran_invoice');
+        }
+
+        if (Schema::hasColumn('pasien_poin_ledger', 'tipe_mutasi')) {
+            $query->where('tipe_mutasi', 'earn');
+        }
+
+        if (Schema::hasColumn('pasien_poin_ledger', 'is_void')) {
+            $query->where(function ($q) {
+                $q->whereNull('is_void')->orWhere('is_void', 0);
+            });
+        }
+
+        if ($pasienId > 0 && Schema::hasColumn('pasien_poin_ledger', 'pasien_id')) {
+            $query->where('pasien_id', $pasienId);
+        }
+
+        $rows = $query
+            ->orderByDesc('id')
+            ->get();
+
+        if ($rows->isEmpty()) {
+            return null;
+        }
+
+        $latest = $rows->first();
+
+        return [
+            'id' => (int) ($latest->id ?? 0),
+            'total_point_earned' => (int) $rows->sum(fn ($row) => (int) ($row->poin_masuk ?? 0)),
+            'poin_masuk' => (int) ($latest->poin_masuk ?? 0),
+            'poin_keluar' => (int) ($latest->poin_keluar ?? 0),
+            'saldo_sebelum' => (int) ($latest->saldo_sebelum ?? 0),
+            'saldo_setelah' => (int) ($latest->saldo_setelah ?? 0),
+            'nominal_transaksi' => (float) ($latest->nominal_transaksi ?? 0),
+            'tanggal' => $latest->tanggal ?? null,
+            'keterangan' => $latest->keterangan ?? null,
+        ];
+    }
+
+    protected function resolveLatestMemberPointLedger(array $invoiceIds, int $pasienId = 0): ?array
+    {
+        $invoiceIds = collect($invoiceIds)
+            ->filter(fn ($id) => (int) $id > 0)
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values()
+            ->all();
+
+        if (count($invoiceIds) === 0 || !Schema::hasTable('member_point_ledger')) {
+            return null;
+        }
+
+        $query = DB::table('member_point_ledger')
+            ->whereIn('pembayaran_id', $invoiceIds);
+
+        if (Schema::hasColumn('member_point_ledger', 'transaksi_type')) {
+            $query->where('transaksi_type', 1);
+        }
+
+        if (Schema::hasColumn('member_point_ledger', 'is_void')) {
+            $query->where(function ($q) {
+                $q->whereNull('is_void')->orWhere('is_void', 0);
+            });
+        }
+
+        if ($pasienId > 0 && Schema::hasColumn('member_point_ledger', 'pasien_id')) {
+            $query->where('pasien_id', $pasienId);
+        }
+
+        $rows = $query
+            ->orderByDesc('id')
+            ->get();
+
+        if ($rows->isEmpty()) {
+            return null;
+        }
+
+        $latest = $rows->first();
+
+        return [
+            'id' => (int) ($latest->id ?? 0),
+            'member_id' => (int) ($latest->member_id ?? 0),
+            'total_point_earned' => (float) $rows->sum(fn ($row) => (float) ($row->point_masuk ?? 0)),
+            'point_masuk' => (float) ($latest->point_masuk ?? 0),
+            'point_keluar' => (float) ($latest->point_keluar ?? 0),
+            'nominal_referensi' => (float) ($latest->nominal_referensi ?? 0),
+            'tanggal_transaksi' => $latest->tanggal_transaksi ?? null,
+            'catatan' => $latest->catatan ?? null,
+        ];
+    }
+
 
     protected function formatSplitInvoicesForResponse(array $splitInvoiceIds): array
     {
@@ -1759,6 +2095,8 @@ class PembayaranController extends Controller
         $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
         $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
 
+        $memberBeforeLedger = $this->snapshotPaymentMemberReward($generalInvoice);
+
         $this->memberPointService->applyMemberBenefitToInvoice($generalInvoice, $this->username());
         $this->memberPointService->applyMemberBenefitToInvoice($depositInvoice, $this->username());
 
@@ -1814,6 +2152,12 @@ class PembayaranController extends Controller
         $this->memberPointService->processEarnedPointLedger($generalInvoice, $this->username());
         $this->memberPointService->processEarnedPointLedger($depositInvoice, $this->username());
 
+        $memberReward = $this->buildPaymentMemberRewardResponse(
+            $depositInvoice,
+            $memberBeforeLedger,
+            [$generalInvoice->id, $depositInvoice->id]
+        );
+
         $nextTask = $this->completePaymentTask($registrasi);
 
         return [
@@ -1826,6 +2170,7 @@ class PembayaranController extends Controller
             ],
             'next_task_id' => $nextTask?->id,
             'already_paid' => false,
+            'member_reward' => $memberReward,
         ];
     }
 

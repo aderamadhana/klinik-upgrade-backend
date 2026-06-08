@@ -13,6 +13,10 @@ class PaymentInvoiceItemSyncService
 {
     public function syncInvoiceItemsFromRequest(Request $request, PembayaranInvoice $invoice): void
     {
+        if (!Schema::hasTable('pembayaran_invoice_item')) {
+            return;
+        }
+
         if ($request->has('treatment_items')) {
             $this->syncRequestTreatmentItems($request, $invoice);
         }
@@ -30,25 +34,23 @@ class PaymentInvoiceItemSyncService
             ->filter(fn ($row) => is_array($row))
             ->values();
 
-        // METODE BARU:
-        // Pada submit pembayaran, payload FE adalah final state kasir.
-        // Jangan merge dengan item registrasi/invoice lama karena itu membuat item stale
-        // tetap ikut grand_total. Seluruh item treatment aktif untuk invoice ini di-reset,
-        // lalu dibangun ulang hanya dari treatment_items request.
         $this->hardResetRequestItems($invoice, 2);
 
         foreach ($rows as $row) {
             $sourceDetailId = (int) ($row['registrasi_treatment_detail_id'] ?? $row['source_detail_id'] ?? 0);
-
             $qty = max((float) ($row['qty'] ?? $row['jumlah'] ?? 1), 1);
             $harga = (float) ($row['harga'] ?? $row['harga_treatment'] ?? $row['tarif'] ?? $row['harga_terendah'] ?? 0);
             $gross = $harga * $qty;
-            $diskonTipe = $this->normalizeItemDiscountType($row['diskon_type'] ?? $row['manual_diskon_type'] ?? $row['diskon_tipe'] ?? 0);
+
+            $diskonTipe = $this->normalizeItemDiscountType(
+                $row['diskon_type'] ?? $row['manual_diskon_type'] ?? $row['diskon_tipe'] ?? 0
+            );
             $diskonNilai = (float) ($row['diskon'] ?? $row['manual_diskon'] ?? $row['diskon_nilai'] ?? 0);
             $diskonAmount = $this->calculateInvoiceItemDiscountAmount($gross, $diskonTipe, $diskonNilai);
             $diskonReferral = (float) ($row['diskon_referral'] ?? 0);
             $promoDiskon = (float) ($row['promo_diskon_amount'] ?? 0);
             $subtotal = max($gross - $diskonAmount - $diskonReferral - $promoDiskon, 0);
+
             $sourceType = $sourceDetailId > 0 ? 1 : 0;
 
             $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
@@ -57,6 +59,7 @@ class PaymentInvoiceItemSyncService
                 'item_type' => 2,
                 'source_type' => $sourceType,
                 'source_detail_id' => $sourceDetailId > 0 ? $sourceDetailId : null,
+                'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
                 'nama_item' => $row['nama'] ?? $row['nama_item'] ?? $row['nama_treatment'] ?? 'Treatment',
                 'satuan' => $row['unit'] ?? $row['satuan'] ?? 'x',
                 'qty' => $qty,
@@ -92,27 +95,29 @@ class PaymentInvoiceItemSyncService
             ->filter(fn ($row) => is_array($row))
             ->values();
 
-        // METODE BARU:
-        // Pada submit pembayaran, payload FE adalah final state kasir.
-        // Produk/obat aktif lama di invoice ini di-reset, lalu dibangun ulang hanya
-        // dari penjualan_items request agar tidak ada stale item dari registrasi/submit sebelumnya.
         $this->hardResetRequestItems($invoice, 3);
 
         foreach ($rows as $row) {
             $sourceDetailId = (int) ($row['registrasi_penjualan_detail_id'] ?? $row['source_detail_id'] ?? 0);
-
             $qty = max((float) ($row['qty'] ?? $row['jumlah'] ?? 1), 1);
             $harga = (float) ($row['harga'] ?? $row['harga_jual'] ?? 0);
             $gross = $harga * $qty;
-            $diskonTipe = $this->normalizeItemDiscountType($row['diskon_type'] ?? $row['manual_diskon_type'] ?? $row['diskon_tipe'] ?? 0);
+
+            $diskonTipe = $this->normalizeItemDiscountType(
+                $row['diskon_type'] ?? $row['manual_diskon_type'] ?? $row['diskon_tipe'] ?? 0
+            );
             $diskonNilai = (float) ($row['diskon'] ?? $row['manual_diskon'] ?? $row['diskon_nilai'] ?? 0);
             $diskonAmount = $this->calculateInvoiceItemDiscountAmount($gross, $diskonTipe, $diskonNilai);
             $diskonReferral = (float) ($row['diskon_referral'] ?? 0);
             $promoDiskon = (float) ($row['promo_diskon_amount'] ?? 0);
             $subtotal = max($gross - $diskonAmount - $diskonReferral - $promoDiskon, 0);
+
             $frekuensi = $row['frekuensi'] ?? $row['frekuensi_penggunaan'] ?? null;
             $waktuPakai = $row['waktu_pakai'] ?? $row['waktu_penggunaan'] ?? null;
-            $instruksi = $row['penggunaan'] ?? $row['instruksi_pemakaian'] ?? $this->buildInstruksiPemakaian($frekuensi, $waktuPakai);
+            $instruksi = $row['penggunaan']
+                ?? $row['instruksi_pemakaian']
+                ?? $this->buildInstruksiPemakaian($frekuensi, $waktuPakai);
+
             $sourceType = $sourceDetailId > 0 ? 2 : 0;
 
             $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
@@ -121,6 +126,7 @@ class PaymentInvoiceItemSyncService
                 'item_type' => 3,
                 'source_type' => $sourceType,
                 'source_detail_id' => $sourceDetailId > 0 ? $sourceDetailId : null,
+                'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
                 'produk_id' => $row['produk_id'] ?? null,
                 'produk_toko_id' => $row['produk_toko_id'] ?? null,
                 'tempat_produk_id' => $row['tempat_produk_id'] ?? null,
@@ -175,11 +181,9 @@ class PaymentInvoiceItemSyncService
             ->where('item_type', $itemType)
             ->lockForUpdate();
 
-        // Request submit adalah final state kasir. Jika item pernah di-soft delete
-        // pada submit sebelumnya, item tetap boleh direvive ketika ID/source-nya dikirim lagi.
-        // Karena itu pencarian request sengaja TIDAK filter is_delete.
         if ($itemId > 0) {
             $item = (clone $baseQuery)->whereKey($itemId)->first();
+
             if ($item) {
                 return $item;
             }
@@ -194,8 +198,12 @@ class PaymentInvoiceItemSyncService
         return null;
     }
 
-    protected function softDeleteMissingRequestItems(PembayaranInvoice $invoice, int $itemType, array $activeItemIds, array $activeSourceIds = []): void
-    {
+    protected function softDeleteMissingRequestItems(
+        PembayaranInvoice $invoice,
+        int $itemType,
+        array $activeItemIds,
+        array $activeSourceIds = []
+    ): void {
         $query = DB::table('pembayaran_invoice_item')
             ->where('pembayaran_id', $invoice->id)
             ->where('item_type', $itemType)
@@ -252,7 +260,6 @@ class PaymentInvoiceItemSyncService
         $this->markRemovedInvoiceItems($invoice, 5, $activeMarkerSourceIds);
     }
 
-
     protected function syncKonsultasiInvoiceItemFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): array
     {
         $hasConsultation = $this->hasRegistrasiConsultation($registrasi);
@@ -262,13 +269,14 @@ class PaymentInvoiceItemSyncService
             return [];
         }
 
-        $sourceCode = strtoupper((string) ($registrasi->konsultasi_source_code ?: $registrasi->channel_konsultasi ?: 'KONSULTASI'));
-        $mapping = $this->resolveAccurateMapping('konsultasi', $sourceCode);
-        $subtotal = (float) ($registrasi->total_konsultasi ?? 0);
+        $sourceCode = strtoupper((string) (
+            $registrasi->konsultasi_source_code
+                ?: $registrasi->channel_konsultasi
+                ?: 'KONSULTASI'
+        ));
 
-        if ($subtotal <= 0 && $mapping && (int) ($mapping->is_billable ?? 0) === 1) {
-            $subtotal = (float) ($mapping->default_harga ?? 0);
-        }
+        $mapping = $this->resolveAccurateMapping('konsultasi', $sourceCode);
+        $subtotal = $this->resolveKonsultasiSubtotal($registrasi, $mapping, $sourceCode);
 
         if ($subtotal <= 0 && !$this->mappingShouldSendWhenZero($mapping)) {
             return [];
@@ -280,6 +288,7 @@ class PaymentInvoiceItemSyncService
             'item_type' => 1,
             'source_type' => 3,
             'source_detail_id' => $sourceId,
+            'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
             'accurate_mapping_id' => $mapping->id ?? null,
             'accurate_source_type' => $mapping->source_type ?? 'konsultasi',
             'accurate_source_code' => $mapping->source_code ?? $sourceCode,
@@ -295,6 +304,9 @@ class PaymentInvoiceItemSyncService
             'diskon_nilai' => 0,
             'diskon_amount' => 0,
             'diskon_referral' => 0,
+            'subtotal_before_diskon_subtotal' => $subtotal,
+            'diskon_subtotal_amount' => 0,
+            'subtotal_after_diskon_subtotal' => $subtotal,
             'subtotal' => $subtotal,
             'dokter_id' => $registrasi->dokter_awal_id ?? null,
             'perawat_id' => $registrasi->perawat_awal_id ?? null,
@@ -307,17 +319,49 @@ class PaymentInvoiceItemSyncService
         ]);
 
         $this->upsertInvoiceItemBySource($invoice->id, 1, 3, $sourceId, $payload);
-
-        // Satu registrasi hanya boleh punya satu item konsultasi aktif.
-        // Case SPPG/SPKK/online sebelumnya bisa membuat 2 item:
-        // - Konsultasi Dokter generic
-        // - Konsultasi SPPG/SPKK mapped Accurate
-        // Karena source_detail_id sama, markRemovedInvoiceItems() tidak menghapus yang generic.
-        // Setelah item konsultasi final dibuat, nonaktifkan semua konsultasi lain
-        // selain source_type/source_detail_id yang dipilih.
         $this->deactivateOtherConsultationItems($invoice->id, 3, $sourceId);
 
         return [$sourceId];
+    }
+
+    protected function resolveKonsultasiSubtotal(RegistrasiKunjungan $registrasi, ?object $mapping, string $sourceCode): float
+    {
+        if ($this->isFreeConsultationByRule($registrasi, $sourceCode)) {
+            return 0.0;
+        }
+
+        $subtotal = (float) ($registrasi->total_konsultasi ?? 0);
+
+        if ($subtotal > 0) {
+            return $subtotal;
+        }
+
+        if ($mapping && (int) ($mapping->is_billable ?? 0) === 1) {
+            return max((float) ($mapping->default_harga ?? 0), 0);
+        }
+
+        return 0.0;
+    }
+
+    protected function isFreeConsultationByRule(RegistrasiKunjungan $registrasi, string $sourceCode): bool
+    {
+        $sourceCode = strtoupper(trim((string) $sourceCode));
+        $channel = strtolower(trim((string) ($registrasi->channel_konsultasi ?? '')));
+        $ruleBiaya = (int) ($registrasi->rule_biaya_konsultasi ?? 0);
+
+        if (in_array($ruleBiaya, [2, 3], true)) {
+            return true;
+        }
+
+        if ($sourceCode === 'KONSULTASI_ONLINE' || str_contains($sourceCode, 'ONLINE')) {
+            return true;
+        }
+
+        if ((int) ($registrasi->is_konsultasi_online ?? 0) === 1) {
+            return true;
+        }
+
+        return in_array($channel, ['2', 'online'], true);
     }
 
     protected function deactivateOtherConsultationItems(int $invoiceId, int $activeSourceType, int $activeSourceDetailId): void
@@ -353,12 +397,14 @@ class PaymentInvoiceItemSyncService
 
             if ($sourceId > 0 && $this->mappingShouldSendWhenZero($mapping)) {
                 $activeIds[] = $sourceId;
+
                 $payload = $this->onlyExistingColumns('pembayaran_invoice_item', [
                     'pembayaran_id' => $invoice->id,
                     'registrasi_id' => $registrasi->id,
                     'item_type' => 5,
                     'source_type' => 4,
                     'source_detail_id' => $sourceId,
+                    'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
                     'accurate_mapping_id' => $mapping->id ?? null,
                     'accurate_source_type' => $mapping->source_type ?? 'marker',
                     'accurate_source_code' => $mapping->source_code ?? 'PEMBELIAN_ONLINE',
@@ -370,6 +416,9 @@ class PaymentInvoiceItemSyncService
                     'satuan' => 'x',
                     'qty' => 1,
                     'harga' => 0,
+                    'subtotal_before_diskon_subtotal' => 0,
+                    'diskon_subtotal_amount' => 0,
+                    'subtotal_after_diskon_subtotal' => 0,
                     'subtotal' => 0,
                     'status' => 1,
                     'is_delete' => 0,
@@ -386,7 +435,6 @@ class PaymentInvoiceItemSyncService
         return $activeIds;
     }
 
-
     protected function resolveTreatmentPrice($detail, RegistrasiKunjungan $registrasi): float
     {
         $candidateFields = [
@@ -399,6 +447,7 @@ class PaymentInvoiceItemSyncService
 
         foreach ($candidateFields as $field) {
             $value = (float) ($detail->{$field} ?? 0);
+
             if ($value > 0) {
                 return $value;
             }
@@ -456,6 +505,7 @@ class PaymentInvoiceItemSyncService
     {
         foreach ($values as $value) {
             $amount = (float) $value;
+
             if ($amount > 0) {
                 return $amount;
             }
@@ -475,6 +525,7 @@ class PaymentInvoiceItemSyncService
             }
 
             $sourceId = (int) ($detail->id ?? 0);
+
             if ($sourceId <= 0) {
                 continue;
             }
@@ -493,6 +544,7 @@ class PaymentInvoiceItemSyncService
                 'item_type' => 2,
                 'source_type' => 1,
                 'source_detail_id' => $sourceId,
+                'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
                 'deposit_treatment_id' => $detail->deposit_treatment_id ?? null,
                 'deposit_claim_id' => $detail->deposit_claim_id ?? null,
                 'treatment_id' => $detail->treatment_id ?? null,
@@ -501,12 +553,16 @@ class PaymentInvoiceItemSyncService
                     ?? $detail->treatment?->nama
                     ?? $detail->treatmentToko?->nama_treatment
                     ?? 'Treatment',
+                'satuan' => $detail->satuan ?? 'x',
                 'qty' => $qty,
                 'harga' => $harga,
                 'diskon_tipe' => (int) ($detail->diskon_tipe ?? 0),
                 'diskon_nilai' => (float) ($detail->diskon_nilai ?? 0),
                 'diskon_amount' => (float) ($detail->diskon_amount ?? 0),
                 'diskon_referral' => (float) ($detail->diskon_referral ?? 0),
+                'subtotal_before_diskon_subtotal' => $subtotal,
+                'diskon_subtotal_amount' => 0,
+                'subtotal_after_diskon_subtotal' => $subtotal,
                 'subtotal' => $subtotal,
                 'dokter_id' => $registrasi->dokter_awal_id ?? null,
                 'perawat_id' => $registrasi->perawat_awal_id ?? null,
@@ -536,6 +592,7 @@ class PaymentInvoiceItemSyncService
             }
 
             $sourceId = (int) ($detail->id ?? 0);
+
             if ($sourceId <= 0) {
                 continue;
             }
@@ -545,18 +602,15 @@ class PaymentInvoiceItemSyncService
             $qty = max((float) ($detail->jumlah ?? $detail->qty ?? 1), 1);
             $harga = (float) ($detail->harga ?? $detail->harga_jual ?? 0);
             $gross = $harga * $qty;
+
             $diskonTipe = (int) ($detail->diskon_tipe ?? 0);
             $diskonNilai = (float) ($detail->diskon_nilai ?? 0);
             $diskonAmount = $this->calculateInvoiceItemDiscountAmount($gross, $diskonTipe, $diskonNilai);
             $diskonReferral = (float) ($detail->diskon_referral ?? 0);
             $subtotal = (float) ($detail->subtotal ?? max($gross - $diskonAmount - $diskonReferral, 0));
 
-            $frekuensi = $detail->frekuensi_penggunaan
-                ?? $detail->frekuensi
-                ?? null;
-            $waktuPakai = $detail->waktu_penggunaan
-                ?? $detail->waktu_pakai
-                ?? null;
+            $frekuensi = $detail->frekuensi_penggunaan ?? $detail->frekuensi ?? null;
+            $waktuPakai = $detail->waktu_penggunaan ?? $detail->waktu_pakai ?? null;
             $instruksi = $detail->instruksi_pemakaian
                 ?? $detail->penggunaan
                 ?? $this->buildInstruksiPemakaian($frekuensi, $waktuPakai);
@@ -567,6 +621,7 @@ class PaymentInvoiceItemSyncService
                 'item_type' => 3,
                 'source_type' => 2,
                 'source_detail_id' => $sourceId,
+                'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
                 'produk_id' => $detail->produk_id ?? null,
                 'produk_toko_id' => $detail->produk_toko_id ?? null,
                 'tempat_produk_id' => $detail->tempat_produk_id ?? null,
@@ -575,16 +630,16 @@ class PaymentInvoiceItemSyncService
                     ?? $detail->produk?->nama
                     ?? $detail->produkToko?->nama_produk
                     ?? 'Produk',
-                'satuan' => $detail->unit
-                    ?? $detail->satuan
-                    ?? $detail->produk?->satuan_nama
-                    ?? 'pcs',
+                'satuan' => $detail->unit ?? $detail->satuan ?? $detail->produk?->satuan_nama ?? 'pcs',
                 'qty' => $qty,
                 'harga' => $harga,
                 'diskon_tipe' => $diskonTipe,
                 'diskon_nilai' => $diskonNilai,
                 'diskon_amount' => $diskonAmount,
                 'diskon_referral' => $diskonReferral,
+                'subtotal_before_diskon_subtotal' => $subtotal,
+                'diskon_subtotal_amount' => 0,
+                'subtotal_after_diskon_subtotal' => $subtotal,
                 'subtotal' => $subtotal,
                 'dokter_id' => (int) ($detail->is_saran_dokter ?? 0) === 1
                     ? ($registrasi->dokter_awal_id ?? null)
@@ -607,8 +662,13 @@ class PaymentInvoiceItemSyncService
         return $activeIds;
     }
 
-    protected function upsertInvoiceItemBySource(int $invoiceId, int $itemType, int $sourceType, int $sourceDetailId, array $payload): void
-    {
+    protected function upsertInvoiceItemBySource(
+        int $invoiceId,
+        int $itemType,
+        int $sourceType,
+        int $sourceDetailId,
+        array $payload
+    ): void {
         $existingId = DB::table('pembayaran_invoice_item')
             ->where('pembayaran_id', $invoiceId)
             ->where('item_type', $itemType)
@@ -622,9 +682,11 @@ class PaymentInvoiceItemSyncService
 
         if ($existingId) {
             unset($payload['created_by'], $payload['created_at']);
+
             DB::table('pembayaran_invoice_item')
                 ->where('id', $existingId)
                 ->update($payload);
+
             return;
         }
 
@@ -651,7 +713,6 @@ class PaymentInvoiceItemSyncService
             'updated_at' => now(),
         ]));
     }
-
 
     protected function invoiceHasActiveTreatment(PembayaranInvoice $invoice): bool
     {
@@ -725,15 +786,9 @@ class PaymentInvoiceItemSyncService
         $subtotalProduk = (float) ($totals->produk_total ?? 0);
         $subtotalKonsultasi = $hasActiveTreatment ? 0.0 : (float) ($totals->konsultasi_total ?? 0);
 
-        // Fallback ke header konsultasi hanya boleh jika TIDAK ada treatment aktif.
-        // Sebelumnya fallback ini memasukkan ulang 100k/200k konsultasi walaupun item
-        // konsultasi sudah di-zero-kan, sehingga grand_total selalu lebih besar 200k.
-        if (!$hasActiveTreatment && $subtotalKonsultasi <= 0 && (float) ($invoice->subtotal_konsultasi ?? 0) > 0) {
-            $subtotalKonsultasi = (float) $invoice->subtotal_konsultasi;
-        }
-
         $subtotal = $subtotalTreatment + $subtotalProduk + $subtotalKonsultasi;
         $prorationBase = $subtotalTreatment + $subtotalProduk;
+
         $diskonSubtotal = min(
             max((float) ($invoice->diskon_subtotal_amount ?? $invoice->diskon_subtotal ?? 0), 0),
             max($prorationBase, 0)
@@ -767,9 +822,6 @@ class PaymentInvoiceItemSyncService
             'grand_total' => $grandTotal,
         ]);
     }
-
-
-
 
     protected function hasRegistrasiConsultation(?RegistrasiKunjungan $registrasi): bool
     {
@@ -813,7 +865,9 @@ class PaymentInvoiceItemSyncService
 
     protected function mappingShouldSendWhenZero(?object $mapping): bool
     {
-        return $mapping && (int) ($mapping->is_send_to_accurate ?? 0) === 1 && (int) ($mapping->send_when_zero ?? 0) === 1;
+        return $mapping
+            && (int) ($mapping->is_send_to_accurate ?? 0) === 1
+            && (int) ($mapping->send_when_zero ?? 0) === 1;
     }
 
     protected function calculateInvoiceItemDiscountAmount(float $gross, int $diskonTipe, float $diskonNilai): float
@@ -873,6 +927,7 @@ class PaymentInvoiceItemSyncService
         if ($items->isEmpty() || $baseSubtotal <= 0 || $diskonSubtotal <= 0) {
             foreach ($items as $item) {
                 $subtotal = (float) ($item->subtotal ?? 0);
+
                 $payload = [
                     'updated_by' => $this->username(),
                     'updated_at' => now(),
@@ -881,9 +936,11 @@ class PaymentInvoiceItemSyncService
                 if ($hasProrataAmount) {
                     $payload['diskon_subtotal_amount'] = 0;
                 }
+
                 if ($hasBeforeColumn) {
                     $payload['subtotal_before_diskon_subtotal'] = $subtotal;
                 }
+
                 if ($hasAfterColumn) {
                     $payload['subtotal_after_diskon_subtotal'] = $subtotal;
                 }
@@ -920,9 +977,11 @@ class PaymentInvoiceItemSyncService
             if ($hasProrataAmount) {
                 $payload['diskon_subtotal_amount'] = $amount;
             }
+
             if ($hasBeforeColumn) {
                 $payload['subtotal_before_diskon_subtotal'] = $subtotal;
             }
+
             if ($hasAfterColumn) {
                 $payload['subtotal_after_diskon_subtotal'] = $afterSubtotal;
             }
@@ -944,5 +1003,4 @@ class PaymentInvoiceItemSyncService
     {
         return (string) (auth()->user()->username ?? auth()->user()->name ?? 'system');
     }
-
 }

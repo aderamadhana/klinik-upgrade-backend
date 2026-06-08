@@ -737,14 +737,29 @@ class AntrianDokterController extends Controller
 
     private function recalculateRegistrasiKunjungan(Request $request, RegistrasiKunjungan $registrasi): void
     {
-        $treatmentItems = $this->getActiveTreatmentDetailsForBilling($registrasi);
-        $penjualanItems = $this->getActivePenjualanDetailsForBilling($registrasi);
+        $totalTreatment = (float) RegistrasiTreatmentDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->sum('total');
 
-        $totalTreatment = (float) $treatmentItems->sum(fn ($item) => (float) ($item->total ?? 0));
-        $totalPenjualan = (float) $penjualanItems->sum(fn ($item) => (float) ($item->subtotal ?? 0));
+        $totalPenjualan = (float) RegistrasiPenjualanDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->sum('subtotal');
 
-        $hasTreatment = $treatmentItems->isNotEmpty();
-        $hasPenjualan = $penjualanItems->isNotEmpty();
+        $hasTreatment = $totalTreatment > 0 || RegistrasiTreatmentDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->exists();
+
+        $hasPenjualan = $totalPenjualan > 0 || RegistrasiPenjualanDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->exists();
 
         $addConsultation = $this->isTrue($request->input('add_consultation'));
         $hasOriginalConsultation = $this->hasConsultation($registrasi);
@@ -754,21 +769,57 @@ class AntrianDokterController extends Controller
         $ruleBiayaKonsultasi = 0;
         $catatanBiayaKonsultasi = null;
 
+        $sourceCode = strtoupper((string) ($registrasi->konsultasi_source_code ?? ''));
+        $sourceName = strtoupper((string) ($registrasi->konsultasi_source_name ?? ''));
+
+        $isOnlineConsultation = $hasOriginalConsultation
+            && (
+                (int) ($registrasi->channel_konsultasi ?? 0) === RegistrasiKunjungan::CHANNEL_ONLINE
+                || str_contains($sourceCode, 'ONLINE')
+                || str_contains($sourceName, 'ONLINE')
+            );
+
         if ($hasConsultation && $hasTreatment) {
+            $totalKonsultasi = 0;
             $ruleBiayaKonsultasi = 2;
             $catatanBiayaKonsultasi = 'Gratis karena pasien mengambil treatment';
+        } elseif ($hasConsultation && $isOnlineConsultation) {
+            $totalKonsultasi = 0;
+            $ruleBiayaKonsultasi = 3;
+            $catatanBiayaKonsultasi = 'Biaya konsultasi Rp 0 sesuai layanan konsultasi online';
         } elseif ($hasConsultation) {
-            $totalKonsultasi = (float) $request->input('biaya_konsultasi', 100000);
-            $totalKonsultasi = $totalKonsultasi > 0 ? $totalKonsultasi : 100000;
+            $existingConsultationFee = (float) ($registrasi->total_konsultasi ?? 0);
+            $submittedConsultationFee = (float) $request->input('biaya_konsultasi', 0);
+
+            if ($existingConsultationFee > 0) {
+                $totalKonsultasi = $existingConsultationFee;
+            } elseif ($submittedConsultationFee > 0) {
+                $totalKonsultasi = $submittedConsultationFee;
+            } else {
+                $totalKonsultasi = 100000;
+            }
+
             $ruleBiayaKonsultasi = 1;
-            $catatanBiayaKonsultasi = 'Biaya konsultasi dokter';
+            $catatanBiayaKonsultasi = 'Biaya konsultasi mengikuti layanan: ' . (
+                $registrasi->konsultasi_source_name ?: 'Konsultasi Dokter'
+            );
         }
 
         $hasSaranDokterPenjualan = Schema::hasColumn('registrasi_penjualan_detail', 'is_saran_dokter')
-            && $penjualanItems->contains(fn ($item) => (int) ($item->is_saran_dokter ?? 0) === 1);
+            && RegistrasiPenjualanDetail::query()
+                ->where('registrasi_id', $registrasi->id)
+                ->where('is_delete', 0)
+                ->where('status', '!=', 9)
+                ->where('is_saran_dokter', 1)
+                ->exists();
 
         $hasSaranDokterTreatment = Schema::hasColumn('registrasi_treatment_detail', 'is_saran_dokter')
-            && $treatmentItems->contains(fn ($item) => (int) ($item->is_saran_dokter ?? 0) === 1);
+            && RegistrasiTreatmentDetail::query()
+                ->where('registrasi_id', $registrasi->id)
+                ->where('is_delete', 0)
+                ->where('status', '!=', 9)
+                ->where('is_saran_dokter', 1)
+                ->exists();
 
         $channelKonsultasi = $registrasi->channel_konsultasi;
 
@@ -776,13 +827,18 @@ class AntrianDokterController extends Controller
             $channelKonsultasi = RegistrasiKunjungan::CHANNEL_OFFLINE;
         }
 
-        $perluTindakanPerawat = $treatmentItems->contains(
-            fn ($item) => (int) ($item->perlu_tindakan_perawat ?? 0) === 1
-        );
+        $perluTindakanPerawat = RegistrasiTreatmentDetail::query()
+            ->where('registrasi_id', $registrasi->id)
+            ->where('is_delete', 0)
+            ->where('status', '!=', 9)
+            ->where('perlu_tindakan_perawat', 1)
+            ->exists();
 
         $registrasi->update($this->onlyExistingColumns('registrasi_kunjungan', [
             'channel_konsultasi' => $channelKonsultasi,
-            'is_konsultasi_tambahan_dokter' => $addConsultation ? 1 : (int) $registrasi->is_konsultasi_tambahan_dokter,
+            'is_konsultasi_tambahan_dokter' => $addConsultation
+                ? 1
+                : (int) $registrasi->is_konsultasi_tambahan_dokter,
             'has_saran_dokter' => ($hasSaranDokterPenjualan || $hasSaranDokterTreatment || $addConsultation) ? 1 : 0,
             'is_treatment' => $hasTreatment ? 1 : 0,
             'is_penjualan' => $hasPenjualan ? 1 : 0,
