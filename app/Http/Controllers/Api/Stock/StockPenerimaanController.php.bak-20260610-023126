@@ -2,8 +2,6 @@
 
 namespace App\Http\Controllers\Api\Stock;
 
-use App\Models\Master\MasterProduk;
-use App\Models\Master\MasterTempatProduk;
 use App\Models\Stock\StockPenerimaan;
 use App\Models\Stock\StockPenerimaanDetail;
 use Illuminate\Http\Request;
@@ -84,7 +82,7 @@ class StockPenerimaanController extends BaseStockController
         $request->validate([
             'tanggal' => 'required|date',
             'toko_id' => 'required|integer',
-            'tempat_produk_id' => 'nullable|integer',
+            'tempat_produk_id' => 'required|integer',
             'supplier_id' => 'nullable|integer',
             'no_faktur_supplier' => 'nullable|string|max:100',
             'tanggal_faktur' => 'nullable|date',
@@ -105,7 +103,6 @@ class StockPenerimaanController extends BaseStockController
 
         try {
             $user = $this->userName($request);
-            $tempatProdukId = $this->resolveTempatProdukId($request);
 
             $kode = $request->kode_penerimaan
                 ?? $this->generateKodePenerimaan($request->toko_id);
@@ -125,7 +122,7 @@ class StockPenerimaanController extends BaseStockController
                 'kode_penerimaan' => $kode,
                 'tanggal' => $request->tanggal,
                 'toko_id' => $request->toko_id,
-                'tempat_produk_id' => $tempatProdukId,
+                'tempat_produk_id' => $request->tempat_produk_id,
                 'supplier_id' => $request->supplier_id,
                 'no_faktur_supplier' => $request->no_faktur_supplier,
                 'tanggal_faktur' => $request->tanggal_faktur,
@@ -146,7 +143,7 @@ class StockPenerimaanController extends BaseStockController
                 StockPenerimaanDetail::create([
                     'penerimaan_id' => $penerimaan->id,
                     'toko_id' => $request->toko_id,
-                    'tempat_produk_id' => $tempatProdukId,
+                    'tempat_produk_id' => $request->tempat_produk_id,
                     'produk_toko_id' => $detail['produk_toko_id'],
                     'produk_id' => $detail['produk_id'],
                     'qty' => $qty,
@@ -181,7 +178,7 @@ class StockPenerimaanController extends BaseStockController
         $request->validate([
             'tanggal' => 'required|date',
             'toko_id' => 'required|integer',
-            'tempat_produk_id' => 'nullable|integer',
+            'tempat_produk_id' => 'required|integer',
             'supplier_id' => 'nullable|integer',
             'no_faktur_supplier' => 'nullable|string|max:100',
             'tanggal_faktur' => 'nullable|date',
@@ -202,7 +199,6 @@ class StockPenerimaanController extends BaseStockController
 
         try {
             $user = $this->userName($request);
-            $tempatProdukId = $this->resolveTempatProdukId($request);
 
             $penerimaan = StockPenerimaan::active()->findOrFail($id);
 
@@ -224,7 +220,7 @@ class StockPenerimaanController extends BaseStockController
             $penerimaan->update([
                 'tanggal' => $request->tanggal,
                 'toko_id' => $request->toko_id,
-                'tempat_produk_id' => $tempatProdukId,
+                'tempat_produk_id' => $request->tempat_produk_id,
                 'supplier_id' => $request->supplier_id,
                 'no_faktur_supplier' => $request->no_faktur_supplier,
                 'tanggal_faktur' => $request->tanggal_faktur,
@@ -250,7 +246,7 @@ class StockPenerimaanController extends BaseStockController
                 StockPenerimaanDetail::create([
                     'penerimaan_id' => $penerimaan->id,
                     'toko_id' => $request->toko_id,
-                    'tempat_produk_id' => $tempatProdukId,
+                    'tempat_produk_id' => $request->tempat_produk_id,
                     'produk_toko_id' => $detail['produk_toko_id'],
                     'produk_id' => $detail['produk_id'],
                     'qty' => $qty,
@@ -285,7 +281,6 @@ class StockPenerimaanController extends BaseStockController
 
         try {
             $user = $this->userName($request);
-            $tempatProdukId = $this->resolveTempatProdukId($request);
 
             $penerimaan = StockPenerimaan::with(['details'])
                 ->active()
@@ -385,7 +380,6 @@ class StockPenerimaanController extends BaseStockController
 
         try {
             $user = $this->userName($request);
-            $tempatProdukId = $this->resolveTempatProdukId($request);
 
             $penerimaan = StockPenerimaan::active()
                 ->lockForUpdate()
@@ -414,56 +408,6 @@ class StockPenerimaanController extends BaseStockController
 
             return $this->errorResponse('Gagal membatalkan penerimaan', $e->getMessage());
         }
-    }
-
-
-    protected function resolveTempatProdukId(Request $request): int
-    {
-        if ($request->filled('tempat_produk_id')) {
-            return (int) $request->tempat_produk_id;
-        }
-
-        $produkId = collect($request->input('details', []))
-            ->pluck('produk_id')
-            ->filter()
-            ->first();
-
-        if ($produkId) {
-            $tempatProdukId = MasterProduk::where('id', $produkId)
-                ->where(function ($query) {
-                    $query->where('is_delete', 0)
-                        ->orWhereNull('is_delete');
-                })
-                ->value('tempat_produk_id');
-
-            if ($tempatProdukId) {
-                return (int) $tempatProdukId;
-            }
-        }
-
-        $apotekId = MasterTempatProduk::where(function ($query) {
-                $query->where('is_delete', 0)
-                    ->orWhereNull('is_delete');
-            })
-            ->whereRaw('LOWER(nama_tempat_produk) = ?', ['apotek'])
-            ->value('id');
-
-        if ($apotekId) {
-            return (int) $apotekId;
-        }
-
-        $firstId = MasterTempatProduk::where(function ($query) {
-                $query->where('is_delete', 0)
-                    ->orWhereNull('is_delete');
-            })
-            ->orderBy('id')
-            ->value('id');
-
-        if ($firstId) {
-            return (int) $firstId;
-        }
-
-        abort(422, 'Master tempat produk belum tersedia.');
     }
 
     protected function generateKodePenerimaan($tokoId)

@@ -956,12 +956,10 @@ class RegistrasiLayananController extends Controller
             }
 
             if ($adaPenjualan) {
-                $penjualanItems = $this->stockTransactionService
-                    ->prepareRegistrasiPenjualanItems(
-                        $penjualanItems,
-                        $tokoId,
-                        $this->username()
-                    );
+                $penjualanItems = $this->ensureAndValidatePenjualanStockFromMaster(
+                    $penjualanItems,
+                    $tokoId
+                );
             }
 
             $needNurseStation = collect($treatmentItems)->contains(function ($item) {

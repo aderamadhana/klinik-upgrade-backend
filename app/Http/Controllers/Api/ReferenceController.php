@@ -254,6 +254,42 @@ class ReferenceController extends Controller
             ], 422);
         }
 
+        /*
+        * Penerimaan yang dianggap mengaktifkan saldo stock_produk_toko
+        * hanya penerimaan yang sudah POSTED dan tidak dihapus.
+        *
+        * Key dibuat per produk_toko_id + tempat_produk_id agar penerimaan
+        * di Apotek tidak dianggap sebagai penerimaan untuk Kabin, dan sebaliknya.
+        */
+        $penerimaanPostedKeys = \App\Models\Stock\StockPenerimaanDetail::query()
+            ->from('stock_penerimaan_detail as spd')
+            ->join('stock_penerimaan as sp', 'sp.id', '=', 'spd.penerimaan_id')
+            ->where('spd.toko_id', $tokoId)
+            ->where('sp.toko_id', $tokoId)
+            ->where('sp.status', 'POSTED')
+            ->where(function ($q) {
+                $q->where('spd.is_delete', 0)
+                    ->orWhereNull('spd.is_delete');
+            })
+            ->where(function ($q) {
+                $q->where('sp.is_delete', 0)
+                    ->orWhereNull('sp.is_delete');
+            })
+            ->when($tempatProdukId, function ($q) use ($tempatProdukId) {
+                $q->where('spd.tempat_produk_id', $tempatProdukId);
+            })
+            ->select([
+                'spd.produk_toko_id',
+                'spd.tempat_produk_id',
+            ])
+            ->distinct()
+            ->get()
+            ->mapWithKeys(function ($item) {
+                $key = (int) $item->produk_toko_id . ':' . (int) $item->tempat_produk_id;
+
+                return [$key => true];
+            });
+
         $data = MasterProdukToko::query()
             ->active()
             ->where('toko_id', $tokoId)
@@ -302,7 +338,7 @@ class ReferenceController extends Controller
             ->orderBy('sort_order')
             ->orderBy('id')
             ->get()
-            ->map(function ($produkToko) use ($tokoId, $tempatProdukId) {
+            ->map(function ($produkToko) use ($tokoId, $tempatProdukId, $penerimaanPostedKeys) {
                 $produk = $produkToko->produk;
 
                 if (!$produk) {
@@ -327,34 +363,93 @@ class ReferenceController extends Controller
                     $stock = $stockRows->first();
                 }
 
-                $resolvedTempatProdukId = $stock->tempat_produk_id
+                $resolvedTempatProdukId = (int) (
+                    $stock->tempat_produk_id
                     ?? $preferredTempatProdukId
-                    ?? 1;
+                    ?? 1
+                );
 
                 $namaTempatProduk = $stock?->tempatProduk?->nama_tempat_produk
                     ?? $produk?->tempatProduk?->nama_tempat_produk
                     ?? $produk?->tempatProduk?->nama
                     ?? '-';
 
-                $stokAwalMaster = (float) ($produkToko->stok_awal ?? 0);
+                $penerimaanKey = (int) $produkToko->id . ':' . $resolvedTempatProdukId;
+                $sudahAdaPenerimaan = $penerimaanPostedKeys->has($penerimaanKey);
+                $belumAdaPenerimaan = !$sudahAdaPenerimaan;
 
-                if ($stock) {
+                $stokAwalMaster = (float) ($produkToko->stok_awal ?? 0);
+                $stokMasukStock = (float) ($stock->stok_masuk ?? 0);
+                $stokKeluarStock = (float) ($stock->stok_keluar ?? 0);
+                $stokPenyesuaianStock = (float) ($stock->stok_penyesuaian ?? 0);
+                $stokReservedStock = (float) ($stock->stok_reserved ?? 0);
+
+                /*
+                * Selama belum ada penerimaan POSTED, stok awal master menjadi
+                * saldo dasar. Mutasi yang sudah ada tetap diperhitungkan supaya
+                * stok tidak kembali ke angka awal setelah terjadi pengeluaran
+                * atau penyesuaian.
+                */
+                if ($belumAdaPenerimaan) {
                     $stokAwal = $stokAwalMaster;
-                    $stokMasuk = (float) ($stock->stok_masuk ?? 0);
-                    $stokKeluar = (float) ($stock->stok_keluar ?? 0);
-                    $stokPenyesuaian = (float) ($stock->stok_penyesuaian ?? 0);
-                    $stokAkhir = (float) ($stock->stok_akhir ?? 0);
-                    $stokReserved = (float) ($stock->stok_reserved ?? 0);
+                    $stokMasuk = $stokMasukStock;
+                    $stokKeluar = $stokKeluarStock;
+                    $stokPenyesuaian = $stokPenyesuaianStock;
+                    $stokAkhir = max(
+                        $stokAwalMaster
+                        + $stokMasukStock
+                        + $stokPenyesuaianStock
+                        - $stokKeluarStock,
+                        0
+                    );
+                    $stokReserved = $stokReservedStock;
                     $stokMinimum = (float) ($stock->stok_minimum ?? $produkToko->stok_minimum ?? 0);
 
-                    $hargaBeliTerakhir = (float) ($stock->harga_beli_terakhir ?? $produkToko->harga_beli ?? 0);
-                    $hargaJualTerakhir = (float) ($stock->harga_jual_terakhir ?? $produkToko->harga_jual ?? 0);
+                    $hargaBeliTerakhir = (float) (
+                        $stock->harga_beli_terakhir
+                        ?? $produkToko->harga_beli
+                        ?? 0
+                    );
+                    $hargaJualTerakhir = (float) (
+                        $stock->harga_jual_terakhir
+                        ?? $produkToko->harga_jual
+                        ?? 0
+                    );
+
+                    $stockProdukTokoId = $stock->id ?? null;
+                    $sumberStok = 'master_produk_toko';
+                    $belumAdaSaldoStok = 1;
+                    $lastMutationAt = $stock->last_mutation_at ?? null;
+                } elseif ($stock) {
+                    $stokAwal = $stokAwalMaster;
+                    $stokMasuk = $stokMasukStock;
+                    $stokKeluar = $stokKeluarStock;
+                    $stokPenyesuaian = $stokPenyesuaianStock;
+                    $stokAkhir = (float) ($stock->stok_akhir ?? 0);
+                    $stokReserved = $stokReservedStock;
+                    $stokMinimum = (float) ($stock->stok_minimum ?? $produkToko->stok_minimum ?? 0);
+
+                    $hargaBeliTerakhir = (float) (
+                        $stock->harga_beli_terakhir
+                        ?? $produkToko->harga_beli
+                        ?? 0
+                    );
+                    $hargaJualTerakhir = (float) (
+                        $stock->harga_jual_terakhir
+                        ?? $produkToko->harga_jual
+                        ?? 0
+                    );
 
                     $stockProdukTokoId = $stock->id;
                     $sumberStok = 'stock_produk_toko';
                     $belumAdaSaldoStok = 0;
                     $lastMutationAt = $stock->last_mutation_at ?? null;
                 } else {
+                    /*
+                    * Kondisi defensif: penerimaan sudah POSTED tetapi saldo belum
+                    * terbentuk. Data tetap ditampilkan dari master, tetapi flag
+                    * belum_ada_penerimaan tetap 0 agar inkonsistensi mudah dilacak.
+                    */
                     $stokAwal = $stokAwalMaster;
                     $stokMasuk = 0;
                     $stokKeluar = 0;
@@ -367,7 +462,7 @@ class ReferenceController extends Controller
                     $hargaJualTerakhir = (float) ($produkToko->harga_jual ?? 0);
 
                     $stockProdukTokoId = null;
-                    $sumberStok = 'master_produk_toko';
+                    $sumberStok = 'master_produk_toko_fallback';
                     $belumAdaSaldoStok = 1;
                     $lastMutationAt = null;
                 }
@@ -375,7 +470,11 @@ class ReferenceController extends Controller
                 $stokTersedia = max($stokAkhir - $stokReserved, 0);
 
                 $isStokHabis = $stokTersedia <= 0 ? 1 : 0;
-                $isStokMinimum = $stokTersedia > 0 && $stokMinimum > 0 && $stokTersedia <= $stokMinimum ? 1 : 0;
+                $isStokMinimum = $stokTersedia > 0
+                    && $stokMinimum > 0
+                    && $stokTersedia <= $stokMinimum
+                        ? 1
+                        : 0;
 
                 if ($isStokHabis) {
                     $statusStok = 'HABIS';
@@ -391,13 +490,13 @@ class ReferenceController extends Controller
                 $labelProduk = trim($kodeProduk . ' - ' . $namaProduk);
 
                 $labelDropdown = trim(
-                    $kodeProduk .
-                    ' - ' .
-                    $namaProduk .
-                    ' | ' .
-                    $namaTempatProduk .
-                    ' | Bisa dijual: ' .
-                    $stokTersedia
+                    $kodeProduk
+                    . ' - '
+                    . $namaProduk
+                    . ' | '
+                    . $namaTempatProduk
+                    . ' | Bisa dijual: '
+                    . $stokTersedia
                 );
 
                 return [
@@ -450,6 +549,7 @@ class ReferenceController extends Controller
 
                     'sumber_stok' => $sumberStok,
                     'belum_ada_saldo_stok' => $belumAdaSaldoStok,
+                    'belum_ada_penerimaan' => $belumAdaPenerimaan ? 1 : 0,
                     'last_mutation_at' => $lastMutationAt,
 
                     'fee_dokter' => (float) ($produkToko->fee_dokter ?? 0),
@@ -482,6 +582,7 @@ class ReferenceController extends Controller
             'data' => $data,
         ]);
     }
+
     public function treatmentByToko(Request $request)
     {
         $tokoId = $request->get('toko_id');

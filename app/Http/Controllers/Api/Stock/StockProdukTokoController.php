@@ -21,10 +21,10 @@ class StockProdukTokoController extends BaseStockController
         ]);
 
         $query = StockProdukToko::with([
-                'produkToko.produk',
-                'produk',
-                'toko',
-            ])
+            'produkToko.produk',
+            'produk',
+            'toko',
+        ])
             ->active()
             ->where('toko_id', $request->toko_id);
 
@@ -58,6 +58,7 @@ class StockProdukTokoController extends BaseStockController
 
         if ($request->filled('keyword')) {
             $keyword = $request->keyword;
+
             $query->where(function ($q) use ($keyword) {
                 $q->whereHas('produkToko.produk', function ($produkQuery) use ($keyword) {
                     $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
@@ -89,10 +90,10 @@ class StockProdukTokoController extends BaseStockController
     public function show($id)
     {
         $stock = StockProdukToko::with([
-                'produkToko.produk',
-                'produk',
-                'toko',
-            ])
+            'produkToko.produk',
+            'produk',
+            'toko',
+        ])
             ->active()
             ->findOrFail($id);
 
@@ -128,11 +129,11 @@ class StockProdukTokoController extends BaseStockController
         }
 
         $query = StockMutasiProduk::with([
-                'produkToko.produk',
-                'produk',
-                'toko',
-                'stockProdukToko',
-            ])
+            'produkToko.produk',
+            'produk',
+            'toko',
+            'stockProdukToko',
+        ])
             ->where('toko_id', $request->toko_id)
             ->where('produk_id', $produkId)
             ->notVoid();
@@ -184,10 +185,10 @@ class StockProdukTokoController extends BaseStockController
         }
 
         $stockRows = StockProdukToko::with([
-                'produkToko.produk',
-                'produk',
-                'toko',
-            ])
+            'produkToko.produk',
+            'produk',
+            'toko',
+        ])
             ->active()
             ->where('toko_id', $request->toko_id)
             ->where('produk_id', $produkId)
@@ -224,18 +225,23 @@ class StockProdukTokoController extends BaseStockController
         $request->validate([
             'toko_id' => 'required|integer',
             'keyword' => 'nullable|string|max:100',
+            'search' => 'nullable|string|max:100',
+            'page' => 'nullable|integer|min:1',
+            'per_page' => 'nullable|integer|min:1|max:100',
             'limit' => 'nullable|integer|min:1|max:1000',
         ]);
 
         $tokoId = (int) $request->toko_id;
-        $limit = (int) ($request->limit ?: 500);
+        $keyword = trim((string) ($request->input('search') ?: $request->input('keyword', '')));
+        $usePagination = $request->filled('page') || $request->filled('per_page');
+        $perPage = (int) ($request->input('per_page') ?: 10);
+        $limit = (int) ($request->input('limit') ?: 500);
 
         $produkQuery = MasterProdukToko::with(['produk', 'toko'])
             ->active()
             ->where('toko_id', $tokoId);
 
-        if ($request->filled('keyword')) {
-            $keyword = $request->keyword;
+        if ($keyword !== '') {
             $produkQuery->where(function ($q) use ($keyword) {
                 $q->whereHas('produk', function ($produkQuery) use ($keyword) {
                     $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
@@ -246,48 +252,126 @@ class StockProdukTokoController extends BaseStockController
             });
         }
 
-        $produkToko = $produkQuery->orderByDesc('id')
-            ->limit($limit)
-            ->get();
+        $produkQuery->orderByDesc('id');
+
+        if ($usePagination) {
+            $result = $produkQuery->paginate($perPage);
+            $produkToko = $result->getCollection();
+        } else {
+            $result = null;
+            $produkToko = $produkQuery->limit($limit)->get();
+        }
 
         $produkTokoIds = $produkToko->pluck('id')->filter()->values();
         $produkIds = $produkToko->pluck('produk_id')->filter()->unique()->values();
 
-        $stockQuery = StockProdukToko::query()
-            ->active()
-            ->where('toko_id', $tokoId);
+        $stockRows = collect();
+        $mutasiProdukTokoIds = collect();
+        $mutasiProdukIds = collect();
 
-        if ($produkTokoIds->isNotEmpty()) {
-            $stockQuery->where(function ($query) use ($produkTokoIds, $produkIds) {
-                $query->whereIn('produk_toko_id', $produkTokoIds);
+        if ($produkTokoIds->isNotEmpty() || $produkIds->isNotEmpty()) {
+            $stockQuery = StockProdukToko::query()
+                ->active()
+                ->where('toko_id', $tokoId)
+                ->where(function ($query) use ($produkTokoIds, $produkIds) {
+                    if ($produkTokoIds->isNotEmpty()) {
+                        $query->whereIn('produk_toko_id', $produkTokoIds);
+                    }
 
-                if ($produkIds->isNotEmpty()) {
-                    $query->orWhereIn('produk_id', $produkIds);
-                }
-            });
-        } elseif ($produkIds->isNotEmpty()) {
-            $stockQuery->whereIn('produk_id', $produkIds);
+                    if ($produkIds->isNotEmpty()) {
+                        if ($produkTokoIds->isNotEmpty()) {
+                            $query->orWhereIn('produk_id', $produkIds);
+                        } else {
+                            $query->whereIn('produk_id', $produkIds);
+                        }
+                    }
+                });
+
+            $stockRows = $stockQuery->get()
+                ->groupBy(function ($stock) {
+                    return $stock->produk_toko_id ?: 'produk-' . $stock->produk_id;
+                });
+
+            $mutasi = StockMutasiProduk::query()
+                ->where('toko_id', $tokoId)
+                ->notVoid()
+                ->where(function ($query) use ($produkTokoIds, $produkIds) {
+                    if ($produkTokoIds->isNotEmpty()) {
+                        $query->whereIn('produk_toko_id', $produkTokoIds);
+                    }
+
+                    if ($produkIds->isNotEmpty()) {
+                        if ($produkTokoIds->isNotEmpty()) {
+                            $query->orWhereIn('produk_id', $produkIds);
+                        } else {
+                            $query->whereIn('produk_id', $produkIds);
+                        }
+                    }
+                })
+                ->get(['produk_toko_id', 'produk_id']);
+
+            $mutasiProdukTokoIds = $mutasi->pluck('produk_toko_id')
+                ->filter()
+                ->map(fn ($id) => (int) $id)
+                ->unique()
+                ->values();
+
+            $mutasiProdukIds = $mutasi->pluck('produk_id')
+                ->filter()
+                ->map(fn ($id) => (int) $id)
+                ->unique()
+                ->values();
         }
 
-        $stockRows = $stockQuery->get()
-            ->groupBy(function ($stock) {
-                return $stock->produk_toko_id ?: 'produk-' . $stock->produk_id;
-            });
-
-        $items = $produkToko->map(function ($produk) use ($stockRows) {
+        $items = $produkToko->map(function ($produk) use (
+            $stockRows,
+            $mutasiProdukTokoIds,
+            $mutasiProdukIds
+        ) {
             $stockByProdukToko = $stockRows->get($produk->id, collect());
             $stockByProdukId = $stockRows->get('produk-' . $produk->produk_id, collect());
-            $stockCollection = $stockByProdukToko->merge($stockByProdukId);
-
+            $stockCollection = $stockByProdukToko->merge($stockByProdukId)->unique('id')->values();
             $latestStock = $stockCollection->sortByDesc('updated_at')->first();
 
-            $stokAkhir = $stockCollection->sum('stok_akhir');
-            $stokReserved = $stockCollection->sum('stok_reserved');
-            $stokTersedia = $stockCollection->sum('stok_tersedia');
+            $hasMutasi = $mutasiProdukTokoIds->contains((int) $produk->id)
+                || $mutasiProdukIds->contains((int) $produk->produk_id);
 
-            if (!$stokTersedia && $stokAkhir > 0) {
-                $stokTersedia = max($stokAkhir - $stokReserved, 0);
-            }
+            $hasOperationalStock = $stockCollection->contains(function ($stock) {
+                return abs((float) $stock->stok_awal) > 0
+                    || abs((float) $stock->stok_masuk) > 0
+                    || abs((float) $stock->stok_keluar) > 0
+                    || abs((float) $stock->stok_penyesuaian) > 0
+                    || abs((float) $stock->stok_akhir) > 0
+                    || abs((float) $stock->stok_reserved) > 0
+                    || !empty($stock->last_mutation_at);
+            });
+
+            $useMasterFallback = $stockCollection->isEmpty()
+                || (!$hasOperationalStock && !$hasMutasi);
+
+            $masterStokAwal = (float) ($produk->stok_awal ?? 0);
+            $stokAwal = $useMasterFallback
+                ? $masterStokAwal
+                : (float) $stockCollection->sum('stok_awal');
+            $stokMasuk = $useMasterFallback
+                ? 0
+                : (float) $stockCollection->sum('stok_masuk');
+            $stokKeluar = $useMasterFallback
+                ? 0
+                : (float) $stockCollection->sum('stok_keluar');
+            $stokPenyesuaian = $useMasterFallback
+                ? 0
+                : (float) $stockCollection->sum('stok_penyesuaian');
+            $stokAkhir = $useMasterFallback
+                ? $masterStokAwal
+                : (float) $stockCollection->sum('stok_akhir');
+            $stokReserved = $useMasterFallback
+                ? 0
+                : (float) $stockCollection->sum('stok_reserved');
+            $stokTersedia = max($stokAkhir - $stokReserved, 0);
+            $stokMinimum = $useMasterFallback
+                ? (float) ($produk->stok_minimum ?? 0)
+                : (float) (optional($latestStock)->stok_minimum ?? $produk->stok_minimum ?? 0);
 
             $produkMaster = $produk->produk;
             $namaProduk = optional($produkMaster)->nama_produk
@@ -301,24 +385,39 @@ class StockProdukTokoController extends BaseStockController
                 'produk_toko_id' => $produk->id,
                 'produk_id' => $produk->produk_id,
                 'toko_id' => $produk->toko_id,
-                'kode_produk' => optional($produkMaster)->kode_produk ?: optional($produkMaster)->kode_obat ?: $produk->kode_produk ?: $produk->kode_obat,
+                'kode_produk' => optional($produkMaster)->kode_produk
+                    ?: optional($produkMaster)->kode_obat
+                    ?: $produk->kode_produk
+                    ?: $produk->kode_obat,
                 'nama_produk' => $namaProduk,
-                'satuan' => optional($produkMaster)->satuan ?: optional($produkMaster)->unit ?: $produk->satuan,
-                'stok_awal' => $stockCollection->sum('stok_awal'),
-                'stok_masuk' => $stockCollection->sum('stok_masuk'),
-                'stok_keluar' => $stockCollection->sum('stok_keluar'),
-                'stok_penyesuaian' => $stockCollection->sum('stok_penyesuaian'),
+                'satuan' => optional($produkMaster)->satuan
+                    ?: optional($produkMaster)->unit
+                    ?: $produk->satuan,
+                'stok_awal' => $stokAwal,
+                'stok_masuk' => $stokMasuk,
+                'stok_keluar' => $stokKeluar,
+                'stok_penyesuaian' => $stokPenyesuaian,
                 'stok_akhir' => $stokAkhir,
                 'stok_reserved' => $stokReserved,
                 'stok_tersedia' => $stokTersedia,
-                'stok_minimal' => optional($latestStock)->stok_minimal ?: optional($latestStock)->stok_minimum ?: 0,
+                'stok_minimal' => $stokMinimum,
+                'stok_minimum' => $stokMinimum,
                 'harga_beli' => $produk->harga_beli,
                 'harga_jual' => $produk->harga_jual,
+                'sumber_stok' => $useMasterFallback
+                    ? 'master_produk_toko'
+                    : 'stock_produk_toko',
                 'produk_toko' => $produk,
                 'produk' => $produkMaster,
                 'updated_at' => optional($latestStock)->updated_at,
             ];
         })->values();
+
+        if ($usePagination) {
+            $result->setCollection($items);
+
+            return $this->successResponse($result);
+        }
 
         return $this->successResponse($items);
     }

@@ -57,6 +57,11 @@ class StockMutasiProduk extends BaseStockModel
     {
         return $this->belongsTo(MasterTempatProduk::class, 'tempat_produk_id', 'id');
     }
+    
+    public function stockProdukToko()
+    {
+        return $this->belongsTo(StockProdukToko::class, 'produk_toko_id', 'produk_toko_id');
+    }
 
     public function scopeByToko($query, $tokoId)
     {

@@ -2,8 +2,6 @@
 
 namespace App\Http\Controllers\Api\Stock;
 
-use App\Models\Master\MasterProduk;
-use App\Models\Master\MasterTempatProduk;
 use App\Models\Stock\StockPenerimaan;
 use App\Models\Stock\StockPenerimaanDetail;
 use Illuminate\Http\Request;
@@ -105,7 +103,6 @@ class StockPenerimaanController extends BaseStockController
 
         try {
             $user = $this->userName($request);
-            $tempatProdukId = $this->resolveTempatProdukId($request);
 
             $kode = $request->kode_penerimaan
                 ?? $this->generateKodePenerimaan($request->toko_id);
@@ -125,7 +122,7 @@ class StockPenerimaanController extends BaseStockController
                 'kode_penerimaan' => $kode,
                 'tanggal' => $request->tanggal,
                 'toko_id' => $request->toko_id,
-                'tempat_produk_id' => $tempatProdukId,
+                // 'tempat_produk_id' => $tempatProdukId,
                 'supplier_id' => $request->supplier_id,
                 'no_faktur_supplier' => $request->no_faktur_supplier,
                 'tanggal_faktur' => $request->tanggal_faktur,
@@ -146,7 +143,7 @@ class StockPenerimaanController extends BaseStockController
                 StockPenerimaanDetail::create([
                     'penerimaan_id' => $penerimaan->id,
                     'toko_id' => $request->toko_id,
-                    'tempat_produk_id' => $tempatProdukId,
+                    // 'tempat_produk_id' => $tempatProdukId,
                     'produk_toko_id' => $detail['produk_toko_id'],
                     'produk_id' => $detail['produk_id'],
                     'qty' => $qty,
@@ -224,7 +221,7 @@ class StockPenerimaanController extends BaseStockController
             $penerimaan->update([
                 'tanggal' => $request->tanggal,
                 'toko_id' => $request->toko_id,
-                'tempat_produk_id' => $tempatProdukId,
+                // 'tempat_produk_id' => $tempatProdukId,
                 'supplier_id' => $request->supplier_id,
                 'no_faktur_supplier' => $request->no_faktur_supplier,
                 'tanggal_faktur' => $request->tanggal_faktur,
@@ -285,7 +282,6 @@ class StockPenerimaanController extends BaseStockController
 
         try {
             $user = $this->userName($request);
-            $tempatProdukId = $this->resolveTempatProdukId($request);
 
             $penerimaan = StockPenerimaan::with(['details'])
                 ->active()
@@ -385,7 +381,6 @@ class StockPenerimaanController extends BaseStockController
 
         try {
             $user = $this->userName($request);
-            $tempatProdukId = $this->resolveTempatProdukId($request);
 
             $penerimaan = StockPenerimaan::active()
                 ->lockForUpdate()
@@ -423,25 +418,8 @@ class StockPenerimaanController extends BaseStockController
             return (int) $request->tempat_produk_id;
         }
 
-        $produkId = collect($request->input('details', []))
-            ->pluck('produk_id')
-            ->filter()
-            ->first();
-
-        if ($produkId) {
-            $tempatProdukId = MasterProduk::where('id', $produkId)
-                ->where(function ($query) {
-                    $query->where('is_delete', 0)
-                        ->orWhereNull('is_delete');
-                })
-                ->value('tempat_produk_id');
-
-            if ($tempatProdukId) {
-                return (int) $tempatProdukId;
-            }
-        }
-
-        $apotekId = MasterTempatProduk::where(function ($query) {
+        $apotekId = DB::table('master_tempat_produk')
+            ->where(function ($query) {
                 $query->where('is_delete', 0)
                     ->orWhereNull('is_delete');
             })
@@ -452,7 +430,8 @@ class StockPenerimaanController extends BaseStockController
             return (int) $apotekId;
         }
 
-        $firstId = MasterTempatProduk::where(function ($query) {
+        $firstId = DB::table('master_tempat_produk')
+            ->where(function ($query) {
                 $query->where('is_delete', 0)
                     ->orWhereNull('is_delete');
             })
