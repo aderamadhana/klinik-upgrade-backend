@@ -29,6 +29,8 @@ use App\Http\Controllers\Api\Administrasi\PasienDepositController;
 
 use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
 
+use App\Http\Controllers\Api\Farmasi\AntrianResepController;
+
 use App\Http\Controllers\Api\PelayananMedis\AntrianDokterController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatCpptController;
@@ -89,6 +91,17 @@ Route::middleware('auth:api')->group(function () {
             ->whereNumber('depositId');
         Route::get('pasien/{id}/riwayat', [PasienController::class, 'riwayat'])->whereNumber('id');
         Route::apiResource('pasien', PasienController::class);
+    });
+
+    Route::prefix('farmasi')->group(function () {
+        Route::prefix('antrian-resep')->group(function () {
+            Route::get('/', [AntrianResepController::class, 'index']);
+            Route::get('/petugas', [AntrianResepController::class, 'petugas']);
+            Route::get('/{id}/print', [AntrianResepController::class, 'cetak'])->whereNumber('id');
+            Route::get('/{id}', [AntrianResepController::class, 'show'])->whereNumber('id');
+            Route::post('/{id}/start', [AntrianResepController::class, 'start'])->whereNumber('id');
+            Route::post('/{id}/finish', [AntrianResepController::class, 'finish'])->whereNumber('id');
+        });
     });
 
     Route::prefix('registrasi-layanan')->group(function () {
