@@ -4,15 +4,16 @@ namespace App\Models\Registrasi;
 
 class RegistrasiPerawatBeforeAfterFoto extends BaseRegistrasiModel
 {
-    const TAHAP_BEFORE = 1;
-    const TAHAP_AFTER = 2;
+    public const TIPE_BEFORE = 'before';
+    public const TIPE_AFTER = 'after';
+
+    // Alias dipertahankan agar pemanggilan lama tidak langsung rusak.
+    public const TAHAP_BEFORE = self::TIPE_BEFORE;
+    public const TAHAP_AFTER = self::TIPE_AFTER;
 
     protected $table = 'registrasi_perawat_before_after_foto';
-
     protected $primaryKey = 'id';
-
     protected $guarded = ['id'];
-
     public $timestamps = false;
 
     protected $casts = [
@@ -20,9 +21,9 @@ class RegistrasiPerawatBeforeAfterFoto extends BaseRegistrasiModel
         'registrasi_id' => 'integer',
         'task_id' => 'integer',
         'treatment_detail_id' => 'integer',
-        'tahap' => 'integer',
-        'slot_no' => 'integer',
-        'file_size' => 'integer',
+        'urutan' => 'integer',
+        'tanggal_upload' => 'datetime',
+        'uploaded_by' => 'integer',
         'is_delete' => 'boolean',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
@@ -40,36 +41,45 @@ class RegistrasiPerawatBeforeAfterFoto extends BaseRegistrasiModel
 
     public function treatmentDetail()
     {
-        return $this->belongsTo(RegistrasiTreatmentDetail::class, 'treatment_detail_id', 'id');
-    }
-
-    public function scopeByTask($query, $taskId)
-    {
-        return $query->where('task_id', $taskId);
-    }
-
-    public function scopeByTreatmentDetail($query, $treatmentDetailId)
-    {
-        return $query->where('treatment_detail_id', $treatmentDetailId);
+        return $this->belongsTo(
+            RegistrasiTreatmentDetail::class,
+            'treatment_detail_id',
+            'id',
+        );
     }
 
     public function scopeBefore($query)
     {
-        return $query->where('tahap', self::TAHAP_BEFORE);
+        return $query->where('tipe_foto', self::TIPE_BEFORE);
     }
 
     public function scopeAfter($query)
     {
-        return $query->where('tahap', self::TAHAP_AFTER);
+        return $query->where('tipe_foto', self::TIPE_AFTER);
     }
 
-    public function scopeBySlot($query, $slotNo)
+    public function scopeByType($query, string $type)
     {
-        return $query->where('slot_no', $slotNo);
+        return $query->where('tipe_foto', $type);
     }
 
-    public function getTahapLabelAttribute()
+    public function scopeByOrder($query, int $order)
     {
-        return (int) $this->tahap === self::TAHAP_BEFORE ? 'Before' : 'After';
+        return $query->where('urutan', $order);
+    }
+
+    public function scopeBySlot($query, int $slotNo)
+    {
+        return $this->scopeByOrder($query, $slotNo);
+    }
+
+    public function getTipeFotoLabelAttribute(): string
+    {
+        return $this->tipe_foto === self::TIPE_BEFORE ? 'Before' : 'After';
+    }
+
+    public function getTahapLabelAttribute(): string
+    {
+        return $this->tipe_foto_label;
     }
 }

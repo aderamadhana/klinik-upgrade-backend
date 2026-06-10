@@ -32,6 +32,7 @@ use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianDokterController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatCpptController;
+use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatBeforeAfterController;
 use App\Http\Controllers\Api\PelayananMedis\RiwayatPelayananController;
 
 use App\Http\Controllers\Api\Kasir\PembayaranController;
@@ -125,6 +126,13 @@ Route::middleware('auth:api')->group(function () {
         });
         Route::prefix('antrian-perawat')->group(function () {
             Route::get('/', [AntrianPerawatController::class, 'index']);
+            Route::get('/{id}/before-after', [AntrianPerawatBeforeAfterController::class, 'show'])
+                ->whereNumber('id');
+            Route::get('/{id}/before-after/photo/{photoId}', [AntrianPerawatBeforeAfterController::class, 'photo'])
+                ->whereNumber('id')
+                ->whereNumber('photoId');
+            Route::post('/{id}/before-after', [AntrianPerawatBeforeAfterController::class, 'store'])
+                ->whereNumber('id');
             Route::get('/{id}', [AntrianPerawatController::class, 'show'])->whereNumber('id');
             Route::post('/{id}/start', [AntrianPerawatController::class, 'start'])->whereNumber('id');
             Route::post('/{id}/finish', [AntrianPerawatController::class, 'finish'])->whereNumber('id');
