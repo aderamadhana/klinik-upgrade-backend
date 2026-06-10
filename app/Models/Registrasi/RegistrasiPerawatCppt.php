@@ -8,15 +8,25 @@ use App\Models\Master\MasterSubjective;
 
 class RegistrasiPerawatCppt extends BaseRegistrasiModel
 {
-    const STATUS_DRAFT = 0;
-    const STATUS_FINAL = 1;
-    const STATUS_BATAL = 9;
+    public const STATUS_DRAFT = 0;
+    public const STATUS_FINAL = 1;
+    public const STATUS_BATAL = 9;
 
     protected $table = 'registrasi_perawat_cppt';
 
     protected $primaryKey = 'id';
 
     protected $guarded = ['id'];
+
+    protected $with = [
+        'subjectives',
+        'assessments',
+    ];
+
+    protected $appends = [
+        'subjective_ids',
+        'assessment_ids',
+    ];
 
     public $timestamps = false;
 
@@ -26,11 +36,8 @@ class RegistrasiPerawatCppt extends BaseRegistrasiModel
         'task_id' => 'integer',
         'dokter_id' => 'integer',
         'perawat_id' => 'integer',
-        'tanggal_jam' => 'datetime',
-        'subjective_category_id' => 'integer',
-        'assessment_id' => 'integer',
+        'tanggal_pengisian' => 'datetime',
         'status' => 'integer',
-        'finalized_at' => 'datetime',
         'is_delete' => 'boolean',
         'created_at' => 'datetime',
         'updated_at' => 'datetime',
@@ -56,14 +63,48 @@ class RegistrasiPerawatCppt extends BaseRegistrasiModel
         return $this->belongsTo(MasterKaryawan::class, 'perawat_id', 'id');
     }
 
-    public function subjectiveCategory()
+    public function subjectives()
     {
-        return $this->belongsTo(MasterSubjective::class, 'subjective_category_id', 'id');
+        return $this->belongsToMany(
+            MasterSubjective::class,
+            'registrasi_perawat_cppt_subjective',
+            'cppt_id',
+            'subjective_id'
+        )
+            ->withPivot(['sort_order', 'created_at'])
+            ->orderBy('registrasi_perawat_cppt_subjective.sort_order')
+            ->orderBy('registrasi_perawat_cppt_subjective.id');
     }
 
-    public function assessment()
+    public function assessments()
     {
-        return $this->belongsTo(MasterAssessment::class, 'assessment_id', 'id');
+        return $this->belongsToMany(
+            MasterAssessment::class,
+            'registrasi_perawat_cppt_assessment',
+            'cppt_id',
+            'assessment_id'
+        )
+            ->withPivot(['sort_order', 'created_at'])
+            ->orderBy('registrasi_perawat_cppt_assessment.sort_order')
+            ->orderBy('registrasi_perawat_cppt_assessment.id');
+    }
+
+    public function getSubjectiveIdsAttribute(): array
+    {
+        return $this->subjectives
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->values()
+            ->all();
+    }
+
+    public function getAssessmentIdsAttribute(): array
+    {
+        return $this->assessments
+            ->pluck('id')
+            ->map(fn ($id) => (int) $id)
+            ->values()
+            ->all();
     }
 
     public function scopeByTask($query, $taskId)
@@ -84,7 +125,8 @@ class RegistrasiPerawatCppt extends BaseRegistrasiModel
     public function markFinal($updatedBy = null)
     {
         $this->status = self::STATUS_FINAL;
-        $this->finalized_at = now();
+        $this->tanggal_pengisian = $this->tanggal_pengisian ?: now();
+        $this->updated_at = now();
 
         if ($updatedBy !== null) {
             $this->updated_by = $updatedBy;
@@ -96,6 +138,7 @@ class RegistrasiPerawatCppt extends BaseRegistrasiModel
     public function markCancelled($updatedBy = null)
     {
         $this->status = self::STATUS_BATAL;
+        $this->updated_at = now();
 
         if ($updatedBy !== null) {
             $this->updated_by = $updatedBy;

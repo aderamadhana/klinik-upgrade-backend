@@ -31,6 +31,7 @@ use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
 
 use App\Http\Controllers\Api\PelayananMedis\AntrianDokterController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatController;
+use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatCpptController;
 use App\Http\Controllers\Api\PelayananMedis\RiwayatPelayananController;
 
 use App\Http\Controllers\Api\Kasir\PembayaranController;
@@ -127,6 +128,7 @@ Route::middleware('auth:api')->group(function () {
             Route::get('/{id}', [AntrianPerawatController::class, 'show'])->whereNumber('id');
             Route::post('/{id}/start', [AntrianPerawatController::class, 'start'])->whereNumber('id');
             Route::post('/{id}/finish', [AntrianPerawatController::class, 'finish'])->whereNumber('id');
+            Route::post('/{id}/cppt', [AntrianPerawatCpptController::class, 'store'])->whereNumber('id');
             Route::delete('/{id}', [AntrianPerawatController::class, 'destroy'])->whereNumber('id');
         });
         Route::prefix('riwayat-pelayanan')->group(function () {
