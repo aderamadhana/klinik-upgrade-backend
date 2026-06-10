@@ -75,6 +75,120 @@ class AntrianResepController extends Controller
         ]);
     }
 
+
+    public function history(Request $request)
+    {
+        $request->validate([
+            'page' => ['nullable', 'integer', 'min:1'],
+            'per_page' => ['nullable', 'integer', 'min:1', 'max:100'],
+            'toko_id' => ['nullable', 'integer', 'min:1'],
+            'tanggal_mulai' => ['nullable', 'date_format:Y-m-d'],
+            'tanggal_selesai' => [
+                'nullable',
+                'date_format:Y-m-d',
+                'after_or_equal:tanggal_mulai',
+            ],
+            'apoteker_id' => ['nullable', 'integer', 'min:1'],
+            'search' => ['nullable', 'string', 'max:150'],
+        ]);
+
+        $query = $this->buildQueueQuery($request);
+        $this->applyStatusFilter(
+            $query,
+            FarmasiAntrianResep::STATUS_SELESAI
+        );
+
+        if ($request->filled('tanggal_mulai')) {
+            $query->whereDate(
+                'farmasi_queue.finished_at',
+                '>=',
+                $request->tanggal_mulai
+            );
+        }
+
+        if ($request->filled('tanggal_selesai')) {
+            $query->whereDate(
+                'farmasi_queue.finished_at',
+                '<=',
+                $request->tanggal_selesai
+            );
+        }
+
+        if ($request->filled('apoteker_id')) {
+            $query->where(
+                'farmasi_queue.petugas_karyawan_id',
+                (int) $request->apoteker_id
+            );
+        }
+
+        $query
+            ->orderByDesc('farmasi_queue.finished_at')
+            ->orderByDesc('pembayaran_invoice.id');
+
+        $rows = $query->paginate((int) $request->get('per_page', 10));
+        $items = $rows->getCollection()
+            ->map(fn (PembayaranInvoice $invoice) => $this->formatQueueRow($invoice))
+            ->values();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Riwayat resep berhasil diambil',
+            'rows' => $items,
+            'total' => $rows->total(),
+            'per_page' => $rows->perPage(),
+            'current_page' => $rows->currentPage(),
+            'last_page' => $rows->lastPage(),
+            'from' => $rows->firstItem(),
+            'to' => $rows->lastItem(),
+        ]);
+    }
+
+    public function historyPetugas(Request $request)
+    {
+        $validated = $request->validate([
+            'toko_id' => ['nullable', 'integer', 'min:1'],
+        ]);
+
+        $query = FarmasiAntrianResep::query()
+            ->where('status', FarmasiAntrianResep::STATUS_SELESAI)
+            ->whereNotNull('petugas_karyawan_id')
+            ->whereNotNull('petugas_nama_snapshot');
+
+        if (!empty($validated['toko_id'])) {
+            $query->where('toko_id', (int) $validated['toko_id']);
+        }
+
+        $petugas = $query
+            ->select([
+                'petugas_karyawan_id',
+                'petugas_nama_snapshot',
+                'petugas_jabatan_snapshot',
+            ])
+            ->distinct()
+            ->orderBy('petugas_nama_snapshot')
+            ->get()
+            ->map(function (FarmasiAntrianResep $row) {
+                $nama = trim((string) $row->petugas_nama_snapshot);
+                $jabatan = trim((string) $row->petugas_jabatan_snapshot);
+
+                return [
+                    'id' => (int) $row->petugas_karyawan_id,
+                    'nama' => $nama,
+                    'jabatan_nama' => $jabatan ?: null,
+                    'label' => $jabatan
+                        ? sprintf('%s - %s', $nama, $jabatan)
+                        : $nama,
+                ];
+            })
+            ->values();
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Filter petugas riwayat resep berhasil diambil',
+            'data' => $petugas,
+        ]);
+    }
+
     public function petugas(Request $request)
     {
         $validated = $request->validate([

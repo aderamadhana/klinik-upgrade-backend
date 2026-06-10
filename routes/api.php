@@ -26,6 +26,7 @@ use App\Http\Controllers\Api\Master\MasterTreatmentPerawatBahanController;
 
 use App\Http\Controllers\Api\Administrasi\PasienController;
 use App\Http\Controllers\Api\Administrasi\PasienDepositController;
+use App\Http\Controllers\Api\Administrasi\PasienTierController;
 
 use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
 
@@ -90,10 +91,19 @@ Route::middleware('auth:api')->group(function () {
             ->whereNumber('id')
             ->whereNumber('depositId');
         Route::get('pasien/{id}/riwayat', [PasienController::class, 'riwayat'])->whereNumber('id');
+        Route::get('pasien/{id}/tier', [PasienTierController::class, 'show'])->whereNumber('id');
+        Route::post('pasien/{id}/tier/upgrade', [PasienTierController::class, 'upgrade'])->whereNumber('id');
+        Route::post('pasien/{id}/tier/downgrade', [PasienTierController::class, 'downgrade'])->whereNumber('id');
+        Route::post('pasien/{id}/tier/automatic', [PasienTierController::class, 'automatic'])->whereNumber('id');
         Route::apiResource('pasien', PasienController::class);
     });
 
     Route::prefix('farmasi')->group(function () {
+        Route::prefix('riwayat-resep')->group(function () {
+            Route::get('/', [AntrianResepController::class, 'history']);
+            Route::get('/petugas', [AntrianResepController::class, 'historyPetugas']);
+        });
+
         Route::prefix('antrian-resep')->group(function () {
             Route::get('/', [AntrianResepController::class, 'index']);
             Route::get('/petugas', [AntrianResepController::class, 'petugas']);
