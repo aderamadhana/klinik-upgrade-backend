@@ -608,25 +608,25 @@ class AntrianDokterController extends Controller
             $existingPenjualan = $this->findActiveBasePenjualanDetail($registrasi, $produkTokoId, $produkId);
 
             if ($existingPenjualan) {
-                if (!$this->isSameProductBillingValue($existingPenjualan, $jumlah, $harga, $subtotal)) {
-                    throw new \Exception(
-                        "Produk {$namaProduk} sudah ada dari registrasi dengan qty/harga berbeda. " .
-                        "Ubah qty/harga dari registrasi atau kasir agar stok reservasi tidak double."
-                    );
-                }
+                $reservasi = $this->adjustExistingProductReservation(
+                    $registrasi,
+                    $existingPenjualan,
+                    $jumlah,
+                    $namaProduk
+                );
 
-                RegistrasiDokterResepDetail::create($this->onlyExistingColumns('registrasi_dokter_resep_detail', [
+                $resep = RegistrasiDokterResepDetail::create($this->onlyExistingColumns('registrasi_dokter_resep_detail', [
                     'registrasi_id' => $registrasi->id,
                     'soap_id' => $soap->id,
                     'produk_toko_id' => $existingPenjualan->produk_toko_id,
                     'produk_id' => $existingPenjualan->produk_id,
-                    'tempat_produk_id' => $existingPenjualan->tempat_produk_id,
-                    'stock_reservasi_id' => $existingPenjualan->stock_reservasi_id,
+                    'tempat_produk_id' => $reservasi?->tempat_produk_id ?? $existingPenjualan->tempat_produk_id,
+                    'stock_reservasi_id' => $reservasi?->id ?? $existingPenjualan->stock_reservasi_id,
                     'is_saran_dokter' => 0,
-                    'nama_produk' => $existingPenjualan->nama_produk ?: $namaProduk,
-                    'harga' => $existingPenjualan->harga,
-                    'jumlah' => $existingPenjualan->jumlah,
-                    'total' => $existingPenjualan->subtotal,
+                    'nama_produk' => $namaProduk ?: ($existingPenjualan->nama_produk ?: 'Produk / Obat'),
+                    'harga' => $harga,
+                    'jumlah' => $jumlah,
+                    'total' => $subtotal,
                     'frekuensi' => $frekuensiPenggunaan,
                     'waktu_pakai' => $waktuPenggunaan,
                     'penggunaan' => $instruksiPemakaian ?: null,
@@ -636,14 +636,40 @@ class AntrianDokterController extends Controller
                     'created_at' => now(),
                 ]));
 
-                $existingPenjualan->update($this->onlyExistingColumns('registrasi_penjualan_detail', [
+                $updatePayload = [
+                    'source_resep_id' => $resep->id,
+                    'source_resep_detail_id' => $resep->id,
+                    'source_karyawan_id' => $registrasi->dokter_awal_id,
+                    'is_saran_dokter' => 0,
+                    'nama_produk' => $namaProduk ?: $existingPenjualan->nama_produk,
+                    'harga' => $harga,
+                    'jumlah' => $jumlah,
                     'frekuensi_penggunaan' => $frekuensiPenggunaan,
                     'waktu_penggunaan' => $waktuPenggunaan,
                     'instruksi_pemakaian' => $instruksiPemakaian ?: null,
-                    'is_saran_dokter' => 0,
+                    'subtotal' => $subtotal,
+                    'status' => 1,
+                    'is_delete' => 0,
                     'updated_by' => $this->username(),
                     'updated_at' => now(),
-                ]));
+                ];
+
+                if ($reservasi) {
+                    $updatePayload['produk_toko_id'] = $reservasi->produk_toko_id;
+                    $updatePayload['produk_id'] = $reservasi->produk_id;
+                    $updatePayload['tempat_produk_id'] = $reservasi->tempat_produk_id;
+                    $updatePayload['stock_reservasi_id'] = $reservasi->id;
+                }
+
+                $existingPenjualan->update($this->onlyExistingColumns('registrasi_penjualan_detail', $updatePayload));
+
+                if ($reservasi && Schema::hasColumn('stock_reservasi_produk', 'source_detail_id')) {
+                    $reservasi->update([
+                        'source_detail_id' => $existingPenjualan->id,
+                        'updated_by' => $this->username(),
+                        'updated_at' => now(),
+                    ]);
+                }
 
                 continue;
             }
@@ -677,7 +703,7 @@ class AntrianDokterController extends Controller
                 'created_at' => now(),
             ]));
 
-            RegistrasiPenjualanDetail::create($this->onlyExistingColumns('registrasi_penjualan_detail', [
+            $penjualan = RegistrasiPenjualanDetail::create($this->onlyExistingColumns('registrasi_penjualan_detail', [
                 'registrasi_id' => $registrasi->id,
                 'source_type' => 2,
                 'source_task_id' => $task->id,
@@ -704,6 +730,14 @@ class AntrianDokterController extends Controller
                 'created_by' => $this->username(),
                 'created_at' => now(),
             ]));
+
+            if (Schema::hasColumn('stock_reservasi_produk', 'source_detail_id')) {
+                $reservasi->update([
+                    'source_detail_id' => $penjualan->id,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]);
+            }
         }
     }
 
@@ -1178,6 +1212,111 @@ class AntrianDokterController extends Controller
                 'updated_at' => now(),
             ]);
         }
+    }
+
+    private function adjustExistingProductReservation(
+        RegistrasiKunjungan $registrasi,
+        RegistrasiPenjualanDetail $detail,
+        int $newQty,
+        string $namaProduk
+    ): ?StockReservasiProduk {
+        if (!Schema::hasColumn('registrasi_penjualan_detail', 'stock_reservasi_id')) {
+            return null;
+        }
+
+        $reservasi = null;
+
+        if (!empty($detail->stock_reservasi_id)) {
+            $reservasi = StockReservasiProduk::query()
+                ->whereKey($detail->stock_reservasi_id)
+                ->lockForUpdate()
+                ->first();
+        }
+
+        if (!$reservasi || strtoupper((string) $reservasi->status) !== 'ACTIVE') {
+            $stock = $this->lockAvailableProductStock(
+                $registrasi,
+                $detail->produk_toko_id,
+                $detail->produk_id,
+                $newQty
+            );
+
+            return $this->reserveExistingProductStock($registrasi, $detail, $stock, $newQty, $namaProduk);
+        }
+
+        $stock = StockProdukToko::query()
+            ->where('produk_toko_id', $reservasi->produk_toko_id)
+            ->where('toko_id', $reservasi->toko_id)
+            ->where('tempat_produk_id', $reservasi->tempat_produk_id)
+            ->where('is_delete', 0)
+            ->lockForUpdate()
+            ->first();
+
+        if (!$stock) {
+            throw new \Exception("Data stok produk {$namaProduk} tidak ditemukan untuk update reservasi.");
+        }
+
+        $oldQty = (float) $reservasi->qty_reserved;
+        $delta = (float) $newQty - $oldQty;
+
+        if ($delta > 0) {
+            $available = (float) $stock->stok_akhir - (float) $stock->stok_reserved;
+
+            if ($available < $delta) {
+                throw new \Exception("Stok produk {$namaProduk} tidak mencukupi. Tersedia {$available}, tambahan diminta {$delta}");
+            }
+        }
+
+        if (abs($delta) > 0.0001) {
+            $stock->update([
+                'stok_reserved' => max(0, (float) $stock->stok_reserved + $delta),
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ]);
+        }
+
+        $reservasi->update([
+            'qty_reserved' => $newQty,
+            'source_id' => $registrasi->id,
+            'source_detail_id' => $detail->id,
+            'keterangan' => 'Reservasi produk diperbarui dari proses dokter: ' . $namaProduk,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]);
+
+        return $reservasi->fresh();
+    }
+
+    private function reserveExistingProductStock(
+        RegistrasiKunjungan $registrasi,
+        RegistrasiPenjualanDetail $detail,
+        StockProdukToko $stock,
+        int $qty,
+        string $namaProduk
+    ): StockReservasiProduk {
+        $stock->update([
+            'stok_reserved' => (float) $stock->stok_reserved + $qty,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]);
+
+        return StockReservasiProduk::create([
+            'kode_reservasi' => 'RSV-REG-DOK-' . $registrasi->id . '-' . $detail->id . '-' . now()->format('YmdHis'),
+            'tanggal' => now(),
+            'expired_at' => now()->addHours(6),
+            'toko_id' => $registrasi->toko_id,
+            'tempat_produk_id' => $stock->tempat_produk_id,
+            'produk_toko_id' => $stock->produk_toko_id,
+            'produk_id' => $stock->produk_id,
+            'qty_reserved' => $qty,
+            'source_type' => 'REGISTRASI_LAYANAN',
+            'source_id' => $registrasi->id,
+            'source_detail_id' => $detail->id,
+            'status' => 'ACTIVE',
+            'keterangan' => 'Reservasi produk registrasi diperbarui dari proses dokter: ' . $namaProduk,
+            'created_by' => $this->username(),
+            'created_at' => now(),
+        ]);
     }
 
     private function lockAvailableProductStock(RegistrasiKunjungan $registrasi, $produkTokoId, $produkId, int $qty)

@@ -41,6 +41,8 @@ class PembayaranController extends Controller
     protected PaymentSubtotalDiscountService $subtotalDiscountService;
     protected PaymentMemberPointService $memberPointService;
     protected PaymentNurseTreatmentMaterialService $nurseTreatmentMaterialService;
+    protected array $existingColumnCache = [];
+    protected ?string $cachedUsername = null;
     
     public function __construct(
         StockTransactionService $stockTransactionService,
@@ -2015,9 +2017,25 @@ class PembayaranController extends Controller
         Request $request,
         PembayaranInvoice $depositInvoice,
         RegistrasiKunjungan $registrasi,
-        ?string $depositExpiredAt
+        ?string $depositExpiredAt,
+        ?array &$trace = null
     ): array {
+        $splitTrace = function (string $label, array $context = []) use (&$trace): void {
+            if (is_array($trace)) {
+                $this->markPaymentFinishTrace($trace, 'splitDeposit.' . $label, $context);
+            }
+        };
+
+        $splitTrace('started', [
+            'deposit_invoice_id' => $depositInvoice->id,
+            'registrasi_id' => $registrasi->id,
+        ]);
+
         $selectedDepositItems = $this->resolveDepositItems($request, $depositInvoice);
+        $splitTrace('resolveDepositItems.finished', [
+            'selected_count' => count($selectedDepositItems),
+            'selected_item_ids' => array_keys($selectedDepositItems),
+        ]);
 
         if (count($selectedDepositItems) === 0) {
             throw ValidationException::withMessages([
@@ -2026,15 +2044,25 @@ class PembayaranController extends Controller
         }
 
         $generalInvoice = $this->resolveOrCreateGeneralInvoiceForDepositSplit($depositInvoice, $registrasi);
+        $splitTrace('resolveOrCreateGeneralInvoiceForDepositSplit.finished', [
+            'general_invoice_id' => $generalInvoice->id,
+            'deposit_invoice_id' => $depositInvoice->id,
+            'general_no_invoice' => $generalInvoice->no_invoice,
+            'deposit_no_invoice' => $depositInvoice->no_invoice,
+        ]);
 
         $this->splitDepositInvoiceItems(
             $depositInvoice,
             $generalInvoice,
             $selectedDepositItems
         );
+        $splitTrace('splitDepositInvoiceItems.finished');
 
         $this->refreshInvoiceTotalsFromItems($depositInvoice);
+        $splitTrace('refreshInvoiceTotalsFromItems.deposit.1.finished');
+
         $this->refreshInvoiceTotalsFromItems($generalInvoice);
+        $splitTrace('refreshInvoiceTotalsFromItems.general.1.finished');
 
         $depositInvoice = PembayaranInvoice::query()
             ->whereKey($depositInvoice->id)
@@ -2048,6 +2076,12 @@ class PembayaranController extends Controller
 
         $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
         $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $splitTrace('reload.afterSplit.finished', [
+            'deposit_item_count' => $depositInvoice->items?->count(),
+            'general_item_count' => $generalInvoice->items?->count(),
+            'deposit_grand_total' => (float) ($depositInvoice->grand_total ?? 0),
+            'general_grand_total' => (float) ($generalInvoice->grand_total ?? 0),
+        ]);
 
         $this->applyDepositTransactionRules(
             $depositInvoice,
@@ -2055,14 +2089,27 @@ class PembayaranController extends Controller
             $depositExpiredAt,
             array_keys($selectedDepositItems)
         );
+        $splitTrace('applyDepositTransactionRules.finished');
 
         $this->syncJenisTransaksiToInvoiceItems($generalInvoice, 0);
+        $splitTrace('syncJenisTransaksiToInvoiceItems.general.finished');
 
-        $this->applyDiscountsAndPromosForSplitDepositInvoices(
-            $request,
-            $generalInvoice,
-            $depositInvoice
-        );
+        if ($this->hasPromoPayloadForSplitDeposit($request)) {
+            $this->applyDiscountsAndPromosForSplitDepositInvoices(
+                $request,
+                $generalInvoice,
+                $depositInvoice
+            );
+            $splitTrace('applyDiscountsAndPromosForSplitDepositInvoices.finished', [
+                'has_promo_payload' => true,
+            ]);
+        } else {
+            $this->resetSplitInvoiceDiscountsAndPromosLite($generalInvoice);
+            $this->resetSplitInvoiceDiscountsAndPromosLite($depositInvoice);
+            $splitTrace('applyDiscountsAndPromosForSplitDepositInvoices.skippedAndReset', [
+                'has_promo_payload' => false,
+            ]);
+        }
 
         $depositInvoice = PembayaranInvoice::query()
             ->whereKey($depositInvoice->id)
@@ -2076,11 +2123,19 @@ class PembayaranController extends Controller
 
         $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
         $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $splitTrace('reload.afterDiscount.finished', [
+            'deposit_item_count' => $depositInvoice->items?->count(),
+            'general_item_count' => $generalInvoice->items?->count(),
+        ]);
 
         $this->generateDepositTreatmentRecords($depositInvoice, $selectedDepositItems);
+        $splitTrace('generateDepositTreatmentRecords.finished');
 
         $this->refreshInvoiceTotalsFromItems($depositInvoice);
+        $splitTrace('refreshInvoiceTotalsFromItems.deposit.2.finished');
+
         $this->refreshInvoiceTotalsFromItems($generalInvoice);
+        $splitTrace('refreshInvoiceTotalsFromItems.general.2.finished');
 
         $depositInvoice = PembayaranInvoice::query()
             ->whereKey($depositInvoice->id)
@@ -2094,14 +2149,25 @@ class PembayaranController extends Controller
 
         $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
         $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $splitTrace('reload.afterDepositRecords.finished', [
+            'deposit_grand_total' => (float) ($depositInvoice->grand_total ?? 0),
+            'general_grand_total' => (float) ($generalInvoice->grand_total ?? 0),
+        ]);
 
         $memberBeforeLedger = $this->snapshotPaymentMemberReward($generalInvoice);
+        $splitTrace('snapshotPaymentMemberReward.finished');
 
         $this->memberPointService->applyMemberBenefitToInvoice($generalInvoice, $this->username());
+        $splitTrace('applyMemberBenefitToInvoice.general.finished');
+
         $this->memberPointService->applyMemberBenefitToInvoice($depositInvoice, $this->username());
+        $splitTrace('applyMemberBenefitToInvoice.deposit.finished');
 
         $this->refreshInvoiceTotalsFromItems($generalInvoice);
+        $splitTrace('refreshInvoiceTotalsFromItems.general.3.finished');
+
         $this->refreshInvoiceTotalsFromItems($depositInvoice);
+        $splitTrace('refreshInvoiceTotalsFromItems.deposit.3.finished');
 
         $generalInvoice = PembayaranInvoice::query()
             ->whereKey($generalInvoice->id)
@@ -2115,9 +2181,17 @@ class PembayaranController extends Controller
 
         $generalInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
         $depositInvoice->load(['items', 'metode', 'promos', 'depositClaims']);
+        $splitTrace('reload.afterMemberBenefit.finished', [
+            'deposit_grand_total' => (float) ($depositInvoice->grand_total ?? 0),
+            'general_grand_total' => (float) ($generalInvoice->grand_total ?? 0),
+        ]);
 
         $this->nurseTreatmentMaterialService->syncFromInvoice($generalInvoice, $registrasi, $this->username());
-        $this->nurseTreatmentMaterialService->syncFromInvoice($depositInvoice, $registrasi, $this->username());
+        $splitTrace('nurseTreatmentMaterialService.syncFromInvoice.general.finished');
+
+        $splitTrace('nurseTreatmentMaterialService.syncFromInvoice.deposit.skipped', [
+            'reason' => 'Invoice deposit adalah pembelian saldo treatment, bukan tindakan perawat hari ini.',
+        ]);
 
         $generalGrandTotal = (float) ($generalInvoice->grand_total ?? 0);
         $depositGrandTotal = (float) ($depositInvoice->grand_total ?? 0);
@@ -2125,42 +2199,75 @@ class PembayaranController extends Controller
 
         $metode = $this->normalizeMetodePayloadForSplit($request, $totalGrandTotal);
         $totalBayar = collect($metode)->sum('nominal_dialokasikan');
+        $splitTrace('normalizeMetodePayloadForSplit.finished', [
+            'metode_count' => count($metode),
+            'general_grand_total' => $generalGrandTotal,
+            'deposit_grand_total' => $depositGrandTotal,
+            'total_grand_total' => $totalGrandTotal,
+            'total_bayar' => $totalBayar,
+        ]);
 
         $this->validatePaymentAmount($totalGrandTotal, $totalBayar);
+        $splitTrace('validatePaymentAmount.finished');
 
         $splitMetode = $this->splitMetodeForDepositInvoices(
             $metode,
             $generalGrandTotal,
             $depositGrandTotal
         );
+        $splitTrace('splitMetodeForDepositInvoices.finished', [
+            'general_metode_count' => count($splitMetode['general'] ?? []),
+            'deposit_metode_count' => count($splitMetode['deposit'] ?? []),
+        ]);
 
         $this->replaceInvoiceMetode($generalInvoice, $splitMetode['general'], 0);
+        $splitTrace('replaceInvoiceMetode.general.finished');
+
         $this->replaceInvoiceMetode($depositInvoice, $splitMetode['deposit'], 4);
+        $splitTrace('replaceInvoiceMetode.deposit.finished');
 
         $this->processStockKeluarPembayaran($generalInvoice, $registrasi);
-        $this->processStockKeluarPembayaran($depositInvoice, $registrasi);
+        $splitTrace('processStockKeluarPembayaran.general.finished');
+
+        $splitTrace('processStockKeluarPembayaran.deposit.skipped', [
+            'reason' => 'Semua item produk/obat dipindah ke invoice umum saat split deposit.',
+        ]);
 
         $this->createAccurateSyncPendingLog($generalInvoice, $registrasi);
+        $splitTrace('createAccurateSyncPendingLog.general.finished');
+
         $this->createAccurateSyncPendingLog($depositInvoice, $registrasi);
+        $splitTrace('createAccurateSyncPendingLog.deposit.finished');
 
         $this->markSplitInvoiceAsPaid($generalInvoice, $request, 0, null, $generalGrandTotal, 0);
+        $splitTrace('markSplitInvoiceAsPaid.general.finished');
+
         $this->markSplitInvoiceAsPaid($depositInvoice, $request, 4, $depositExpiredAt, $depositGrandTotal, 0);
+        $splitTrace('markSplitInvoiceAsPaid.deposit.finished');
 
         $generalInvoice->refresh();
         $depositInvoice->refresh();
+        $splitTrace('invoice.refresh.afterPaid.finished');
 
         $this->memberPointService->processEarnedPointLedger($generalInvoice, $this->username());
+        $splitTrace('processEarnedPointLedger.general.finished');
+
         $this->memberPointService->processEarnedPointLedger($depositInvoice, $this->username());
+        $splitTrace('processEarnedPointLedger.deposit.finished');
 
         $memberReward = $this->buildPaymentMemberRewardResponse(
             $depositInvoice,
             $memberBeforeLedger,
             [$generalInvoice->id, $depositInvoice->id]
         );
+        $splitTrace('buildPaymentMemberRewardResponse.finished');
 
         $nextTask = $this->completePaymentTask($registrasi);
+        $splitTrace('completePaymentTask.finished', [
+            'next_task_id' => $nextTask?->id,
+        ]);
 
-        return [
+        $result = [
             'invoice_id' => $depositInvoice->id,
             'general_invoice_id' => $generalInvoice->id,
             'deposit_invoice_id' => $depositInvoice->id,
@@ -2172,6 +2279,13 @@ class PembayaranController extends Controller
             'already_paid' => false,
             'member_reward' => $memberReward,
         ];
+
+        $splitTrace('finished', [
+            'general_invoice_id' => $generalInvoice->id,
+            'deposit_invoice_id' => $depositInvoice->id,
+        ]);
+
+        return $result;
     }
 
     protected function activeInvoiceItemsForSplit(PembayaranInvoice $invoice)
@@ -2475,6 +2589,47 @@ class PembayaranController extends Controller
 
         return false;
     }
+
+    protected function resetSplitInvoiceDiscountsAndPromosLite(PembayaranInvoice $invoice): void
+    {
+        $this->resetSplitInvoicePromosAndAmount($invoice);
+
+        if (Schema::hasTable('pembayaran_invoice_item')) {
+            $itemPayload = [
+                'diskon_subtotal_amount' => 0,
+                'subtotal_before_diskon_subtotal' => DB::raw('COALESCE(subtotal, 0)'),
+                'subtotal_after_diskon_subtotal' => DB::raw('COALESCE(subtotal, 0)'),
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ];
+
+            $itemPayload = $this->onlyExistingColumns('pembayaran_invoice_item', $itemPayload);
+
+            if (!empty($itemPayload)) {
+                DB::table('pembayaran_invoice_item')
+                    ->where('pembayaran_id', $invoice->id)
+                    ->where(function ($q) {
+                        $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                    })
+                    ->where(function ($q) {
+                        $q->whereNull('status')->orWhere('status', '!=', 9);
+                    })
+                    ->update($itemPayload);
+            }
+        }
+
+        $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+            'diskon_subtotal' => 0,
+            'diskon_subtotal_tipe' => 0,
+            'diskon_subtotal_nilai' => 0,
+            'diskon_subtotal_amount' => 0,
+            'diskon_promo' => 0,
+            'total_promo' => 0,
+            'updated_by' => $this->username(),
+            'updated_at' => now(),
+        ]));
+    }
+
 
 
     protected function applyDiscountsAndPromosForSplitDepositInvoices(
@@ -5823,16 +5978,32 @@ class PembayaranController extends Controller
 
     protected function onlyExistingColumns(string $table, array $data): array
     {
-        return collect($data)
-            ->filter(fn ($value, $key) => Schema::hasColumn($table, $key))
-            ->all();
+        if (!isset($this->existingColumnCache[$table])) {
+            try {
+                $this->existingColumnCache[$table] = array_flip(Schema::getColumnListing($table));
+            } catch (Throwable $e) {
+                $this->existingColumnCache[$table] = [];
+            }
+        }
+
+        if (empty($this->existingColumnCache[$table])) {
+            return [];
+        }
+
+        return array_intersect_key($data, $this->existingColumnCache[$table]);
     }
 
     protected function username(): string
     {
-        return auth()->user()->username
+        if ($this->cachedUsername !== null) {
+            return $this->cachedUsername;
+        }
+
+        $this->cachedUsername = auth()->user()->username
             ?? auth()->user()->name
             ?? 'system';
+
+        return $this->cachedUsername;
     }
 
     private function buildInvoiceQrDataUri(PembayaranInvoice $invoice): ?string
@@ -6098,7 +6269,7 @@ class PembayaranController extends Controller
 
                 if ($jenisTransaksi === 4 && $this->shouldSplitDepositInvoice($request, $invoice)) {
                     $this->markPaymentFinishTrace($trace, 'finishSplitDepositInvoice.started');
-                    $splitResult = $this->finishSplitDepositInvoice($request, $invoice, $registrasi, $depositExpiredAt);
+                    $splitResult = $this->finishSplitDepositInvoice($request, $invoice, $registrasi, $depositExpiredAt, $trace);
                     $this->markPaymentFinishTrace($trace, 'finishSplitDepositInvoice.finished');
                     return $splitResult;
                 }
