@@ -38,6 +38,7 @@ use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatCpptController;
 use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatBeforeAfterController;
 use App\Http\Controllers\Api\PelayananMedis\RiwayatPelayananController;
+use App\Http\Controllers\Api\PelayananMedis\AntrianPerawatBahanTreatmentController;
 
 use App\Http\Controllers\Api\Kasir\PembayaranController;
 
@@ -47,6 +48,19 @@ use App\Http\Controllers\Api\Stock\StockPenyesuaianController;
 
 use App\Http\Controllers\Api\Antrian\AntrianController;
 use App\Http\Controllers\Api\Antrian\BookingLayananController;
+
+use App\Http\Controllers\Api\Laporan\LaporanInsentifDokterController;
+use App\Http\Controllers\Api\Laporan\LaporanInsentifNurseBeauticianController;
+use App\Http\Controllers\Api\Laporan\LaporanInsentifApotekerController;
+use App\Http\Controllers\Api\Laporan\LaporanDetailPasienController;
+use App\Http\Controllers\Api\Laporan\LaporanPemasukanUmumController;
+use App\Http\Controllers\Api\Laporan\LaporanTreatmentController;
+use App\Http\Controllers\Api\Laporan\LaporanProdukObatController;
+use App\Http\Controllers\Api\Laporan\LaporanPasienTreatmentTerbanyakController;
+use App\Http\Controllers\Api\Laporan\LaporanTopPasienNominalTerbanyakController;
+use App\Http\Controllers\Api\Laporan\LaporanTindakanTerlarisController;
+
+use App\Http\Controllers\Api\Accurate\AccurateSettlementController;
 
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/auth/refresh', [AuthController::class, 'refresh']);
@@ -171,11 +185,20 @@ Route::middleware('auth:api')->group(function () {
                 ->whereNumber('photoId');
             Route::post('/{id}/before-after', [AntrianPerawatBeforeAfterController::class, 'store'])
                 ->whereNumber('id');
-            Route::get('/{id}', [AntrianPerawatController::class, 'show'])->whereNumber('id');
-            Route::post('/{id}/start', [AntrianPerawatController::class, 'start'])->whereNumber('id');
-            Route::post('/{id}/finish', [AntrianPerawatController::class, 'finish'])->whereNumber('id');
-            Route::post('/{id}/cppt', [AntrianPerawatCpptController::class, 'store'])->whereNumber('id');
-            Route::delete('/{id}', [AntrianPerawatController::class, 'destroy'])->whereNumber('id');
+            Route::get('/{id}/bahan-treatment', [AntrianPerawatBahanTreatmentController::class, 'show'])
+                ->whereNumber('id');
+            Route::post('/{id}/bahan-treatment', [AntrianPerawatBahanTreatmentController::class, 'store'])
+                ->whereNumber('id');
+            Route::get('/{id}', [AntrianPerawatController::class, 'show'])
+                ->whereNumber('id');
+            Route::post('/{id}/start', [AntrianPerawatController::class, 'start'])
+                ->whereNumber('id');
+            Route::post('/{id}/finish', [AntrianPerawatController::class, 'finish'])
+                ->whereNumber('id');
+            Route::post('/{id}/cppt', [AntrianPerawatCpptController::class, 'store'])
+                ->whereNumber('id');
+            Route::delete('/{id}', [AntrianPerawatController::class, 'destroy'])
+                ->whereNumber('id');
         });
         Route::prefix('riwayat-pelayanan')->group(function () {
             Route::get('/', [RiwayatPelayananController::class, 'index']);
@@ -224,6 +247,71 @@ Route::middleware('auth:api')->group(function () {
         Route::get('/summary', [AuditLogController::class, 'summary']);
         Route::get('/{id}', [AuditLogController::class, 'show']);
     });
+
+    Route::prefix('laporan')->group(function () {
+        Route::prefix('insentif-dokter')->group(function () {
+            Route::get('/dokter', [LaporanInsentifDokterController::class, 'dokter']);
+            Route::get('/summary', [LaporanInsentifDokterController::class, 'summary']);
+            Route::get('/export/{kategori}/{jenis}/{format}', [LaporanInsentifDokterController::class, 'export']);
+        });
+
+        Route::prefix('insentif-nurse-beautician')->group(function () {
+            Route::get('/staff', [LaporanInsentifNurseBeauticianController::class, 'staff']);
+            Route::get('/summary', [LaporanInsentifNurseBeauticianController::class, 'summary']);
+            Route::get('/export/{jenis}/{format}', [LaporanInsentifNurseBeauticianController::class, 'export']);
+        });
+
+        Route::prefix('insentif-apoteker')->group(function () {
+            Route::get('/petugas', [LaporanInsentifApotekerController::class, 'petugas']);
+            Route::get('/summary', [LaporanInsentifApotekerController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanInsentifApotekerController::class, 'export']);
+        });
+
+        Route::prefix('detail-pasien')->group(function () {
+            Route::get('/summary', [LaporanDetailPasienController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanDetailPasienController::class, 'export']);
+        });
+
+        Route::prefix('pemasukan-umum')->group(function () {
+            Route::get('/summary', [LaporanPemasukanUmumController::class, 'summary']);
+            Route::get('/export/{jenis}', [LaporanPemasukanUmumController::class, 'export']);
+        });
+
+        Route::prefix('treatment')->group(function () {
+            Route::get('/summary', [LaporanTreatmentController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanTreatmentController::class, 'export']);
+        });
+
+        Route::prefix('obat')->group(function () {
+            Route::get('/summary', [LaporanProdukObatController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanProdukObatController::class, 'export']);
+        });
+
+        Route::prefix('pasien-treatment-terbanyak')->group(function () {
+            Route::get('/summary', [LaporanPasienTreatmentTerbanyakController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanPasienTreatmentTerbanyakController::class, 'export']);
+        });
+
+        Route::prefix('top-pasien-nominal-terbanyak')->group(function () {
+            Route::get('/summary', [LaporanTopPasienNominalTerbanyakController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanTopPasienNominalTerbanyakController::class, 'export']);
+        });
+
+        Route::prefix('tindakan-terlaris')->group(function () {
+            Route::get('/summary', [LaporanTindakanTerlarisController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanTindakanTerlarisController::class, 'export']);
+        });
+
+
+
+    });
+
+    Route::prefix('accurate')->group(function () {
+        Route::get('/settlement-umum', [AccurateSettlementController::class, 'index']);
+        Route::post('/settlement-umum/upload', [AccurateSettlementController::class, 'upload']);
+    });
+
+
 });
 
 Route::prefix('reference')->group(function () {
