@@ -74,6 +74,178 @@ class PasienDepositController extends Controller
         ]);
     }
 
+    public function updateExpiredAt(Request $request, $id, $depositId)
+    {
+        $validator = Validator::make($request->all(), [
+            'expired_at' => 'required|date_format:Y-m-d|after_or_equal:today',
+        ], [
+            'expired_at.required' => 'Tanggal expired baru wajib diisi.',
+            'expired_at.date_format' => 'Format tanggal expired harus Y-m-d.',
+            'expired_at.after_or_equal' => 'Tanggal expired baru tidak boleh lebih kecil dari hari ini.',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Validasi gagal',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            $result = DB::transaction(function () use ($request, $id, $depositId) {
+                $pasien = $this->getPasien((int) $id);
+
+                if (!$pasien) {
+                    throw ValidationException::withMessages([
+                        'pasien' => 'Pasien tidak ditemukan.',
+                    ]);
+                }
+
+                $deposit = DB::table('pembayaran_deposit_treatment as d')
+                    ->where('d.id', (int) $depositId)
+                    ->where('d.pasien_id', (int) $id)
+                    ->where(function ($query) {
+                        $query->whereNull('d.is_delete')
+                            ->orWhere('d.is_delete', 0);
+                    })
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$deposit) {
+                    throw ValidationException::withMessages([
+                        'deposit' => 'Data deposit tidak ditemukan.',
+                    ]);
+                }
+
+                $status = (int) $deposit->status;
+                $qtySisa = (float) $deposit->qty_sisa;
+
+                if ($status === 9) {
+                    throw ValidationException::withMessages([
+                        'deposit' => 'Deposit yang sudah dibatalkan tidak dapat diubah.',
+                    ]);
+                }
+
+                if ($status === 2 || $qtySisa <= 0) {
+                    throw ValidationException::withMessages([
+                        'deposit' => 'Deposit yang sudah habis tidak dapat diubah.',
+                    ]);
+                }
+
+                if (!in_array($status, [1, 3], true)) {
+                    throw ValidationException::withMessages([
+                        'deposit' => 'Status deposit tidak dapat diubah tanggal expired-nya.',
+                    ]);
+                }
+
+                $newExpiredAt = Carbon::createFromFormat(
+                    'Y-m-d',
+                    (string) $request->input('expired_at')
+                )->toDateString();
+                $oldExpiredAt = $deposit->expired_at
+                    ? Carbon::parse($deposit->expired_at)->toDateString()
+                    : null;
+
+                if ($oldExpiredAt === $newExpiredAt && $status === 1) {
+                    return [
+                        'changed' => false,
+                        'deposit_id' => (int) $deposit->id,
+                        'expired_at' => $newExpiredAt,
+                        'expired_at_formatted' => $this->formatDate($newExpiredAt),
+                        'status' => 1,
+                        'status_key' => 'aktif',
+                        'status_text' => $this->statusText('aktif'),
+                        'status_color' => $this->statusColor('aktif'),
+                    ];
+                }
+
+                $username = $this->username();
+                $now = now();
+
+                DB::table('pembayaran_deposit_treatment')
+                    ->where('id', (int) $deposit->id)
+                    ->update($this->onlyExistingColumns('pembayaran_deposit_treatment', [
+                        'expired_at' => $newExpiredAt,
+                        'status' => 1,
+                        'updated_by' => $username,
+                        'updated_at' => $now,
+                    ]));
+
+                if (Schema::hasTable('audit_logs')) {
+                    $user = auth('api')->user();
+
+                    DB::table('audit_logs')->insert(
+                        $this->onlyExistingColumns('audit_logs', [
+                            'module_name' => 'Deposit',
+                            'table_name' => 'pembayaran_deposit_treatment',
+                            'record_id' => (int) $deposit->id,
+                            'action' => 'update',
+                            'description' => sprintf(
+                                'Mengubah tanggal expired deposit ID %d dari %s menjadi %s',
+                                (int) $deposit->id,
+                                $oldExpiredAt ?: '-',
+                                $newExpiredAt
+                            ),
+                            'old_values' => json_encode([
+                                'expired_at' => $oldExpiredAt,
+                                'status' => $status,
+                            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                            'new_values' => json_encode([
+                                'expired_at' => $newExpiredAt,
+                                'status' => 1,
+                            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+                            'toko_id' => $deposit->toko_beli_id
+                                ? (int) $deposit->toko_beli_id
+                                : null,
+                            'user_id' => $user?->id,
+                            'username' => $username,
+                            'role_name' => $user?->role?->nama_role ?? $user?->role_name ?? null,
+                            'ip_address' => $request->ip(),
+                            'user_agent' => $request->userAgent(),
+                            'created_at' => $now,
+                        ])
+                    );
+                }
+
+                return [
+                    'changed' => true,
+                    'deposit_id' => (int) $deposit->id,
+                    'expired_at' => $newExpiredAt,
+                    'expired_at_formatted' => $this->formatDate($newExpiredAt),
+                    'status' => 1,
+                    'status_key' => 'aktif',
+                    'status_text' => $this->statusText('aktif'),
+                    'status_color' => $this->statusColor('aktif'),
+                    'updated_by' => $username,
+                    'updated_at' => $now->toDateTimeString(),
+                ];
+            }, 3);
+
+            return response()->json([
+                'status' => true,
+                'message' => $result['changed']
+                    ? 'Tanggal expired deposit berhasil diubah'
+                    : 'Tanggal expired deposit tidak berubah',
+                'data' => $result,
+            ]);
+        } catch (ValidationException $e) {
+            return response()->json([
+                'status' => false,
+                'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
+        } catch (Throwable $e) {
+            report($e);
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Gagal mengubah tanggal expired deposit',
+                'error' => config('app.debug') ? $e->getMessage() : null,
+            ], 500);
+        }
+    }
+
     public function claim(Request $request, $id, $depositId)
     {
         $validator = Validator::make($request->all(), [

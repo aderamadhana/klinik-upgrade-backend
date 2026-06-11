@@ -87,6 +87,9 @@ Route::middleware('auth:api')->group(function () {
     Route::prefix('administrasi')->group(function () {
         Route::get('pasien/{id}/saldo-deposit', [PasienDepositController::class, 'show'])
             ->whereNumber('id');
+        Route::put('pasien/{id}/saldo-deposit/{depositId}/expired-at', [PasienDepositController::class, 'updateExpiredAt'])
+            ->whereNumber('id')
+            ->whereNumber('depositId');
         Route::post('pasien/{id}/saldo-deposit/{depositId}/claim', [PasienDepositController::class, 'claim'])
             ->whereNumber('id')
             ->whereNumber('depositId');
