@@ -27,6 +27,7 @@ use App\Http\Controllers\Api\Master\MasterTreatmentPerawatBahanController;
 use App\Http\Controllers\Api\Administrasi\PasienController;
 use App\Http\Controllers\Api\Administrasi\PasienDepositController;
 use App\Http\Controllers\Api\Administrasi\PasienTierController;
+use App\Http\Controllers\Api\Administrasi\PasienPoinController;
 
 use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
 
@@ -98,6 +99,17 @@ Route::middleware('auth:api')->group(function () {
         Route::post('pasien/{id}/tier/upgrade', [PasienTierController::class, 'upgrade'])->whereNumber('id');
         Route::post('pasien/{id}/tier/downgrade', [PasienTierController::class, 'downgrade'])->whereNumber('id');
         Route::post('pasien/{id}/tier/automatic', [PasienTierController::class, 'automatic'])->whereNumber('id');
+        Route::get('poin/merchandise', [PasienPoinController::class, 'merchandise']);
+
+        Route::get('pasien/{id}/saldo-poin', [PasienPoinController::class, 'show'])
+            ->whereNumber('id');
+
+        Route::post('pasien/{id}/saldo-poin/redeem', [PasienPoinController::class, 'redeem'])
+            ->whereNumber('id');
+
+        Route::post('pasien/{id}/saldo-poin/{ledgerId}/void', [PasienPoinController::class, 'voidRedeem'])
+            ->whereNumber('id')
+            ->whereNumber('ledgerId');
         Route::apiResource('pasien', PasienController::class);
     });
 
