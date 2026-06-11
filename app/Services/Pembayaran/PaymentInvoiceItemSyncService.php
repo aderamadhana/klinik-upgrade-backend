@@ -11,9 +11,15 @@ use Illuminate\Support\Facades\Schema;
 
 class PaymentInvoiceItemSyncService
 {
+    protected array $tableExistsCache = [];
+
+    protected array $tableColumnCache = [];
+
+    protected ?string $usernameCache = null;
+
     public function syncInvoiceItemsFromRequest(Request $request, PembayaranInvoice $invoice): void
     {
-        if (!Schema::hasTable('pembayaran_invoice_item')) {
+        if (!$this->hasTable('pembayaran_invoice_item')) {
             return;
         }
 
@@ -34,9 +40,10 @@ class PaymentInvoiceItemSyncService
             ->filter(fn ($row) => is_array($row))
             ->values();
 
-        $this->hardResetRequestItems($invoice, 2);
+        $activeItemIds = [];
 
         foreach ($rows as $row) {
+            $itemId = (int) ($row['invoice_item_id'] ?? $row['id'] ?? 0);
             $sourceDetailId = (int) ($row['registrasi_treatment_detail_id'] ?? $row['source_detail_id'] ?? 0);
             $qty = max((float) ($row['qty'] ?? $row['jumlah'] ?? 1), 1);
             $harga = (float) ($row['harga'] ?? $row['harga_treatment'] ?? $row['tarif'] ?? $row['harga_terendah'] ?? 0);
@@ -85,8 +92,23 @@ class PaymentInvoiceItemSyncService
                 'updated_at' => now(),
             ]);
 
-            PembayaranInvoiceItem::query()->create($payload);
+            $existing = $this->resolveRequestInvoiceItem($invoice, 2, $itemId, $sourceDetailId);
+
+            if ($existing) {
+                unset($payload['created_by'], $payload['created_at']);
+
+                DB::table('pembayaran_invoice_item')
+                    ->where('id', $existing->id)
+                    ->update($payload);
+
+                $activeItemIds[] = (int) $existing->id;
+                continue;
+            }
+
+            $activeItemIds[] = (int) DB::table('pembayaran_invoice_item')->insertGetId($payload);
         }
+
+        $this->softDeleteMissingRequestItems($invoice, 2, $activeItemIds);
     }
 
     protected function syncRequestProductItems(Request $request, PembayaranInvoice $invoice): void
@@ -95,9 +117,10 @@ class PaymentInvoiceItemSyncService
             ->filter(fn ($row) => is_array($row))
             ->values();
 
-        $this->hardResetRequestItems($invoice, 3);
+        $activeItemIds = [];
 
         foreach ($rows as $row) {
+            $itemId = (int) ($row['invoice_item_id'] ?? $row['id'] ?? 0);
             $sourceDetailId = (int) ($row['registrasi_penjualan_detail_id'] ?? $row['source_detail_id'] ?? 0);
             $qty = max((float) ($row['qty'] ?? $row['jumlah'] ?? 1), 1);
             $harga = (float) ($row['harga'] ?? $row['harga_jual'] ?? 0);
@@ -154,8 +177,23 @@ class PaymentInvoiceItemSyncService
                 'updated_at' => now(),
             ]);
 
-            PembayaranInvoiceItem::query()->create($payload);
+            $existing = $this->resolveRequestInvoiceItem($invoice, 3, $itemId, $sourceDetailId);
+
+            if ($existing) {
+                unset($payload['created_by'], $payload['created_at']);
+
+                DB::table('pembayaran_invoice_item')
+                    ->where('id', $existing->id)
+                    ->update($payload);
+
+                $activeItemIds[] = (int) $existing->id;
+                continue;
+            }
+
+            $activeItemIds[] = (int) DB::table('pembayaran_invoice_item')->insertGetId($payload);
         }
+
+        $this->softDeleteMissingRequestItems($invoice, 3, $activeItemIds);
     }
 
     protected function hardResetRequestItems(PembayaranInvoice $invoice, int $itemType): void
@@ -243,7 +281,7 @@ class PaymentInvoiceItemSyncService
 
     public function syncInvoiceItemsFromRegistrasi(PembayaranInvoice $invoice, RegistrasiKunjungan $registrasi): void
     {
-        if (!Schema::hasTable('pembayaran_invoice_item')) {
+        if (!$this->hasTable('pembayaran_invoice_item')) {
             return;
         }
 
@@ -457,7 +495,7 @@ class PaymentInvoiceItemSyncService
         $treatmentId = (int) ($detail->treatment_id ?? 0);
         $tokoId = (int) ($registrasi->toko_id ?? 0);
 
-        if (Schema::hasTable('master_treatment_toko')) {
+        if ($this->hasTable('master_treatment_toko')) {
             $query = DB::table('master_treatment_toko')
                 ->where(function ($q) {
                     $q->whereNull('is_delete')->orWhere('is_delete', 0);
@@ -716,7 +754,7 @@ class PaymentInvoiceItemSyncService
 
     protected function invoiceHasActiveTreatment(PembayaranInvoice $invoice): bool
     {
-        if (!Schema::hasTable('pembayaran_invoice_item')) {
+        if (!$this->hasTable('pembayaran_invoice_item')) {
             return false;
         }
 
@@ -731,7 +769,7 @@ class PaymentInvoiceItemSyncService
 
     protected function zeroConsultationChargeWhenInvoiceHasTreatment(PembayaranInvoice $invoice): void
     {
-        if (!Schema::hasTable('pembayaran_invoice_item')) {
+        if (!$this->hasTable('pembayaran_invoice_item')) {
             return;
         }
 
@@ -762,7 +800,7 @@ class PaymentInvoiceItemSyncService
 
     public function refreshInvoiceTotalsFromItems(PembayaranInvoice $invoice): void
     {
-        if (!Schema::hasTable('pembayaran_invoice_item')) {
+        if (!$this->hasTable('pembayaran_invoice_item')) {
             return;
         }
 
@@ -839,7 +877,7 @@ class PaymentInvoiceItemSyncService
 
     protected function resolveAccurateMapping(string $sourceType, string $sourceCode): ?object
     {
-        if (!Schema::hasTable('master_accurate_item_mapping')) {
+        if (!$this->hasTable('master_accurate_item_mapping')) {
             return null;
         }
 
@@ -899,13 +937,13 @@ class PaymentInvoiceItemSyncService
 
     protected function prorateSubtotalDiscountToItems(PembayaranInvoice $invoice, float $diskonSubtotal): void
     {
-        if (!Schema::hasTable('pembayaran_invoice_item')) {
+        if (!$this->hasTable('pembayaran_invoice_item')) {
             return;
         }
 
-        $hasProrataAmount = Schema::hasColumn('pembayaran_invoice_item', 'diskon_subtotal_amount');
-        $hasBeforeColumn = Schema::hasColumn('pembayaran_invoice_item', 'subtotal_before_diskon_subtotal');
-        $hasAfterColumn = Schema::hasColumn('pembayaran_invoice_item', 'subtotal_after_diskon_subtotal');
+        $hasProrataAmount = $this->hasColumn('pembayaran_invoice_item', 'diskon_subtotal_amount');
+        $hasBeforeColumn = $this->hasColumn('pembayaran_invoice_item', 'subtotal_before_diskon_subtotal');
+        $hasAfterColumn = $this->hasColumn('pembayaran_invoice_item', 'subtotal_after_diskon_subtotal');
 
         if (!$hasProrataAmount && !$hasBeforeColumn && !$hasAfterColumn) {
             return;
@@ -921,34 +959,38 @@ class PaymentInvoiceItemSyncService
             ->lockForUpdate()
             ->get(['id', 'subtotal']);
 
+        if ($items->isEmpty()) {
+            return;
+        }
+
         $baseSubtotal = (float) $items->sum(fn ($item) => (float) ($item->subtotal ?? 0));
         $diskonSubtotal = min(max($diskonSubtotal, 0), max($baseSubtotal, 0));
 
-        if ($items->isEmpty() || $baseSubtotal <= 0 || $diskonSubtotal <= 0) {
-            foreach ($items as $item) {
-                $subtotal = (float) ($item->subtotal ?? 0);
+        if ($baseSubtotal <= 0 || $diskonSubtotal <= 0) {
+            $payload = [
+                'updated_by' => $this->username(),
+                'updated_at' => now(),
+            ];
 
-                $payload = [
-                    'updated_by' => $this->username(),
-                    'updated_at' => now(),
-                ];
-
-                if ($hasProrataAmount) {
-                    $payload['diskon_subtotal_amount'] = 0;
-                }
-
-                if ($hasBeforeColumn) {
-                    $payload['subtotal_before_diskon_subtotal'] = $subtotal;
-                }
-
-                if ($hasAfterColumn) {
-                    $payload['subtotal_after_diskon_subtotal'] = $subtotal;
-                }
-
-                DB::table('pembayaran_invoice_item')
-                    ->where('id', $item->id)
-                    ->update($this->onlyExistingColumns('pembayaran_invoice_item', $payload));
+            if ($hasProrataAmount) {
+                $payload['diskon_subtotal_amount'] = 0;
             }
+
+            if ($hasBeforeColumn) {
+                $payload['subtotal_before_diskon_subtotal'] = DB::raw('subtotal');
+            }
+
+            if ($hasAfterColumn) {
+                $payload['subtotal_after_diskon_subtotal'] = DB::raw('subtotal');
+            }
+
+            DB::table('pembayaran_invoice_item')
+                ->where('pembayaran_id', $invoice->id)
+                ->whereIn('item_type', [2, 3])
+                ->where(function ($q) {
+                    $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                })
+                ->update($this->onlyExistingColumns('pembayaran_invoice_item', $payload));
 
             return;
         }
@@ -994,13 +1036,52 @@ class PaymentInvoiceItemSyncService
 
     protected function onlyExistingColumns(string $table, array $data): array
     {
+        $columns = $this->tableColumns($table);
+
+        if (empty($columns)) {
+            return [];
+        }
+
         return collect($data)
-            ->filter(fn ($value, $key) => Schema::hasColumn($table, $key))
+            ->filter(fn ($value, $key) => isset($columns[$key]))
             ->all();
+    }
+
+    protected function hasTable(string $table): bool
+    {
+        if (!array_key_exists($table, $this->tableExistsCache)) {
+            $this->tableExistsCache[$table] = Schema::hasTable($table);
+        }
+
+        return $this->tableExistsCache[$table];
+    }
+
+    protected function hasColumn(string $table, string $column): bool
+    {
+        $columns = $this->tableColumns($table);
+
+        return isset($columns[$column]);
+    }
+
+    protected function tableColumns(string $table): array
+    {
+        if (!$this->hasTable($table)) {
+            return [];
+        }
+
+        if (!array_key_exists($table, $this->tableColumnCache)) {
+            $this->tableColumnCache[$table] = array_fill_keys(Schema::getColumnListing($table), true);
+        }
+
+        return $this->tableColumnCache[$table];
     }
 
     protected function username(): string
     {
-        return (string) (auth()->user()->username ?? auth()->user()->name ?? 'system');
+        if ($this->usernameCache !== null) {
+            return $this->usernameCache;
+        }
+
+        return $this->usernameCache = (string) (auth()->user()->username ?? auth()->user()->name ?? 'system');
     }
 }

@@ -13,17 +13,17 @@ use Illuminate\Validation\ValidationException;
 class StockTransactionService
 {
     /**
-     * Menyiapkan item penjualan registrasi sebelum detail dan reservasi dibuat.
+     * Menyiapkan item penjualan registrasi sebelum detail dibuat.
      *
-     * Prioritas lokasi stok:
-     * 1. stock_produk_toko_id dari request
-     * 2. tempat_produk_id dari request
-     * 3. tempat default dari master_produk
-     * 4. lokasi stock_produk_toko yang sudah tersedia
-     * 5. tempat produk ID 1 sebagai fallback terakhir
+     * Catatan penting:
+     * - tempat_produk_id dari request sengaja DIABAIKAN.
+     * - stock_produk_toko_id dari request juga tidak dijadikan patokan utama.
+     * - Backend memilih row stock_produk_toko yang stok tersedia-nya paling cukup
+     *   berdasarkan produk_toko_id + produk_id + toko_id.
      *
-     * Jika ledger stock_produk_toko belum pernah digunakan, getLockedStockRow()
-     * akan melakukan bootstrap stok awal dari master_produk_toko secara aman.
+     * Kolom tempat_produk_id tetap diisi secara internal dari row stok yang dipilih,
+     * karena tabel stock_produk_toko, stock_mutasi_produk, dan stock_reservasi_produk
+     * masih memiliki kolom tempat_produk_id NOT NULL.
      */
     public function prepareRegistrasiPenjualanItems(
         array $items,
@@ -48,163 +48,22 @@ class StockTransactionService
                     ]);
                 }
 
-                $produkTokoId = (int) (
-                    $item['produk_toko_id']
-                    ?? $item['master_produk_toko_id']
-                    ?? $item['obat_toko_id']
-                    ?? $item['toko_produk_id']
-                    ?? 0
+                $master = $this->resolveMasterProdukToko($item, $tokoId, $index);
+                $masterProduk = $this->resolveMasterProduk((int) $master->produk_id, $index);
+
+                $stock = $this->selectAvailableStockIgnoringTempat(
+                    $master,
+                    $masterProduk,
+                    $qty,
+                    $user,
+                    "penjualan.items.{$index}.jumlah"
                 );
 
-                $produkId = (int) (
-                    $item['produk_id']
-                    ?? $item['obat_id']
-                    ?? $item['master_produk_id']
-                    ?? 0
-                );
-
-                $candidateId = (int) ($item['candidate_id'] ?? $item['id'] ?? 0);
-
-                $masterQuery = MasterProdukToko::query()
-                    ->where('toko_id', $tokoId)
-                    ->where(function ($query) {
-                        $query->where('is_delete', 0)
-                            ->orWhereNull('is_delete');
-                    });
-
-                $master = null;
-
-                if ($produkTokoId > 0) {
-                    $master = (clone $masterQuery)
-                        ->whereKey($produkTokoId)
-                        ->lockForUpdate()
-                        ->first();
-                }
-
-                if (!$master && $produkId > 0) {
-                    $master = (clone $masterQuery)
-                        ->where('produk_id', $produkId)
-                        ->lockForUpdate()
-                        ->first();
-                }
-
-                if (!$master && $candidateId > 0) {
-                    $master = (clone $masterQuery)
-                        ->where(function ($query) use ($candidateId) {
-                            $query->whereKey($candidateId)
-                                ->orWhere('produk_id', $candidateId);
-                        })
-                        ->lockForUpdate()
-                        ->first();
-                }
-
-                if (!$master) {
-                    $requestedId = $produkTokoId ?: ($produkId ?: $candidateId);
-
-                    throw ValidationException::withMessages([
-                        "penjualan.items.{$index}.produk_id" =>
-                            "Produk toko tidak ditemukan atau tidak aktif untuk produk ID {$requestedId} di toko {$tokoId}.",
-                    ]);
-                }
-
-                $produkTokoId = (int) $master->id;
-                $produkId = (int) $master->produk_id;
-
-                $masterProduk = DB::table('master_produk')
-                    ->where('id', $produkId)
-                    ->where(function ($query) {
-                        $query->where('is_delete', 0)
-                            ->orWhereNull('is_delete');
-                    })
-                    ->first(['id', 'nama', 'tempat_produk_id']);
-
-                if (!$masterProduk) {
-                    throw ValidationException::withMessages([
-                        "penjualan.items.{$index}.produk_id" =>
-                            "Master produk ID {$produkId} tidak ditemukan atau sudah tidak aktif.",
-                    ]);
-                }
-
-                $requestStockId = (int) ($item['stock_produk_toko_id'] ?? 0);
-                $requestTempatId = (int) ($item['tempat_produk_id'] ?? 0);
-                $defaultTempatId = (int) ($masterProduk->tempat_produk_id ?? 0);
-
-                $selectedStock = null;
-
-                if ($requestStockId > 0) {
-                    $selectedStock = StockProdukToko::query()
-                        ->whereKey($requestStockId)
-                        ->where('produk_toko_id', $produkTokoId)
-                        ->where('produk_id', $produkId)
-                        ->where('toko_id', $tokoId)
-                        ->lockForUpdate()
-                        ->first();
-
-                    if (!$selectedStock) {
-                        throw ValidationException::withMessages([
-                            "penjualan.items.{$index}.stock_produk_toko_id" =>
-                                'Lokasi stok yang dipilih tidak sesuai dengan produk dan toko.',
-                        ]);
-                    }
-                }
-
-                if (!$selectedStock && $requestTempatId <= 0) {
-                    $stockRows = StockProdukToko::query()
-                        ->where('produk_toko_id', $produkTokoId)
-                        ->where('produk_id', $produkId)
-                        ->where('toko_id', $tokoId)
-                        ->where(function ($query) {
-                            $query->where('is_delete', 0)
-                                ->orWhereNull('is_delete');
-                        })
-                        ->orderByRaw('(COALESCE(stok_akhir, 0) - COALESCE(stok_reserved, 0)) DESC')
-                        ->orderBy('id')
-                        ->lockForUpdate()
-                        ->get();
-
-                    $defaultStock = $defaultTempatId > 0
-                        ? $stockRows->firstWhere('tempat_produk_id', $defaultTempatId)
-                        : null;
-
-                    if (
-                        $defaultStock
-                        && ((float) $defaultStock->stok_akhir - (float) $defaultStock->stok_reserved) > 0
-                    ) {
-                        $selectedStock = $defaultStock;
-                    } else {
-                        $selectedStock = $stockRows->first(function (StockProdukToko $row) {
-                            return ((float) $row->stok_akhir - (float) $row->stok_reserved) > 0;
-                        });
-                    }
-
-                    if (!$selectedStock && $defaultTempatId <= 0) {
-                        $selectedStock = $stockRows->first();
-                    }
-                }
-
-                $tempatProdukId = (int) (
-                    $selectedStock?->tempat_produk_id
-                    ?: $requestTempatId
-                    ?: $defaultTempatId
-                    ?: 1
-                );
-
-                $stock = $this->getLockedStockRow([
-                    'produk_toko_id' => $produkTokoId,
-                    'produk_id' => $produkId,
-                    'toko_id' => $tokoId,
-                    'tempat_produk_id' => $tempatProdukId,
-                    'user' => $user,
-                ]);
-
-                $stokAkhir = (float) ($stock->stok_akhir ?? 0);
-                $stokReserved = (float) ($stock->stok_reserved ?? 0);
-                $stokTersedia = max($stokAkhir - $stokReserved, 0);
+                $stokTersedia = $this->availableQty($stock);
 
                 if ($stokTersedia < $qty) {
                     throw ValidationException::withMessages([
-                        "penjualan.items.{$index}.jumlah" =>
-                            "Stok tidak cukup untuk {$masterProduk->nama}. Stok tersedia: {$stokTersedia}, diminta: {$qty}.",
+                        "penjualan.items.{$index}.jumlah" => "Stok tidak cukup untuk {$masterProduk->nama}. Stok tersedia: {$stokTersedia}, diminta: {$qty}.",
                     ]);
                 }
 
@@ -218,9 +77,9 @@ class StockTransactionService
 
                 $preparedItems[] = [
                     ...$item,
-                    'produk_toko_id' => $produkTokoId,
-                    'produk_id' => $produkId,
-                    'obat_id' => $produkId,
+                    'produk_toko_id' => (int) $master->id,
+                    'produk_id' => (int) $master->produk_id,
+                    'obat_id' => (int) $master->produk_id,
                     'tempat_produk_id' => (int) $stock->tempat_produk_id,
                     'stock_produk_toko_id' => (int) $stock->id,
                     'nama_produk' => $item['nama_produk']
@@ -239,6 +98,7 @@ class StockTransactionService
             return $preparedItems;
         });
     }
+
     /**
      * Dipakai saat produk dipilih di registrasi layanan.
      * Stok fisik belum berkurang, tapi stok_reserved bertambah.
@@ -247,9 +107,11 @@ class StockTransactionService
     {
         return DB::transaction(function () use ($items, $context) {
             $results = [];
+            $tokoId = (int) ($context['toko_id'] ?? 0);
+            $user = $context['created_by'] ?? 'system';
 
             foreach ($items as $item) {
-                $qty = (float) ($item['qty'] ?? 0);
+                $qty = (float) ($item['qty'] ?? $item['jumlah'] ?? 0);
 
                 if ($qty <= 0) {
                     throw ValidationException::withMessages([
@@ -257,13 +119,16 @@ class StockTransactionService
                     ]);
                 }
 
-                $stock = $this->getLockedStockRow([
-                    'produk_toko_id' => $item['produk_toko_id'],
-                    'produk_id' => $item['produk_id'],
-                    'toko_id' => $context['toko_id'],
-                    'tempat_produk_id' => $item['tempat_produk_id'],
-                    'user' => $context['created_by'] ?? 'system',
-                ]);
+                $master = $this->resolveMasterProdukToko($item, $tokoId, null);
+                $masterProduk = $this->resolveMasterProduk((int) $master->produk_id, null);
+
+                $stock = $this->selectAvailableStockIgnoringTempat(
+                    $master,
+                    $masterProduk,
+                    $qty,
+                    $user,
+                    'stok'
+                );
 
                 $stokAkhir = (float) $stock->stok_akhir;
                 $reservedSebelum = (float) $stock->stok_reserved;
@@ -271,7 +136,7 @@ class StockTransactionService
 
                 if ($stokTersedia < $qty) {
                     throw ValidationException::withMessages([
-                        'stok' => "Stok tidak cukup untuk produk ID {$item['produk_id']}. Stok tersedia: {$stokTersedia}, diminta: {$qty}.",
+                        'stok' => "Stok tidak cukup untuk produk ID {$master->produk_id}. Stok tersedia: {$stokTersedia}, diminta: {$qty}.",
                     ]);
                 }
 
@@ -279,7 +144,7 @@ class StockTransactionService
 
                 $stock->stok_reserved = $reservedSesudah;
                 $stock->last_mutation_at = now();
-                $stock->updated_by = $context['created_by'] ?? 'system';
+                $stock->updated_by = $user;
                 $stock->updated_at = now();
                 $stock->save();
 
@@ -287,27 +152,27 @@ class StockTransactionService
                     'kode_reservasi' => $context['kode_reservasi'] ?? null,
                     'tanggal' => $context['tanggal'] ?? now(),
                     'expired_at' => $context['expired_at'] ?? null,
-                    'toko_id' => $context['toko_id'],
-                    'tempat_produk_id' => $item['tempat_produk_id'],
-                    'produk_toko_id' => $item['produk_toko_id'],
-                    'produk_id' => $item['produk_id'],
+                    'toko_id' => $tokoId,
+                    'tempat_produk_id' => (int) $stock->tempat_produk_id,
+                    'produk_toko_id' => (int) $master->id,
+                    'produk_id' => (int) $master->produk_id,
                     'qty_reserved' => $qty,
                     'source_type' => $context['source_type'],
                     'source_id' => $context['source_id'] ?? null,
                     'source_detail_id' => $item['source_detail_id'] ?? null,
                     'status' => 'ACTIVE',
                     'keterangan' => $context['keterangan'] ?? 'Reservasi stok dari registrasi layanan',
-                    'created_by' => $context['created_by'] ?? 'system',
+                    'created_by' => $user,
                     'created_at' => now(),
                 ]);
 
                 $this->insertMutasi([
                     'kode_mutasi' => $context['kode_reservasi'] ?? null,
                     'tanggal' => $context['tanggal'] ?? now(),
-                    'toko_id' => $context['toko_id'],
-                    'tempat_produk_id' => $item['tempat_produk_id'],
-                    'produk_toko_id' => $item['produk_toko_id'],
-                    'produk_id' => $item['produk_id'],
+                    'toko_id' => $tokoId,
+                    'tempat_produk_id' => (int) $stock->tempat_produk_id,
+                    'produk_toko_id' => (int) $master->id,
+                    'produk_id' => (int) $master->produk_id,
                     'tipe_mutasi' => 'RESERVE',
                     'arah_mutasi' => 'RESERVE',
                     'qty_masuk' => 0,
@@ -325,7 +190,7 @@ class StockTransactionService
                     'ref_id' => $context['source_id'] ?? null,
                     'ref_detail_id' => $item['source_detail_id'] ?? null,
                     'keterangan' => $context['keterangan'] ?? 'Reserve stok',
-                    'created_by' => $context['created_by'] ?? 'system',
+                    'created_by' => $user,
                 ]);
 
                 $results[] = $reservasi;
@@ -509,9 +374,11 @@ class StockTransactionService
     {
         return DB::transaction(function () use ($items, $context) {
             $mutasiList = [];
+            $tokoId = (int) ($context['toko_id'] ?? 0);
+            $user = $context['created_by'] ?? 'system';
 
             foreach ($items as $item) {
-                $qty = (float) ($item['qty'] ?? 0);
+                $qty = (float) ($item['qty'] ?? $item['jumlah'] ?? 0);
 
                 if ($qty <= 0) {
                     throw ValidationException::withMessages([
@@ -519,13 +386,16 @@ class StockTransactionService
                     ]);
                 }
 
-                $stock = $this->getLockedStockRow([
-                    'produk_toko_id' => $item['produk_toko_id'],
-                    'produk_id' => $item['produk_id'],
-                    'toko_id' => $context['toko_id'],
-                    'tempat_produk_id' => $item['tempat_produk_id'],
-                    'user' => $context['created_by'] ?? 'system',
-                ]);
+                $master = $this->resolveMasterProdukToko($item, $tokoId, null);
+                $masterProduk = $this->resolveMasterProduk((int) $master->produk_id, null);
+
+                $stock = $this->selectAvailableStockIgnoringTempat(
+                    $master,
+                    $masterProduk,
+                    $qty,
+                    $user,
+                    'stok'
+                );
 
                 $stokSebelum = (float) $stock->stok_akhir;
                 $reservedSebelum = (float) $stock->stok_reserved;
@@ -533,7 +403,7 @@ class StockTransactionService
 
                 if ($stokTersedia < $qty) {
                     throw ValidationException::withMessages([
-                        'stok' => "Stok tidak cukup untuk produk ID {$item['produk_id']}. Stok tersedia: {$stokTersedia}, diminta: {$qty}.",
+                        'stok' => "Stok tidak cukup untuk produk ID {$master->produk_id}. Stok tersedia: {$stokTersedia}, diminta: {$qty}.",
                     ]);
                 }
 
@@ -542,17 +412,17 @@ class StockTransactionService
                 $stock->stok_keluar = (float) $stock->stok_keluar + $qty;
                 $stock->stok_akhir = $stokSesudah;
                 $stock->last_mutation_at = now();
-                $stock->updated_by = $context['created_by'] ?? 'system';
+                $stock->updated_by = $user;
                 $stock->updated_at = now();
                 $stock->save();
 
                 $mutasi = $this->insertMutasi([
                     'kode_mutasi' => $context['kode_mutasi'] ?? null,
                     'tanggal' => $context['tanggal'] ?? now(),
-                    'toko_id' => $context['toko_id'],
-                    'tempat_produk_id' => $item['tempat_produk_id'],
-                    'produk_toko_id' => $item['produk_toko_id'],
-                    'produk_id' => $item['produk_id'],
+                    'toko_id' => $tokoId,
+                    'tempat_produk_id' => (int) $stock->tempat_produk_id,
+                    'produk_toko_id' => (int) $master->id,
+                    'produk_id' => (int) $master->produk_id,
                     'tipe_mutasi' => 'PENJUALAN',
                     'arah_mutasi' => 'OUT',
                     'qty_masuk' => 0,
@@ -570,7 +440,7 @@ class StockTransactionService
                     'ref_id' => $context['ref_id'] ?? null,
                     'ref_detail_id' => $item['ref_detail_id'] ?? null,
                     'keterangan' => $context['keterangan'] ?? 'Penjualan produk',
-                    'created_by' => $context['created_by'] ?? 'system',
+                    'created_by' => $user,
                 ]);
 
                 $mutasiList[] = $mutasi;
@@ -578,6 +448,202 @@ class StockTransactionService
 
             return $mutasiList;
         });
+    }
+
+    private function resolveMasterProdukToko(array $item, int $tokoId, ?int $index): MasterProdukToko
+    {
+        $produkTokoId = (int) (
+            $item['produk_toko_id']
+            ?? $item['master_produk_toko_id']
+            ?? $item['obat_toko_id']
+            ?? $item['toko_produk_id']
+            ?? 0
+        );
+
+        $produkId = (int) (
+            $item['produk_id']
+            ?? $item['obat_id']
+            ?? $item['master_produk_id']
+            ?? 0
+        );
+
+        $candidateId = (int) ($item['candidate_id'] ?? $item['id'] ?? 0);
+        $fieldPrefix = $index === null ? 'produk_id' : "penjualan.items.{$index}.produk_id";
+
+        $masterQuery = MasterProdukToko::query()
+            ->where('toko_id', $tokoId)
+            ->where(function ($query) {
+                $query->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            });
+
+        $master = null;
+
+        if ($produkTokoId > 0) {
+            $master = (clone $masterQuery)
+                ->whereKey($produkTokoId)
+                ->lockForUpdate()
+                ->first();
+        }
+
+        if (!$master && $produkId > 0) {
+            $master = (clone $masterQuery)
+                ->where('produk_id', $produkId)
+                ->lockForUpdate()
+                ->first();
+        }
+
+        if (!$master && $candidateId > 0) {
+            $master = (clone $masterQuery)
+                ->where(function ($query) use ($candidateId) {
+                    $query->whereKey($candidateId)
+                        ->orWhere('produk_id', $candidateId);
+                })
+                ->lockForUpdate()
+                ->first();
+        }
+
+        if (!$master) {
+            $requestedId = $produkTokoId ?: ($produkId ?: $candidateId);
+
+            throw ValidationException::withMessages([
+                $fieldPrefix => "Produk toko tidak ditemukan atau tidak aktif untuk produk ID {$requestedId} di toko {$tokoId}.",
+            ]);
+        }
+
+        return $master;
+    }
+
+    private function resolveMasterProduk(int $produkId, ?int $index): object
+    {
+        $masterProduk = DB::table('master_produk')
+            ->where('id', $produkId)
+            ->where(function ($query) {
+                $query->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            })
+            ->first(['id', 'nama', 'tempat_produk_id']);
+
+        if (!$masterProduk) {
+            $fieldPrefix = $index === null ? 'produk_id' : "penjualan.items.{$index}.produk_id";
+
+            throw ValidationException::withMessages([
+                $fieldPrefix => "Master produk ID {$produkId} tidak ditemukan atau sudah tidak aktif.",
+            ]);
+        }
+
+        return $masterProduk;
+    }
+
+    private function selectAvailableStockIgnoringTempat(
+        MasterProdukToko $master,
+        object $masterProduk,
+        float $qty,
+        string $user,
+        string $errorKey
+    ): StockProdukToko {
+        $produkTokoId = (int) $master->id;
+        $produkId = (int) $master->produk_id;
+        $tokoId = (int) $master->toko_id;
+        $fallbackTempatProdukId = (int) ($masterProduk->tempat_produk_id ?? 0);
+
+        if ($fallbackTempatProdukId <= 0) {
+            $fallbackTempatProdukId = 1;
+        }
+
+        $this->ensureStockRowExists($master, $fallbackTempatProdukId, $user);
+
+        $firstStock = $this->getLockedStockRows($produkTokoId, $produkId, $tokoId)->first();
+
+        if ($firstStock) {
+            $this->bootstrapStokAwalDariMasterJikaPerlu($firstStock, $master, $user);
+        }
+
+        $stockRows = $this->getLockedStockRows($produkTokoId, $produkId, $tokoId);
+
+        $selectedStock = $stockRows->first(function (StockProdukToko $row) use ($qty) {
+            return $this->availableQty($row) >= $qty;
+        });
+
+        if ($selectedStock) {
+            return $selectedStock;
+        }
+
+        $totalTersedia = $stockRows->sum(function (StockProdukToko $row) {
+            return $this->availableQty($row);
+        });
+
+        if ($totalTersedia < $qty) {
+            throw ValidationException::withMessages([
+                $errorKey => "Stok tidak cukup untuk {$masterProduk->nama}. Stok tersedia: {$totalTersedia}, diminta: {$qty}.",
+            ]);
+        }
+
+        throw ValidationException::withMessages([
+            $errorKey => "Stok {$masterProduk->nama} tersedia {$totalTersedia}, tetapi tersebar pada lebih dari satu row stok. Gabungkan stok dulu atau aktifkan split stok otomatis sebelum transaksi.",
+        ]);
+    }
+
+    private function ensureStockRowExists(MasterProdukToko $master, int $tempatProdukId, string $user): void
+    {
+        $exists = StockProdukToko::query()
+            ->where('produk_toko_id', (int) $master->id)
+            ->where('produk_id', (int) $master->produk_id)
+            ->where('toko_id', (int) $master->toko_id)
+            ->where(function ($query) {
+                $query->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            })
+            ->lockForUpdate()
+            ->exists();
+
+        if ($exists) {
+            return;
+        }
+
+        try {
+            StockProdukToko::create([
+                'produk_toko_id' => (int) $master->id,
+                'produk_id' => (int) $master->produk_id,
+                'toko_id' => (int) $master->toko_id,
+                'tempat_produk_id' => $tempatProdukId,
+                'stok_awal' => 0,
+                'stok_masuk' => 0,
+                'stok_keluar' => 0,
+                'stok_penyesuaian' => 0,
+                'stok_akhir' => 0,
+                'stok_reserved' => 0,
+                'stok_minimum' => (float) ($master->stok_minimum ?? 0),
+                'harga_beli_terakhir' => (float) ($master->harga_beli ?? 0),
+                'harga_jual_terakhir' => (float) ($master->harga_jual ?? 0),
+                'is_delete' => 0,
+                'created_by' => $user,
+                'created_at' => now(),
+            ]);
+        } catch (QueryException $e) {
+            // Race condition insert bersamaan: request lain sudah membuat row stok.
+        }
+    }
+
+    private function getLockedStockRows(int $produkTokoId, int $produkId, int $tokoId)
+    {
+        return StockProdukToko::query()
+            ->where('produk_toko_id', $produkTokoId)
+            ->where('produk_id', $produkId)
+            ->where('toko_id', $tokoId)
+            ->where(function ($query) {
+                $query->where('is_delete', 0)
+                    ->orWhereNull('is_delete');
+            })
+            ->orderByRaw('(COALESCE(stok_akhir, 0) - COALESCE(stok_reserved, 0)) DESC')
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+    }
+
+    private function availableQty(StockProdukToko $stock): float
+    {
+        return max((float) $stock->stok_akhir - (float) $stock->stok_reserved, 0);
     }
 
     private function getLockedStockRow(array $payload): StockProdukToko
@@ -588,10 +654,6 @@ class StockTransactionService
         $tempatProdukId = (int) $payload['tempat_produk_id'];
         $user = $payload['user'] ?? 'system';
 
-        /*
-         * Kunci master terlebih dahulu agar bootstrap stok awal untuk produk/cabang
-         * yang sama tidak dilakukan dua kali oleh request paralel.
-         */
         $master = MasterProdukToko::query()
             ->whereKey($produkTokoId)
             ->where('produk_id', $produkId)
@@ -601,6 +663,7 @@ class StockTransactionService
 
         $stock = StockProdukToko::query()
             ->where('produk_toko_id', $produkTokoId)
+            ->where('produk_id', $produkId)
             ->where('toko_id', $tokoId)
             ->where('tempat_produk_id', $tempatProdukId)
             ->lockForUpdate()
@@ -632,6 +695,7 @@ class StockTransactionService
 
             $stock = StockProdukToko::query()
                 ->where('produk_toko_id', $produkTokoId)
+                ->where('produk_id', $produkId)
                 ->where('toko_id', $tokoId)
                 ->where('tempat_produk_id', $tempatProdukId)
                 ->lockForUpdate()

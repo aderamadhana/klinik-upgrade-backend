@@ -61,15 +61,9 @@ class StockProdukTokoController extends BaseStockController
 
             $query->where(function ($q) use ($keyword) {
                 $q->whereHas('produkToko.produk', function ($produkQuery) use ($keyword) {
-                    $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
-                        ->orWhere('nama', 'like', "%{$keyword}%")
-                        ->orWhere('kode_produk', 'like', "%{$keyword}%")
-                        ->orWhere('kode_obat', 'like', "%{$keyword}%");
+                    $produkQuery->where('nama', 'like', "%{$keyword}%");
                 })->orWhereHas('produk', function ($produkQuery) use ($keyword) {
-                    $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
-                        ->orWhere('nama', 'like', "%{$keyword}%")
-                        ->orWhere('kode_produk', 'like', "%{$keyword}%")
-                        ->orWhere('kode_obat', 'like', "%{$keyword}%");
+                    $produkQuery->whhere('nama', 'like', "%{$keyword}%");
                 });
             });
         }
@@ -244,10 +238,7 @@ class StockProdukTokoController extends BaseStockController
         if ($keyword !== '') {
             $produkQuery->where(function ($q) use ($keyword) {
                 $q->whereHas('produk', function ($produkQuery) use ($keyword) {
-                    $produkQuery->where('nama_produk', 'like', "%{$keyword}%")
-                        ->orWhere('nama', 'like', "%{$keyword}%")
-                        ->orWhere('kode_produk', 'like', "%{$keyword}%")
-                        ->orWhere('kode_obat', 'like', "%{$keyword}%");
+                    $produkQuery->where('nama', 'like', "%{$keyword}%");
                 });
             });
         }
@@ -385,10 +376,6 @@ class StockProdukTokoController extends BaseStockController
                 'produk_toko_id' => $produk->id,
                 'produk_id' => $produk->produk_id,
                 'toko_id' => $produk->toko_id,
-                'kode_produk' => optional($produkMaster)->kode_produk
-                    ?: optional($produkMaster)->kode_obat
-                    ?: $produk->kode_produk
-                    ?: $produk->kode_obat,
                 'nama_produk' => $namaProduk,
                 'satuan' => optional($produkMaster)->satuan
                     ?: optional($produkMaster)->unit

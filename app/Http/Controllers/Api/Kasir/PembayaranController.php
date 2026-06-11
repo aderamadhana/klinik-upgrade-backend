@@ -315,245 +315,245 @@ class PembayaranController extends Controller
         }
     }
 
-    public function finish(Request $request, $id)
-    {
-        $validator = Validator::make($request->all(), [
-            'metode' => 'nullable|array',
-            'metode.*.metode_bayar_id' => 'nullable|integer',
-            'metode.*.metode_bayar_nama' => 'required_with:metode|string|max:100',
-            'metode.*.metode_bayar_tipe' => 'nullable|integer',
-            'metode.*.nominal_dialokasikan' => 'required_with:metode|numeric|min:0',
-            'metode.*.nominal_diterima' => 'nullable|numeric|min:0',
-            'metode.*.no_referensi' => 'nullable|string|max:150',
-            'metode.*.catatan' => 'nullable|string',
-            'metode_pembayaran' => 'nullable|string|max:100',
-            'jumlah_bayar' => 'nullable|numeric|min:0',
-            'catatan_pembayaran' => 'nullable|string',
-            'jenis_transaksi' => 'nullable|integer|in:0,1,2,3,4',
-            'referensi_dokter_id' => 'nullable|integer',
-            'deposit_expired_option_id' => 'nullable|integer',
-            'deposit_expired_at' => 'nullable|date',
-            'deposit_item_ids' => 'nullable|array',
-            'deposit_item_ids.*' => 'nullable|integer',
-            'deposit_treatment_item_ids' => 'nullable|array',
-            'deposit_treatment_item_ids.*' => 'nullable|integer',
-            'deposit_items' => 'nullable|array',
-            'deposit_items.*.item_id' => 'nullable|integer',
-            'deposit_items.*.pembayaran_item_id' => 'nullable|integer',
-            'deposit_items.*.invoice_item_id' => 'nullable|integer',
-            'deposit_items.*.qty' => 'nullable|numeric|min:0',
-            'deposit_items.*.qty_deposit' => 'nullable|numeric|min:0',
-            'deposit_treatment_items' => 'nullable|array',
-            'deposit_treatment_items.*.item_id' => 'nullable|integer',
-            'deposit_treatment_items.*.pembayaran_item_id' => 'nullable|integer',
-            'deposit_treatment_items.*.invoice_item_id' => 'nullable|integer',
-            'deposit_treatment_items.*.qty' => 'nullable|numeric|min:0',
-            'deposit_treatment_items.*.qty_deposit' => 'nullable|numeric|min:0',
-            'deposit_item_quantities' => 'nullable|array',
-            'update_pasien_phone' => 'nullable|boolean',
-            'pasien_no_hp_update' => 'nullable|string|max:30',
-            'pasien_no_wa_update' => 'nullable|string|max:30',
-            'pasien_no_telp_update' => 'nullable|string|max:30',
-            'sumber_informasi_id' => 'nullable|integer',
-            'sumber_kedatangan' => 'nullable|string|max:100',
-            'promo_ids' => 'nullable|array',
-            'promo_ids.*' => 'nullable|integer',
-            'promos' => 'nullable|array',
-            'selected_promos' => 'nullable|array',
-            'applied_promos' => 'nullable|array',
-            'promo_code' => 'nullable|string|max:100',
-            'diskon_subtotal_tipe' => 'nullable',
-            'diskon_subtotal_nilai' => 'nullable|numeric|min:0',
-        ]);
+    // public function finish(Request $request, $id)
+    // {
+    //     $validator = Validator::make($request->all(), [
+    //         'metode' => 'nullable|array',
+    //         'metode.*.metode_bayar_id' => 'nullable|integer',
+    //         'metode.*.metode_bayar_nama' => 'required_with:metode|string|max:100',
+    //         'metode.*.metode_bayar_tipe' => 'nullable|integer',
+    //         'metode.*.nominal_dialokasikan' => 'required_with:metode|numeric|min:0',
+    //         'metode.*.nominal_diterima' => 'nullable|numeric|min:0',
+    //         'metode.*.no_referensi' => 'nullable|string|max:150',
+    //         'metode.*.catatan' => 'nullable|string',
+    //         'metode_pembayaran' => 'nullable|string|max:100',
+    //         'jumlah_bayar' => 'nullable|numeric|min:0',
+    //         'catatan_pembayaran' => 'nullable|string',
+    //         'jenis_transaksi' => 'nullable|integer|in:0,1,2,3,4',
+    //         'referensi_dokter_id' => 'nullable|integer',
+    //         'deposit_expired_option_id' => 'nullable|integer',
+    //         'deposit_expired_at' => 'nullable|date',
+    //         'deposit_item_ids' => 'nullable|array',
+    //         'deposit_item_ids.*' => 'nullable|integer',
+    //         'deposit_treatment_item_ids' => 'nullable|array',
+    //         'deposit_treatment_item_ids.*' => 'nullable|integer',
+    //         'deposit_items' => 'nullable|array',
+    //         'deposit_items.*.item_id' => 'nullable|integer',
+    //         'deposit_items.*.pembayaran_item_id' => 'nullable|integer',
+    //         'deposit_items.*.invoice_item_id' => 'nullable|integer',
+    //         'deposit_items.*.qty' => 'nullable|numeric|min:0',
+    //         'deposit_items.*.qty_deposit' => 'nullable|numeric|min:0',
+    //         'deposit_treatment_items' => 'nullable|array',
+    //         'deposit_treatment_items.*.item_id' => 'nullable|integer',
+    //         'deposit_treatment_items.*.pembayaran_item_id' => 'nullable|integer',
+    //         'deposit_treatment_items.*.invoice_item_id' => 'nullable|integer',
+    //         'deposit_treatment_items.*.qty' => 'nullable|numeric|min:0',
+    //         'deposit_treatment_items.*.qty_deposit' => 'nullable|numeric|min:0',
+    //         'deposit_item_quantities' => 'nullable|array',
+    //         'update_pasien_phone' => 'nullable|boolean',
+    //         'pasien_no_hp_update' => 'nullable|string|max:30',
+    //         'pasien_no_wa_update' => 'nullable|string|max:30',
+    //         'pasien_no_telp_update' => 'nullable|string|max:30',
+    //         'sumber_informasi_id' => 'nullable|integer',
+    //         'sumber_kedatangan' => 'nullable|string|max:100',
+    //         'promo_ids' => 'nullable|array',
+    //         'promo_ids.*' => 'nullable|integer',
+    //         'promos' => 'nullable|array',
+    //         'selected_promos' => 'nullable|array',
+    //         'applied_promos' => 'nullable|array',
+    //         'promo_code' => 'nullable|string|max:100',
+    //         'diskon_subtotal_tipe' => 'nullable',
+    //         'diskon_subtotal_nilai' => 'nullable|numeric|min:0',
+    //     ]);
 
-        if ($validator->fails()) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Validasi gagal',
-                'errors' => $validator->errors(),
-            ], 422);
-        }
+    //     if ($validator->fails()) {
+    //         return response()->json([
+    //             'status' => false,
+    //             'message' => 'Validasi gagal',
+    //             'errors' => $validator->errors(),
+    //         ], 422);
+    //     }
 
-        try {
-            $result = DB::transaction(function () use ($request, $id) {
-                $invoice = $this->resolveInvoiceForUpdate($id);
+    //     try {
+    //         $result = DB::transaction(function () use ($request, $id) {
+    //             $invoice = $this->resolveInvoiceForUpdate($id);
 
-                if (!$invoice) {
-                    throw ValidationException::withMessages([
-                        'invoice' => 'Invoice tidak ditemukan.',
-                    ]);
-                }
+    //             if (!$invoice) {
+    //                 throw ValidationException::withMessages([
+    //                     'invoice' => 'Invoice tidak ditemukan.',
+    //                 ]);
+    //             }
 
-                if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
-                    throw ValidationException::withMessages([
-                        'invoice' => 'Invoice sudah lunas.',
-                    ]);
-                }
+    //             if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
+    //                 throw ValidationException::withMessages([
+    //                     'invoice' => 'Invoice sudah lunas.',
+    //                 ]);
+    //             }
 
-                $registrasi = RegistrasiKunjungan::query()
-                    ->with(['tasks'])
-                    ->whereKey($invoice->registrasi_id)
-                    ->where(function ($q) {
-                        $q->whereNull('is_delete')->orWhere('is_delete', 0);
-                    })
-                    ->lockForUpdate()
-                    ->first();
+    //             $registrasi = RegistrasiKunjungan::query()
+    //                 ->with(['tasks'])
+    //                 ->whereKey($invoice->registrasi_id)
+    //                 ->where(function ($q) {
+    //                     $q->whereNull('is_delete')->orWhere('is_delete', 0);
+    //                 })
+    //                 ->lockForUpdate()
+    //                 ->first();
 
-                if (!$registrasi) {
-                    throw ValidationException::withMessages([
-                        'registrasi' => 'Data registrasi invoice tidak ditemukan.',
-                    ]);
-                }
+    //             if (!$registrasi) {
+    //                 throw ValidationException::withMessages([
+    //                     'registrasi' => 'Data registrasi invoice tidak ditemukan.',
+    //                 ]);
+    //             }
 
-                $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
-                $depositExpiredAt = $this->resolveDepositExpiredAt($request);
+    //             $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
+    //             $depositExpiredAt = $this->resolveDepositExpiredAt($request);
 
-                $this->ensureLegacyInvoiceNumber($invoice, $registrasi, $jenisTransaksi);
+    //             $this->ensureLegacyInvoiceNumber($invoice, $registrasi, $jenisTransaksi);
 
-                $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
-                $this->syncInvoiceItemsFromRegistrasi($invoice, $registrasi);
-                $this->syncInvoiceItemsFromRequest($request, $invoice);
-                $this->refreshInvoiceTotalsFromItems($invoice);
+    //             $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
+    //             $this->syncInvoiceItemsFromRegistrasi($invoice, $registrasi);
+    //             $this->syncInvoiceItemsFromRequest($request, $invoice);
+    //             $this->refreshInvoiceTotalsFromItems($invoice);
 
-                $invoice = PembayaranInvoice::query()
-                    ->whereKey($invoice->id)
-                    ->lockForUpdate()
-                    ->firstOrFail();
+    //             $invoice = PembayaranInvoice::query()
+    //                 ->whereKey($invoice->id)
+    //                 ->lockForUpdate()
+    //                 ->firstOrFail();
 
-                $invoice->load([
-                    'items',
-                    'metode',
-                    'promos',
-                    'depositClaims',
-                ]);
+    //             $invoice->load([
+    //                 'items',
+    //                 'metode',
+    //                 'promos',
+    //                 'depositClaims',
+    //             ]);
 
-                $this->updatePatientPhoneFromRequest($request, $invoice);
-                $this->validateJenisTransaksiKhusus($request, $invoice, $jenisTransaksi, $depositExpiredAt);
+    //             $this->updatePatientPhoneFromRequest($request, $invoice);
+    //             $this->validateJenisTransaksiKhusus($request, $invoice, $jenisTransaksi, $depositExpiredAt);
 
-                if ($jenisTransaksi === 4 && $this->shouldSplitDepositInvoice($request, $invoice)) {
-                    return $this->finishSplitDepositInvoice($request, $invoice, $registrasi, $depositExpiredAt);
-                }
+    //             if ($jenisTransaksi === 4 && $this->shouldSplitDepositInvoice($request, $invoice)) {
+    //                 return $this->finishSplitDepositInvoice($request, $invoice, $registrasi, $depositExpiredAt);
+    //             }
 
-                $this->syncJenisTransaksiToInvoiceItems($invoice, $jenisTransaksi);
+    //             $this->syncJenisTransaksiToInvoiceItems($invoice, $jenisTransaksi);
 
-                if ($jenisTransaksi !== 4) {
-                    $this->processDepositClaimsFromInvoice($invoice, $registrasi);
-                }
+    //             if ($jenisTransaksi !== 4) {
+    //                 $this->processDepositClaimsFromInvoice($invoice, $registrasi);
+    //             }
 
-                $this->applySubtotalDiscountFromRequest($request, $invoice);
-                $this->refreshInvoiceTotalsFromItems($invoice);
+    //             $this->applySubtotalDiscountFromRequest($request, $invoice);
+    //             $this->refreshInvoiceTotalsFromItems($invoice);
 
-                $invoice = PembayaranInvoice::query()
-                    ->whereKey($invoice->id)
-                    ->lockForUpdate()
-                    ->firstOrFail();
-                $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
+    //             $invoice = PembayaranInvoice::query()
+    //                 ->whereKey($invoice->id)
+    //                 ->lockForUpdate()
+    //                 ->firstOrFail();
+    //             $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
 
-                $this->voucherFinalizerService->applySelectedPromosFromRequest(
-                    $invoice,
-                    $request,
-                    $this->username()
-                );
+    //             $this->voucherFinalizerService->applySelectedPromosFromRequest(
+    //                 $invoice,
+    //                 $request,
+    //                 $this->username()
+    //             );
 
-                $invoice = PembayaranInvoice::query()
-                    ->whereKey($invoice->id)
-                    ->lockForUpdate()
-                    ->firstOrFail();
-                $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
+    //             $invoice = PembayaranInvoice::query()
+    //                 ->whereKey($invoice->id)
+    //                 ->lockForUpdate()
+    //                 ->firstOrFail();
+    //             $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
 
-                $memberBeforeLedger = $this->snapshotPaymentMemberReward($invoice);
+    //             $memberBeforeLedger = $this->snapshotPaymentMemberReward($invoice);
 
-                $this->memberPointService->applyMemberBenefitToInvoice($invoice, $this->username());
-                $this->refreshInvoiceTotalsFromItems($invoice);
+    //             $this->memberPointService->applyMemberBenefitToInvoice($invoice, $this->username());
+    //             $this->refreshInvoiceTotalsFromItems($invoice);
 
-                $invoice = PembayaranInvoice::query()
-                    ->whereKey($invoice->id)
-                    ->lockForUpdate()
-                    ->firstOrFail();
+    //             $invoice = PembayaranInvoice::query()
+    //                 ->whereKey($invoice->id)
+    //                 ->lockForUpdate()
+    //                 ->firstOrFail();
 
-                $invoice->load([
-                    'items',
-                    'metode',
-                    'promos',
-                    'depositClaims',
-                ]);
+    //             $invoice->load([
+    //                 'items',
+    //                 'metode',
+    //                 'promos',
+    //                 'depositClaims',
+    //             ]);
 
-                $this->nurseTreatmentMaterialService->syncFromInvoice($invoice, $registrasi, $this->username());
+    //             $this->nurseTreatmentMaterialService->syncFromInvoice($invoice, $registrasi, $this->username());
 
-                $metode = $this->normalizeMetodePayload($request, $invoice);
-                $totalBayar = collect($metode)->sum('nominal_dialokasikan');
-                $grandTotal = (float) ($invoice->grand_total ?? 0);
+    //             $metode = $this->normalizeMetodePayload($request, $invoice);
+    //             $totalBayar = collect($metode)->sum('nominal_dialokasikan');
+    //             $grandTotal = (float) ($invoice->grand_total ?? 0);
 
-                $this->validatePaymentAmount($grandTotal, $totalBayar);
-                $this->replaceInvoiceMetode($invoice, $metode, $jenisTransaksi);
+    //             $this->validatePaymentAmount($grandTotal, $totalBayar);
+    //             $this->replaceInvoiceMetode($invoice, $metode, $jenisTransaksi);
 
-                if ($jenisTransaksi === 4) {
-                    $selectedDepositItems = $this->resolveDepositItems($request, $invoice);
-                    $selectedDepositItemIds = array_keys($selectedDepositItems);
-                    $this->applyDepositTransactionRules($invoice, $request, $depositExpiredAt, $selectedDepositItemIds);
-                    $this->generateDepositTreatmentRecords($invoice, $selectedDepositItems);
-                }
+    //             if ($jenisTransaksi === 4) {
+    //                 $selectedDepositItems = $this->resolveDepositItems($request, $invoice);
+    //                 $selectedDepositItemIds = array_keys($selectedDepositItems);
+    //                 $this->applyDepositTransactionRules($invoice, $request, $depositExpiredAt, $selectedDepositItemIds);
+    //                 $this->generateDepositTreatmentRecords($invoice, $selectedDepositItems);
+    //             }
 
-                $this->processStockKeluarPembayaran($invoice, $registrasi);
-                $this->createAccurateSyncPendingLog($invoice, $registrasi);
+    //             $this->processStockKeluarPembayaran($invoice, $registrasi);
+    //             $this->createAccurateSyncPendingLog($invoice, $registrasi);
 
-                $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
-                    'tanggal_lunas' => now(),
-                    'jenis_transaksi' => $jenisTransaksi,
-                    'referensi_dokter_id' => $jenisTransaksi === 4
-                        ? $request->input('referensi_dokter_id')
-                        : ($request->input('referensi_dokter_id', $invoice->referensi_dokter_id ?? null)),
-                    'deposit_expired_option_id' => $jenisTransaksi === 4
-                        ? $request->input('deposit_expired_option_id')
-                        : ($invoice->deposit_expired_option_id ?? null),
-                    'deposit_expired_at' => $jenisTransaksi === 4
-                        ? $depositExpiredAt
-                        : ($invoice->deposit_expired_at ?? null),
-                    'sumber_informasi_id' => $request->input('sumber_informasi_id', $invoice->sumber_informasi_id ?? null),
-                    'sumber_kedatangan' => $request->input('sumber_kedatangan', $invoice->sumber_kedatangan ?? null),
-                    'catatan' => $request->input('catatan_pembayaran', $invoice->catatan ?? null),
-                    'grand_total' => $grandTotal,
-                    'total_bayar' => $totalBayar,
-                    'sisa_tagihan' => 0,
-                    'total_kembalian' => max(0, $totalBayar - $grandTotal),
-                    'status' => PembayaranInvoice::STATUS_LUNAS,
-                    'updated_by' => $this->username(),
-                    'updated_at' => now(),
-                ]));
+    //             $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+    //                 'tanggal_lunas' => now(),
+    //                 'jenis_transaksi' => $jenisTransaksi,
+    //                 'referensi_dokter_id' => $jenisTransaksi === 4
+    //                     ? $request->input('referensi_dokter_id')
+    //                     : ($request->input('referensi_dokter_id', $invoice->referensi_dokter_id ?? null)),
+    //                 'deposit_expired_option_id' => $jenisTransaksi === 4
+    //                     ? $request->input('deposit_expired_option_id')
+    //                     : ($invoice->deposit_expired_option_id ?? null),
+    //                 'deposit_expired_at' => $jenisTransaksi === 4
+    //                     ? $depositExpiredAt
+    //                     : ($invoice->deposit_expired_at ?? null),
+    //                 'sumber_informasi_id' => $request->input('sumber_informasi_id', $invoice->sumber_informasi_id ?? null),
+    //                 'sumber_kedatangan' => $request->input('sumber_kedatangan', $invoice->sumber_kedatangan ?? null),
+    //                 'catatan' => $request->input('catatan_pembayaran', $invoice->catatan ?? null),
+    //                 'grand_total' => $grandTotal,
+    //                 'total_bayar' => $totalBayar,
+    //                 'sisa_tagihan' => 0,
+    //                 'total_kembalian' => max(0, $totalBayar - $grandTotal),
+    //                 'status' => PembayaranInvoice::STATUS_LUNAS,
+    //                 'updated_by' => $this->username(),
+    //                 'updated_at' => now(),
+    //             ]));
 
-                $invoice->refresh();
+    //             $invoice->refresh();
 
-                $this->memberPointService->processEarnedPointLedger($invoice, $this->username());
+    //             $this->memberPointService->processEarnedPointLedger($invoice, $this->username());
 
-                $memberReward = $this->buildPaymentMemberRewardResponse($invoice, $memberBeforeLedger);
+    //             $memberReward = $this->buildPaymentMemberRewardResponse($invoice, $memberBeforeLedger);
 
-                $nextTask = $this->completePaymentTask($registrasi);
+    //             $nextTask = $this->completePaymentTask($registrasi);
 
-                return [
-                    'invoice_id' => $invoice->id,
-                    'next_task_id' => $nextTask?->id,
-                    'already_paid' => false,
-                    'member_reward' => $memberReward,
-                ];
-            }, 3);
+    //             return [
+    //                 'invoice_id' => $invoice->id,
+    //                 'next_task_id' => $nextTask?->id,
+    //                 'already_paid' => false,
+    //                 'member_reward' => $memberReward,
+    //             ];
+    //         }, 3);
 
-            return $this->buildFinishSuccessResponse($result);
-        } catch (ValidationException $e) {
-            return response()->json([
-                'status' => false,
-                'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
-                'errors' => $e->errors(),
-            ], 422);
-        } catch (Throwable $e) {
-            report($e);
+    //         return $this->buildFinishSuccessResponse($result);
+    //     } catch (ValidationException $e) {
+    //         return response()->json([
+    //             'status' => false,
+    //             'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
+    //             'errors' => $e->errors(),
+    //         ], 422);
+    //     } catch (Throwable $e) {
+    //         report($e);
 
-            return response()->json([
-                'status' => false,
-                'message' => 'Gagal menyelesaikan pembayaran',
-                'error' => $e->getMessage(),
-            ], 500);
-        }
-    }
+    //         return response()->json([
+    //             'status' => false,
+    //             'message' => 'Gagal menyelesaikan pembayaran',
+    //             'error' => $e->getMessage(),
+    //         ], 500);
+    //     }
+    // }
 
 
     protected function buildFinishSuccessResponse(array $result)
@@ -5888,5 +5888,436 @@ class PembayaranController extends Controller
         }
 
         return $baseUrl . '/' . $tokoId . '/' . rawurlencode($sipuasPasienId);
+    }
+
+    private function startPaymentFinishTrace(Request $request, $id): array
+    {
+        return [
+            'trace_id' => now()->format('YmdHis') . '-' . bin2hex(random_bytes(4)),
+            'invoice_param_id' => $id,
+            'started_at' => microtime(true),
+            'last_at' => microtime(true),
+            'request_summary' => [
+                'jenis_transaksi' => $request->input('jenis_transaksi'),
+                'grand_total' => $request->input('grand_total'),
+                'metode_count' => is_array($request->input('metode')) ? count($request->input('metode')) : 0,
+                'penjualan_count' => is_array($request->input('penjualan_items')) ? count($request->input('penjualan_items')) : 0,
+                'treatment_count' => is_array($request->input('treatment_items')) ? count($request->input('treatment_items')) : 0,
+                'promo_count' => is_array($request->input('promos')) ? count($request->input('promos')) : 0,
+                'promo_id_count' => is_array($request->input('promo_ids')) ? count($request->input('promo_ids')) : 0,
+                'deposit_item_count' => is_array($request->input('deposit_items')) ? count($request->input('deposit_items')) : 0,
+                'deposit_treatment_item_count' => is_array($request->input('deposit_treatment_items')) ? count($request->input('deposit_treatment_items')) : 0,
+                'update_pasien_phone' => $request->input('update_pasien_phone'),
+            ],
+        ];
+    }
+
+    private function markPaymentFinishTrace(array &$trace, string $label, array $context = []): void
+    {
+        $now = microtime(true);
+        $startedAt = (float) ($trace['started_at'] ?? $now);
+        $lastAt = (float) ($trace['last_at'] ?? $startedAt);
+
+        $trace['last_at'] = $now;
+
+        logger()->info('[PAYMENT_FINISH_TRACE] ' . $label, array_merge([
+            'trace_id' => $trace['trace_id'] ?? null,
+            'invoice_param_id' => $trace['invoice_param_id'] ?? null,
+            'step_ms' => round(($now - $lastAt) * 1000, 2),
+            'total_ms' => round(($now - $startedAt) * 1000, 2),
+            'memory_mb' => round(memory_get_usage(true) / 1048576, 2),
+        ], $context));
+    }
+
+
+    // Ganti method finish() lama dengan versi ini.
+
+    public function finish(Request $request, $id)
+    {
+        $trace = $this->startPaymentFinishTrace($request, $id);
+        $this->markPaymentFinishTrace($trace, 'request.received', $trace['request_summary'] ?? []);
+
+        $validator = Validator::make($request->all(), [
+            'metode' => 'nullable|array',
+            'metode.*.metode_bayar_id' => 'nullable|integer',
+            'metode.*.metode_bayar_nama' => 'required_with:metode|string|max:100',
+            'metode.*.metode_bayar_tipe' => 'nullable|integer',
+            'metode.*.nominal_dialokasikan' => 'required_with:metode|numeric|min:0',
+            'metode.*.nominal_diterima' => 'nullable|numeric|min:0',
+            'metode.*.no_referensi' => 'nullable|string|max:150',
+            'metode.*.catatan' => 'nullable|string',
+            'metode_pembayaran' => 'nullable|string|max:100',
+            'jumlah_bayar' => 'nullable|numeric|min:0',
+            'catatan_pembayaran' => 'nullable|string',
+            'jenis_transaksi' => 'nullable|integer|in:0,1,2,3,4',
+            'referensi_dokter_id' => 'nullable|integer',
+            'deposit_expired_option_id' => 'nullable|integer',
+            'deposit_expired_at' => 'nullable|date',
+            'deposit_item_ids' => 'nullable|array',
+            'deposit_item_ids.*' => 'nullable|integer',
+            'deposit_treatment_item_ids' => 'nullable|array',
+            'deposit_treatment_item_ids.*' => 'nullable|integer',
+            'deposit_items' => 'nullable|array',
+            'deposit_items.*.item_id' => 'nullable|integer',
+            'deposit_items.*.pembayaran_item_id' => 'nullable|integer',
+            'deposit_items.*.invoice_item_id' => 'nullable|integer',
+            'deposit_items.*.qty' => 'nullable|numeric|min:0',
+            'deposit_items.*.qty_deposit' => 'nullable|numeric|min:0',
+            'deposit_treatment_items' => 'nullable|array',
+            'deposit_treatment_items.*.item_id' => 'nullable|integer',
+            'deposit_treatment_items.*.pembayaran_item_id' => 'nullable|integer',
+            'deposit_treatment_items.*.invoice_item_id' => 'nullable|integer',
+            'deposit_treatment_items.*.qty' => 'nullable|numeric|min:0',
+            'deposit_treatment_items.*.qty_deposit' => 'nullable|numeric|min:0',
+            'deposit_item_quantities' => 'nullable|array',
+            'update_pasien_phone' => 'nullable|boolean',
+            'pasien_no_hp_update' => 'nullable|string|max:30',
+            'pasien_no_wa_update' => 'nullable|string|max:30',
+            'pasien_no_telp_update' => 'nullable|string|max:30',
+            'sumber_informasi_id' => 'nullable|integer',
+            'sumber_kedatangan' => 'nullable|string|max:100',
+            'promo_ids' => 'nullable|array',
+            'promo_ids.*' => 'nullable|integer',
+            'promos' => 'nullable|array',
+            'selected_promos' => 'nullable|array',
+            'applied_promos' => 'nullable|array',
+            'promo_code' => 'nullable|string|max:100',
+            'diskon_subtotal_tipe' => 'nullable',
+            'diskon_subtotal_nilai' => 'nullable|numeric|min:0',
+        ]);
+
+        $this->markPaymentFinishTrace($trace, 'validator.finished');
+
+        if ($validator->fails()) {
+            $this->markPaymentFinishTrace($trace, 'validator.failed', [
+                'errors' => $validator->errors()->keys(),
+            ]);
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Validasi gagal',
+                'errors' => $validator->errors(),
+            ], 422);
+        }
+
+        try {
+            $result = DB::transaction(function () use ($request, $id, &$trace) {
+                $this->markPaymentFinishTrace($trace, 'transaction.started');
+
+                $invoice = $this->resolveInvoiceForUpdate($id);
+                $this->markPaymentFinishTrace($trace, 'resolveInvoiceForUpdate.finished', [
+                    'invoice_id' => $invoice?->id,
+                    'invoice_status' => $invoice?->status,
+                    'registrasi_id' => $invoice?->registrasi_id,
+                ]);
+
+                if (!$invoice) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice tidak ditemukan.',
+                    ]);
+                }
+
+                if ((int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
+                    throw ValidationException::withMessages([
+                        'invoice' => 'Invoice sudah lunas.',
+                    ]);
+                }
+
+                $registrasi = RegistrasiKunjungan::query()
+                    ->with(['tasks'])
+                    ->whereKey($invoice->registrasi_id)
+                    ->where(function ($q) {
+                        $q->whereNull('is_delete')->orWhere('is_delete', 0);
+                    })
+                    ->lockForUpdate()
+                    ->first();
+
+                $this->markPaymentFinishTrace($trace, 'registrasi.locked', [
+                    'registrasi_id' => $registrasi?->id,
+                    'task_count' => $registrasi?->tasks?->count(),
+                ]);
+
+                if (!$registrasi) {
+                    throw ValidationException::withMessages([
+                        'registrasi' => 'Data registrasi invoice tidak ditemukan.',
+                    ]);
+                }
+
+                $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
+                $depositExpiredAt = $this->resolveDepositExpiredAt($request);
+                $this->markPaymentFinishTrace($trace, 'resolveDepositExpiredAt.finished', [
+                    'jenis_transaksi' => $jenisTransaksi,
+                    'deposit_expired_at' => $depositExpiredAt,
+                ]);
+
+                $this->ensureLegacyInvoiceNumber($invoice, $registrasi, $jenisTransaksi);
+                $this->markPaymentFinishTrace($trace, 'ensureLegacyInvoiceNumber.finished', [
+                    'invoice_id' => $invoice->id,
+                    'no_invoice' => $invoice->no_invoice,
+                ]);
+
+                $registrasi->loadMissing(['treatmentDetails', 'penjualanDetails']);
+                $this->markPaymentFinishTrace($trace, 'registrasi.loadMissing.billingDetails.finished', [
+                    'treatment_detail_count' => $registrasi->treatmentDetails?->count(),
+                    'penjualan_detail_count' => $registrasi->penjualanDetails?->count(),
+                ]);
+
+                $this->syncInvoiceItemsFromRegistrasi($invoice, $registrasi);
+                $this->markPaymentFinishTrace($trace, 'syncInvoiceItemsFromRegistrasi.finished');
+
+                $this->syncInvoiceItemsFromRequest($request, $invoice);
+                $this->markPaymentFinishTrace($trace, 'syncInvoiceItemsFromRequest.finished');
+
+                $this->refreshInvoiceTotalsFromItems($invoice);
+                $this->markPaymentFinishTrace($trace, 'refreshInvoiceTotalsFromItems.1.finished');
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                $invoice->load([
+                    'items',
+                    'metode',
+                    'promos',
+                    'depositClaims',
+                ]);
+                $this->markPaymentFinishTrace($trace, 'invoice.reload.1.finished', [
+                    'invoice_id' => $invoice->id,
+                    'item_count' => $invoice->items?->count(),
+                    'metode_count' => $invoice->metode?->count(),
+                    'promo_count' => $invoice->promos?->count(),
+                    'deposit_claim_count' => $invoice->depositClaims?->count(),
+                    'grand_total' => (float) ($invoice->grand_total ?? 0),
+                ]);
+
+                $this->updatePatientPhoneFromRequest($request, $invoice);
+                $this->markPaymentFinishTrace($trace, 'updatePatientPhoneFromRequest.finished');
+
+                $this->validateJenisTransaksiKhusus($request, $invoice, $jenisTransaksi, $depositExpiredAt);
+                $this->markPaymentFinishTrace($trace, 'validateJenisTransaksiKhusus.finished');
+
+                if ($jenisTransaksi === 4 && $this->shouldSplitDepositInvoice($request, $invoice)) {
+                    $this->markPaymentFinishTrace($trace, 'finishSplitDepositInvoice.started');
+                    $splitResult = $this->finishSplitDepositInvoice($request, $invoice, $registrasi, $depositExpiredAt);
+                    $this->markPaymentFinishTrace($trace, 'finishSplitDepositInvoice.finished');
+                    return $splitResult;
+                }
+
+                $this->syncJenisTransaksiToInvoiceItems($invoice, $jenisTransaksi);
+                $this->markPaymentFinishTrace($trace, 'syncJenisTransaksiToInvoiceItems.finished');
+
+                if ($jenisTransaksi !== 4) {
+                    $this->processDepositClaimsFromInvoice($invoice, $registrasi);
+                    $this->markPaymentFinishTrace($trace, 'processDepositClaimsFromInvoice.finished');
+                } else {
+                    $this->markPaymentFinishTrace($trace, 'processDepositClaimsFromInvoice.skipped');
+                }
+
+                $this->applySubtotalDiscountFromRequest($request, $invoice);
+                $this->markPaymentFinishTrace($trace, 'applySubtotalDiscountFromRequest.finished', [
+                    'diskon_subtotal_tipe' => $request->input('diskon_subtotal_tipe'),
+                    'diskon_subtotal_nilai' => $request->input('diskon_subtotal_nilai'),
+                ]);
+
+                $this->refreshInvoiceTotalsFromItems($invoice);
+                $this->markPaymentFinishTrace($trace, 'refreshInvoiceTotalsFromItems.2.finished');
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
+                $this->markPaymentFinishTrace($trace, 'invoice.reload.2.finished', [
+                    'item_count' => $invoice->items?->count(),
+                    'promo_count' => $invoice->promos?->count(),
+                    'deposit_claim_count' => $invoice->depositClaims?->count(),
+                    'grand_total' => (float) ($invoice->grand_total ?? 0),
+                ]);
+
+                $this->voucherFinalizerService->applySelectedPromosFromRequest(
+                    $invoice,
+                    $request,
+                    $this->username()
+                );
+                $this->markPaymentFinishTrace($trace, 'voucherFinalizerService.applySelectedPromosFromRequest.finished', [
+                    'request_promo_ids_count' => is_array($request->input('promo_ids')) ? count($request->input('promo_ids')) : 0,
+                    'request_promos_count' => is_array($request->input('promos')) ? count($request->input('promos')) : 0,
+                    'promo_code_present' => filled($request->input('promo_code')),
+                ]);
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                $invoice->load(['items', 'metode', 'promos', 'depositClaims']);
+                $this->markPaymentFinishTrace($trace, 'invoice.reload.3.finished', [
+                    'item_count' => $invoice->items?->count(),
+                    'promo_count' => $invoice->promos?->count(),
+                    'deposit_claim_count' => $invoice->depositClaims?->count(),
+                    'grand_total' => (float) ($invoice->grand_total ?? 0),
+                ]);
+
+                $memberBeforeLedger = $this->snapshotPaymentMemberReward($invoice);
+                $this->markPaymentFinishTrace($trace, 'snapshotPaymentMemberReward.finished', [
+                    'member_before' => $memberBeforeLedger,
+                ]);
+
+                $this->memberPointService->applyMemberBenefitToInvoice($invoice, $this->username());
+                $this->markPaymentFinishTrace($trace, 'memberPointService.applyMemberBenefitToInvoice.finished');
+
+                $this->refreshInvoiceTotalsFromItems($invoice);
+                $this->markPaymentFinishTrace($trace, 'refreshInvoiceTotalsFromItems.3.finished');
+
+                $invoice = PembayaranInvoice::query()
+                    ->whereKey($invoice->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+                $invoice->load([
+                    'items',
+                    'metode',
+                    'promos',
+                    'depositClaims',
+                ]);
+                $this->markPaymentFinishTrace($trace, 'invoice.reload.4.finished', [
+                    'item_count' => $invoice->items?->count(),
+                    'promo_count' => $invoice->promos?->count(),
+                    'deposit_claim_count' => $invoice->depositClaims?->count(),
+                    'grand_total' => (float) ($invoice->grand_total ?? 0),
+                ]);
+
+                $this->nurseTreatmentMaterialService->syncFromInvoice($invoice, $registrasi, $this->username());
+                $this->markPaymentFinishTrace($trace, 'nurseTreatmentMaterialService.syncFromInvoice.finished');
+
+                $metode = $this->normalizeMetodePayload($request, $invoice);
+                $this->markPaymentFinishTrace($trace, 'normalizeMetodePayload.finished', [
+                    'metode_count' => count($metode),
+                ]);
+
+                $totalBayar = collect($metode)->sum('nominal_dialokasikan');
+                $grandTotal = (float) ($invoice->grand_total ?? 0);
+
+                $this->validatePaymentAmount($grandTotal, $totalBayar);
+                $this->markPaymentFinishTrace($trace, 'validatePaymentAmount.finished', [
+                    'grand_total' => $grandTotal,
+                    'total_bayar' => $totalBayar,
+                ]);
+
+                $this->replaceInvoiceMetode($invoice, $metode, $jenisTransaksi);
+                $this->markPaymentFinishTrace($trace, 'replaceInvoiceMetode.finished');
+
+                if ($jenisTransaksi === 4) {
+                    $selectedDepositItems = $this->resolveDepositItems($request, $invoice);
+                    $selectedDepositItemIds = array_keys($selectedDepositItems);
+                    $this->markPaymentFinishTrace($trace, 'resolveDepositItems.finished', [
+                        'selected_deposit_item_count' => count($selectedDepositItemIds),
+                    ]);
+
+                    $this->applyDepositTransactionRules($invoice, $request, $depositExpiredAt, $selectedDepositItemIds);
+                    $this->markPaymentFinishTrace($trace, 'applyDepositTransactionRules.finished');
+
+                    $this->generateDepositTreatmentRecords($invoice, $selectedDepositItems);
+                    $this->markPaymentFinishTrace($trace, 'generateDepositTreatmentRecords.finished');
+                } else {
+                    $this->markPaymentFinishTrace($trace, 'depositTransactionRules.skipped');
+                }
+
+                $this->processStockKeluarPembayaran($invoice, $registrasi);
+                $this->markPaymentFinishTrace($trace, 'processStockKeluarPembayaran.finished');
+
+                $this->createAccurateSyncPendingLog($invoice, $registrasi);
+                $this->markPaymentFinishTrace($trace, 'createAccurateSyncPendingLog.finished');
+
+                $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
+                    'tanggal_lunas' => now(),
+                    'jenis_transaksi' => $jenisTransaksi,
+                    'referensi_dokter_id' => $jenisTransaksi === 4
+                        ? $request->input('referensi_dokter_id')
+                        : ($request->input('referensi_dokter_id', $invoice->referensi_dokter_id ?? null)),
+                    'deposit_expired_option_id' => $jenisTransaksi === 4
+                        ? $request->input('deposit_expired_option_id')
+                        : ($invoice->deposit_expired_option_id ?? null),
+                    'deposit_expired_at' => $jenisTransaksi === 4
+                        ? $depositExpiredAt
+                        : ($invoice->deposit_expired_at ?? null),
+                    'sumber_informasi_id' => $request->input('sumber_informasi_id', $invoice->sumber_informasi_id ?? null),
+                    'sumber_kedatangan' => $request->input('sumber_kedatangan', $invoice->sumber_kedatangan ?? null),
+                    'catatan' => $request->input('catatan_pembayaran', $invoice->catatan ?? null),
+                    'grand_total' => $grandTotal,
+                    'total_bayar' => $totalBayar,
+                    'sisa_tagihan' => 0,
+                    'total_kembalian' => max(0, $totalBayar - $grandTotal),
+                    'status' => PembayaranInvoice::STATUS_LUNAS,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]));
+                $this->markPaymentFinishTrace($trace, 'invoice.markPaid.finished', [
+                    'invoice_id' => $invoice->id,
+                    'status' => PembayaranInvoice::STATUS_LUNAS,
+                ]);
+
+                $invoice->refresh();
+                $this->markPaymentFinishTrace($trace, 'invoice.refresh.afterPaid.finished');
+
+                $this->memberPointService->processEarnedPointLedger($invoice, $this->username());
+                $this->markPaymentFinishTrace($trace, 'memberPointService.processEarnedPointLedger.finished');
+
+                $memberReward = $this->buildPaymentMemberRewardResponse($invoice, $memberBeforeLedger);
+                $this->markPaymentFinishTrace($trace, 'buildPaymentMemberRewardResponse.finished', [
+                    'member_reward' => $memberReward,
+                ]);
+
+                $nextTask = $this->completePaymentTask($registrasi);
+                $this->markPaymentFinishTrace($trace, 'completePaymentTask.finished', [
+                    'next_task_id' => $nextTask?->id,
+                ]);
+
+                $result = [
+                    'invoice_id' => $invoice->id,
+                    'next_task_id' => $nextTask?->id,
+                    'already_paid' => false,
+                    'member_reward' => $memberReward,
+                ];
+
+                $this->markPaymentFinishTrace($trace, 'transaction.returning', $result);
+
+                return $result;
+            }, 3);
+
+            $this->markPaymentFinishTrace($trace, 'transaction.committed', [
+                'invoice_id' => $result['invoice_id'] ?? null,
+                'next_task_id' => $result['next_task_id'] ?? null,
+            ]);
+
+            $response = $this->buildFinishSuccessResponse($result);
+            $this->markPaymentFinishTrace($trace, 'response.built');
+
+            return $response;
+        } catch (ValidationException $e) {
+            $this->markPaymentFinishTrace($trace, 'exception.validation', [
+                'message' => collect($e->errors())->flatten()->first(),
+                'errors' => $e->errors(),
+            ]);
+
+            return response()->json([
+                'status' => false,
+                'message' => collect($e->errors())->flatten()->first() ?: 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
+        } catch (Throwable $e) {
+            $this->markPaymentFinishTrace($trace, 'exception.throwable', [
+                'exception' => get_class($e),
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
+
+            report($e);
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Gagal menyelesaikan pembayaran',
+                'error' => $e->getMessage(),
+            ], 500);
+        }
     }
 }

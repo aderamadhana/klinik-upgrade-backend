@@ -293,40 +293,103 @@ class AntrianDokterController extends Controller
             ], 422);
         }
 
-        $registrasi = RegistrasiKunjungan::query()
-            ->with('tasks')
-            ->active()
-            ->findOrFail($id);
-
-        if (!$this->isDoctorQueue($registrasi)) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Registrasi ini tidak berada pada antrian dokter',
-            ], 422);
-        }
-
-        $task = $this->getDoctorTask($registrasi);
-
-        if (!$task) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Task dokter tidak ditemukan',
-            ], 422);
-        }
-
-        if (!in_array((int) $task->status, [
-            RegistrasiTask::STATUS_MENUNGGU,
-            RegistrasiTask::STATUS_PROSES,
-        ], true)) {
-            return response()->json([
-                'status' => false,
-                'message' => 'Task dokter tidak bisa diselesaikan',
-            ], 422);
-        }
-
         DB::beginTransaction();
 
         try {
+            $registrasi = RegistrasiKunjungan::query()
+                ->active()
+                ->whereKey($id)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$registrasi) {
+                DB::rollBack();
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Registrasi tidak ditemukan',
+                ], 404);
+            }
+
+            $registrasi->load([
+                'toko',
+                'pasien',
+                'dokterAwal',
+                'perawatAwal',
+                'tasks' => function ($q) {
+                    $q->orderBy('task_order');
+                },
+            ]);
+
+            if (!$this->isDoctorQueue($registrasi)) {
+                DB::rollBack();
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Registrasi ini tidak berada pada antrian dokter',
+                ], 422);
+            }
+
+            $doctorTask = $this->getDoctorTask($registrasi);
+
+            if (!$doctorTask) {
+                DB::rollBack();
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Task dokter tidak ditemukan',
+                ], 422);
+            }
+
+            $task = RegistrasiTask::query()
+                ->whereKey($doctorTask->id)
+                ->lockForUpdate()
+                ->first();
+
+            if (!$task) {
+                DB::rollBack();
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Task dokter tidak ditemukan',
+                ], 422);
+            }
+
+            if ((int) $task->status === RegistrasiTask::STATUS_SELESAI) {
+                $paymentTask = $this->ensurePaymentTask($registrasi);
+                $invoice = $this->getLockedDoctorPaymentInvoice($registrasi);
+
+                if (!$invoice) {
+                    $registrasi = $registrasi->fresh([
+                        'toko',
+                        'pasien',
+                        'dokterAwal',
+                        'perawatAwal',
+                        'tasks',
+                        'treatmentDetails',
+                        'penjualanDetails',
+                    ]);
+
+                    $invoice = $this->syncPaymentInvoiceFromRegistrasi($registrasi, $paymentTask);
+                }
+
+                DB::commit();
+
+                return $this->doctorFinishSuccessResponse($registrasi, $invoice, true);
+            }
+
+            if (!in_array((int) $task->status, [
+                RegistrasiTask::STATUS_MENUNGGU,
+                RegistrasiTask::STATUS_PROSES,
+            ], true)) {
+                DB::rollBack();
+
+                return response()->json([
+                    'status' => false,
+                    'message' => 'Task dokter tidak bisa diselesaikan',
+                ], 422);
+            }
+
             $soap = $this->saveDoctorSoap($request, $registrasi, $task);
 
             $this->releaseDoctorProductReservation($registrasi, $task);
@@ -370,31 +433,11 @@ class AntrianDokterController extends Controller
 
             DB::commit();
 
-            $row = $this->formatQueueRow($registrasi->fresh([
-                'toko',
-                'pasien',
-                'dokterAwal',
-                'perawatAwal',
-                'tasks',
-            ]));
-
-            $row->setAttribute('pembayaran_invoice_id', $invoice->id);
-            $row->setAttribute('invoice_id', $invoice->id);
-            $row->setAttribute('no_invoice', $invoice->no_invoice);
-
-            return response()->json([
-                'status' => true,
-                'message' => 'Proses dokter berhasil disimpan dan invoice pembayaran berhasil disinkronkan',
-                'data' => $row,
-                'invoice' => [
-                    'id' => $invoice->id,
-                    'no_invoice' => $invoice->no_invoice,
-                    'grand_total' => $invoice->grand_total,
-                    'status' => $invoice->status,
-                ],
-            ]);
+            return $this->doctorFinishSuccessResponse($registrasi, $invoice, false);
         } catch (\Throwable $e) {
-            DB::rollBack();
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
 
             return response()->json([
                 'status' => false,
@@ -856,10 +899,9 @@ class AntrianDokterController extends Controller
 
     private function syncPaymentInvoiceFromRegistrasi(RegistrasiKunjungan $registrasi, RegistrasiTask $paymentTask)
     {
-        $invoice = PembayaranInvoice::query()
-            ->active()
-            ->where('registrasi_id', $registrasi->id)
-            ->first();
+        $invoiceBaseNo = $this->generateInvoiceBaseNumber($registrasi);
+        $invoiceNo = $this->generateInvoiceNumber($registrasi);
+        $invoice = $this->getLockedDoctorPaymentInvoice($registrasi);
 
         if ($invoice && (int) $invoice->status === PembayaranInvoice::STATUS_LUNAS) {
             throw new \Exception('Invoice sudah lunas dan tidak bisa disinkronkan ulang');
@@ -875,6 +917,8 @@ class AntrianDokterController extends Controller
 
             $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
                 'task_id' => $paymentTask->id,
+                'invoice_base_no' => $invoiceBaseNo,
+                'invoice_suffix' => 'U',
                 'kode_registrasi' => $registrasi->kode_registrasi,
                 'toko_id' => $registrasi->toko_id,
                 'pasien_id' => $registrasi->pasien_id,
@@ -888,7 +932,9 @@ class AntrianDokterController extends Controller
             $invoice = PembayaranInvoice::create($this->onlyExistingColumns('pembayaran_invoice', [
                 'registrasi_id' => $registrasi->id,
                 'task_id' => $paymentTask->id,
-                'no_invoice' => $this->generateInvoiceNumber($registrasi),
+                'no_invoice' => $invoiceNo,
+                'invoice_base_no' => $invoiceBaseNo,
+                'invoice_suffix' => 'U',
                 'kode_registrasi' => $registrasi->kode_registrasi,
                 'toko_id' => $registrasi->toko_id,
                 'pasien_id' => $registrasi->pasien_id,
@@ -1644,9 +1690,14 @@ class AntrianDokterController extends Controller
         }
     }
 
-    private function generateInvoiceNumber(RegistrasiKunjungan $registrasi): string
+    private function generateInvoiceBaseNumber(RegistrasiKunjungan $registrasi): string
     {
         return 'INV-' . $registrasi->kode_registrasi;
+    }
+
+    private function generateInvoiceNumber(RegistrasiKunjungan $registrasi): string
+    {
+        return $this->generateInvoiceBaseNumber($registrasi) . '-U';
     }
 
     private function normalizeTextArray($value): array
@@ -1835,5 +1886,55 @@ class AntrianDokterController extends Controller
     private function isSameDecimal($left, $right, float $tolerance = 0.01): bool
     {
         return abs(((float) $left) - ((float) $right)) <= $tolerance;
+    }
+
+    private function getLockedDoctorPaymentInvoice(RegistrasiKunjungan $registrasi): ?PembayaranInvoice
+    {
+        return PembayaranInvoice::query()
+            ->active()
+            ->where('registrasi_id', $registrasi->id)
+            ->when(
+                Schema::hasColumn('pembayaran_invoice', 'invoice_suffix'),
+                fn ($query) => $query->where('invoice_suffix', 'U')
+            )
+            ->lockForUpdate()
+            ->first();
+    }
+
+    private function doctorFinishSuccessResponse(
+        RegistrasiKunjungan $registrasi,
+        ?PembayaranInvoice $invoice = null,
+        bool $alreadyFinished = false
+    ) {
+        $registrasi = $registrasi->fresh([
+            'toko',
+            'pasien',
+            'dokterAwal',
+            'perawatAwal',
+            'tasks',
+        ]);
+
+        $row = $this->formatQueueRow($registrasi);
+
+        if ($invoice) {
+            $row->setAttribute('pembayaran_invoice_id', $invoice->id);
+            $row->setAttribute('invoice_id', $invoice->id);
+            $row->setAttribute('no_invoice', $invoice->no_invoice);
+        }
+
+        return response()->json([
+            'status' => true,
+            'message' => $alreadyFinished
+                ? 'Proses dokter sudah selesai. Invoice pembayaran sudah tersedia.'
+                : 'Proses dokter berhasil disimpan dan invoice pembayaran berhasil disinkronkan',
+            'data' => $row,
+            'invoice' => $invoice ? [
+                'id' => $invoice->id,
+                'no_invoice' => $invoice->no_invoice,
+                'grand_total' => $invoice->grand_total,
+                'status' => $invoice->status,
+            ] : null,
+            'already_finished' => $alreadyFinished,
+        ]);
     }
 }
