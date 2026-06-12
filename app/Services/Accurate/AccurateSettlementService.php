@@ -15,6 +15,7 @@ class AccurateSettlementService
 {
     private const JENIS_TRANSAKSI_UMUM = 0;
     private const JENIS_TRANSAKSI_ELITE_GLOWBAL = 2;
+    private const JENIS_TRANSAKSI_OWNER = 3;
 
     public function __construct(private readonly AccurateSalesInvoiceClient $client)
     {
@@ -33,6 +34,14 @@ class AccurateSettlementService
         return $this->listByJenisTransaksi(
             $filters,
             self::JENIS_TRANSAKSI_ELITE_GLOWBAL
+        );
+    }
+
+    public function listOwner(array $filters = []): array
+    {
+        return $this->listByJenisTransaksi(
+            $filters,
+            self::JENIS_TRANSAKSI_OWNER
         );
     }
 
@@ -58,6 +67,19 @@ class AccurateSettlementService
             $tanggalFaktur,
             $tokoId,
             self::JENIS_TRANSAKSI_ELITE_GLOWBAL,
+            $user
+        );
+    }
+
+    public function uploadOwner(
+        string $tanggalFaktur,
+        int $tokoId,
+        ?object $user = null
+    ): array {
+        return $this->uploadByJenisTransaksi(
+            $tanggalFaktur,
+            $tokoId,
+            self::JENIS_TRANSAKSI_OWNER,
             $user
         );
     }
@@ -608,43 +630,62 @@ class AccurateSettlementService
         $branch = strtoupper(trim((string) ($toko['nama_toko'] ?? 'CABANG')));
         $date = Carbon::parse($tanggal)->format('d/m/Y');
 
-        if ($jenisTransaksi === self::JENIS_TRANSAKSI_ELITE_GLOWBAL) {
-            return sprintf('ELITE GLOWBAL TREATMENT & PRODUK %s %s', $branch, $date);
-        }
-
-        return sprintf('TREATMENT & PRODUK %s %s', $branch, $date);
+        return match ($jenisTransaksi) {
+            self::JENIS_TRANSAKSI_ELITE_GLOWBAL => sprintf(
+                'ELITE GLOWBAL TREATMENT & PRODUK %s %s',
+                $branch,
+                $date
+            ),
+            self::JENIS_TRANSAKSI_OWNER => sprintf(
+                'OWNER TREATMENT & PRODUK %s %s',
+                $branch,
+                $date
+            ),
+            default => sprintf(
+                'TREATMENT & PRODUK %s %s',
+                $branch,
+                $date
+            ),
+        };
     }
 
     private function jenisTransaksiLabel(int $jenisTransaksi): string
     {
         return match ($jenisTransaksi) {
             self::JENIS_TRANSAKSI_ELITE_GLOWBAL => 'EliteGlowbal',
+            self::JENIS_TRANSAKSI_OWNER => 'Owner',
             default => 'umum',
         };
     }
 
     private function customerNo(int $jenisTransaksi): string
     {
-        if ($jenisTransaksi === self::JENIS_TRANSAKSI_ELITE_GLOWBAL) {
-            return (string) env(
+        return match ($jenisTransaksi) {
+            self::JENIS_TRANSAKSI_ELITE_GLOWBAL => (string) env(
                 'ACCURATE_ELITE_GLOWBAL_CUSTOMER_NO',
                 env('ACCURATE_UMUM_CUSTOMER_NO', 'UMUM')
-            );
-        }
-
-        return (string) env('ACCURATE_UMUM_CUSTOMER_NO', 'UMUM');
+            ),
+            self::JENIS_TRANSAKSI_OWNER => (string) env(
+                'ACCURATE_OWNER_CUSTOMER_NO',
+                env('ACCURATE_UMUM_CUSTOMER_NO', 'UMUM')
+            ),
+            default => (string) env('ACCURATE_UMUM_CUSTOMER_NO', 'UMUM'),
+        };
     }
 
     private function salesmanNo(int $jenisTransaksi): string
     {
-        if ($jenisTransaksi === self::JENIS_TRANSAKSI_ELITE_GLOWBAL) {
-            return (string) env(
+        return match ($jenisTransaksi) {
+            self::JENIS_TRANSAKSI_ELITE_GLOWBAL => (string) env(
                 'ACCURATE_ELITE_GLOWBAL_SALESMAN_NO',
                 env('ACCURATE_UMUM_SALESMAN_NO', '')
-            );
-        }
-
-        return (string) env('ACCURATE_UMUM_SALESMAN_NO', '');
+            ),
+            self::JENIS_TRANSAKSI_OWNER => (string) env(
+                'ACCURATE_OWNER_SALESMAN_NO',
+                env('ACCURATE_UMUM_SALESMAN_NO', '')
+            ),
+            default => (string) env('ACCURATE_UMUM_SALESMAN_NO', ''),
+        };
     }
 
     private function rowKey(string $tanggal, int $tokoId): string

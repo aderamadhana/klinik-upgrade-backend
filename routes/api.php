@@ -312,6 +312,12 @@ Route::middleware('auth:api')->group(function () {
 
         Route::get('/settlement-elite-glowbal', [AccurateSettlementController::class, 'eliteGlowbalIndex']);
         Route::post('/settlement-elite-glowbal/upload', [AccurateSettlementController::class, 'eliteGlowbalUpload']);
+
+        Route::get('/settlement-owner', [AccurateSettlementController::class, 'ownerIndex']);
+        Route::post('/settlement-owner/upload', [AccurateSettlementController::class, 'ownerUpload']);
+
+        Route::get('/settlement-deposit', [AccurateSettlementController::class, 'depositIndex']);
+        Route::post('/settlement-deposit/upload', [AccurateSettlementController::class, 'depositUpload']);
     });
 
 
