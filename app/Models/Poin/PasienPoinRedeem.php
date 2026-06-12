@@ -2,12 +2,19 @@
 
 namespace App\Models\Poin;
 
+use App\Models\Concerns\Auditable;
+use App\Models\Master\MasterToko;
 use App\Models\Pasien;
 use App\Models\PasienMember;
 use Illuminate\Database\Eloquent\Model;
 
 class PasienPoinRedeem extends Model
 {
+    use Auditable;
+
+    public const STATUS_POSTED = 'posted';
+    public const STATUS_VOID = 'void';
+
     protected $table = 'pasien_poin_redeem';
 
     protected $guarded = [];
@@ -39,19 +46,24 @@ class PasienPoinRedeem extends Model
         return $this->belongsTo(PasienMember::class, 'member_id');
     }
 
+    public function toko()
+    {
+        return $this->belongsTo(MasterToko::class, 'toko_id');
+    }
+
     public function ledger()
     {
         return $this->belongsTo(PasienPoinLedger::class, 'ledger_id');
     }
 
-    public function memberPointLedger()
-    {
-        return $this->belongsTo(MemberPointLedger::class, 'member_point_ledger_id');
-    }
-
     public function voidLedger()
     {
         return $this->belongsTo(PasienPoinLedger::class, 'void_ledger_id');
+    }
+
+    public function memberPointLedger()
+    {
+        return $this->belongsTo(MemberPointLedger::class, 'member_point_ledger_id');
     }
 
     public function details()
@@ -61,11 +73,11 @@ class PasienPoinRedeem extends Model
 
     public function scopePosted($query)
     {
-        return $query->where('status', 'posted');
+        return $query->where('status', self::STATUS_POSTED);
     }
 
     public function scopeVoid($query)
     {
-        return $query->where('status', 'void');
+        return $query->where('status', self::STATUS_VOID);
     }
 }
