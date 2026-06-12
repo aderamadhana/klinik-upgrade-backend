@@ -14,6 +14,7 @@ use Throwable;
 class AccurateSettlementService
 {
     private const JENIS_TRANSAKSI_UMUM = 0;
+    private const JENIS_TRANSAKSI_ELITE_GLOWBAL = 2;
 
     public function __construct(private readonly AccurateSalesInvoiceClient $client)
     {
@@ -21,21 +22,80 @@ class AccurateSettlementService
 
     public function listUmum(array $filters = []): array
     {
+        return $this->listByJenisTransaksi(
+            $filters,
+            self::JENIS_TRANSAKSI_UMUM
+        );
+    }
+
+    public function listEliteGlowbal(array $filters = []): array
+    {
+        return $this->listByJenisTransaksi(
+            $filters,
+            self::JENIS_TRANSAKSI_ELITE_GLOWBAL
+        );
+    }
+
+    public function uploadUmum(
+        string $tanggalFaktur,
+        int $tokoId,
+        ?object $user = null
+    ): array {
+        return $this->uploadByJenisTransaksi(
+            $tanggalFaktur,
+            $tokoId,
+            self::JENIS_TRANSAKSI_UMUM,
+            $user
+        );
+    }
+
+    public function uploadEliteGlowbal(
+        string $tanggalFaktur,
+        int $tokoId,
+        ?object $user = null
+    ): array {
+        return $this->uploadByJenisTransaksi(
+            $tanggalFaktur,
+            $tokoId,
+            self::JENIS_TRANSAKSI_ELITE_GLOWBAL,
+            $user
+        );
+    }
+
+    private function listByJenisTransaksi(array $filters, int $jenisTransaksi): array
+    {
         [$startDate, $endDate] = $this->resolveRange($filters);
+
         $tokoId = $this->nullableInt($filters['toko_id'] ?? null);
         $search = trim((string) ($filters['search'] ?? ''));
         $page = max(1, (int) ($filters['page'] ?? 1));
         $perPage = max(1, min(100, (int) ($filters['per_page'] ?? 10)));
 
-        $systemRows = $this->systemRows($startDate, $endDate, $tokoId);
-        $logs = $this->logs($startDate, $endDate, $tokoId);
+        $systemRows = $this->systemRows(
+            $startDate,
+            $endDate,
+            $tokoId,
+            $jenisTransaksi
+        );
 
-        $rows = $this->mergeRows($systemRows, $logs)
-            ->sortByDesc(fn (array $row) => $row['tanggal_faktur'] . '-' . str_pad((string) $row['toko_id'], 8, '0', STR_PAD_LEFT))
+        $logs = $this->logs(
+            $startDate,
+            $endDate,
+            $tokoId,
+            $jenisTransaksi
+        );
+
+        $rows = $this->mergeRows($systemRows, $logs, $jenisTransaksi)
+            ->sortByDesc(
+                fn (array $row) =>
+                    $row['tanggal_faktur'] . '-' .
+                    str_pad((string) $row['toko_id'], 8, '0', STR_PAD_LEFT)
+            )
             ->values();
 
         if ($search !== '') {
             $needle = mb_strtolower($search);
+
             $rows = $rows->filter(function (array $row) use ($needle): bool {
                 return str_contains(mb_strtolower((string) $row['tanggal_faktur']), $needle)
                     || str_contains(mb_strtolower((string) $row['faktur']), $needle)
@@ -63,36 +123,61 @@ class AccurateSettlementService
             'summary' => [
                 'total_system' => round((float) $rows->sum('total_system'), 2),
                 'total_amount' => round((float) $rows->sum('total_amount'), 2),
-                'success_count' => $rows->where('status_code', AccurateSettlementLog::STATUS_SUCCESS)->count(),
-                'pending_count' => $rows->where('status_code', AccurateSettlementLog::STATUS_NO_DATA)->count(),
-                'failed_count' => $rows->where('status_code', AccurateSettlementLog::STATUS_FAILED)->count(),
+                'success_count' => $rows
+                    ->where('status_code', AccurateSettlementLog::STATUS_SUCCESS)
+                    ->count(),
+                'pending_count' => $rows
+                    ->where('status_code', AccurateSettlementLog::STATUS_NO_DATA)
+                    ->count(),
+                'failed_count' => $rows
+                    ->where('status_code', AccurateSettlementLog::STATUS_FAILED)
+                    ->count(),
             ],
             'filters' => [
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'toko_id' => $tokoId,
+                'jenis_transaksi' => $jenisTransaksi,
             ],
         ];
     }
 
-    public function uploadUmum(string $tanggalFaktur, int $tokoId, ?object $user = null): array
-    {
+    private function uploadByJenisTransaksi(
+        string $tanggalFaktur,
+        int $tokoId,
+        int $jenisTransaksi,
+        ?object $user = null
+    ): array {
         $tanggalFaktur = Carbon::parse($tanggalFaktur)->toDateString();
         $userName = $this->userName($user);
+        $jenisLabel = $this->jenisTransaksiLabel($jenisTransaksi);
 
-        $data = $this->buildUploadData($tanggalFaktur, $tokoId, self::JENIS_TRANSAKSI_UMUM);
+        $data = $this->buildUploadData(
+            $tanggalFaktur,
+            $tokoId,
+            $jenisTransaksi
+        );
 
-        $log = DB::transaction(function () use ($tanggalFaktur, $tokoId, $userName, $data) {
+        $log = DB::transaction(function () use (
+            $tanggalFaktur,
+            $tokoId,
+            $jenisTransaksi,
+            $jenisLabel,
+            $userName,
+            $data
+        ) {
             $log = AccurateSettlementLog::findOrCreateDailyLog(
                 $tokoId,
                 $tanggalFaktur,
-                self::JENIS_TRANSAKSI_UMUM,
+                $jenisTransaksi,
                 $data['deskripsi_data'],
                 $userName
             );
 
             if ($log->isSuccess()) {
-                throw new RuntimeException('Faktur umum tanggal ini sudah berhasil diupload ke Accurate.');
+                throw new RuntimeException(
+                    "Faktur {$jenisLabel} tanggal ini sudah berhasil diupload ke Accurate."
+                );
             }
 
             $log->forceFill([
@@ -100,14 +185,24 @@ class AccurateSettlementService
                 'updated_by' => $userName,
             ])->save();
 
-            $log->markProcessing($data['payload'], $data['total_system'], $data['total_amount'], $userName);
+            $log->markProcessing(
+                $data['payload'],
+                $data['total_system'],
+                $data['total_amount'],
+                $userName
+            );
 
             return $log;
         });
 
         try {
             $response = $this->client->uploadSalesInvoice($data['payload']);
-            $log->markSuccess($response['number'], $response['payload'], $userName);
+
+            $log->markSuccess(
+                $response['number'] ?? null,
+                $response['payload'] ?? $response,
+                $userName
+            );
         } catch (Throwable $exception) {
             $log->markFailed($exception->getMessage());
             throw $exception;
@@ -118,34 +213,53 @@ class AccurateSettlementService
 
     private function resolveRange(array $filters): array
     {
+        $minimumDate = Carbon::today()->subDays(7)->toDateString();
+
         $start = $filters['start_date'] ?? null;
         $end = $filters['end_date'] ?? null;
         $date = $filters['date'] ?? null;
 
         if ($date && ! $start && ! $end) {
+            $start = Carbon::parse($date)->toDateString();
             $end = Carbon::parse($date)->toDateString();
-            $start = Carbon::parse($date)->subDays(31)->toDateString();
         }
 
-        $endDate = $end ? Carbon::parse($end)->toDateString() : Carbon::today()->toDateString();
-        $startDate = $start ? Carbon::parse($start)->toDateString() : Carbon::parse($endDate)->subDays(31)->toDateString();
+        $endDate = $end
+            ? Carbon::parse($end)->toDateString()
+            : Carbon::today()->toDateString();
+
+        $startDate = $start
+            ? Carbon::parse($start)->toDateString()
+            : $minimumDate;
 
         if ($startDate > $endDate) {
             [$startDate, $endDate] = [$endDate, $startDate];
         }
 
+        if ($startDate < $minimumDate) {
+            $startDate = $minimumDate;
+        }
+
+        if ($endDate < $minimumDate) {
+            $endDate = $minimumDate;
+        }
+
         return [$startDate, $endDate];
     }
 
-    private function systemRows(string $startDate, string $endDate, ?int $tokoId): Collection
-    {
+    private function systemRows(
+        string $startDate,
+        string $endDate,
+        ?int $tokoId,
+        int $jenisTransaksi
+    ): Collection {
         $dateExpression = 'DATE(COALESCE(pi.tanggal_lunas, pi.tanggal_invoice))';
 
         return DB::table('pembayaran_invoice as pi')
             ->join('master_toko as mt', 'mt.id', '=', 'pi.toko_id')
             ->where('pi.status', PembayaranInvoice::STATUS_LUNAS)
             ->where('pi.is_delete', 0)
-            ->where('pi.jenis_transaksi', self::JENIS_TRANSAKSI_UMUM)
+            ->where('pi.jenis_transaksi', $jenisTransaksi)
             ->whereBetween(DB::raw($dateExpression), [$startDate, $endDate])
             ->when($tokoId, fn ($query) => $query->where('pi.toko_id', $tokoId))
             ->selectRaw("{$dateExpression} as tanggal_faktur")
@@ -157,26 +271,46 @@ class AccurateSettlementService
             ->keyBy(fn ($row) => $this->rowKey($row->tanggal_faktur, (int) $row->toko_id));
     }
 
-    private function logs(string $startDate, string $endDate, ?int $tokoId): Collection
-    {
+    private function logs(
+        string $startDate,
+        string $endDate,
+        ?int $tokoId,
+        int $jenisTransaksi
+    ): Collection {
         return AccurateSettlementLog::query()
-            ->umum()
+            ->where('jenis_transaksi', $jenisTransaksi)
             ->betweenTanggal($startDate, $endDate)
             ->when($tokoId, fn ($query) => $query->where('toko_id', $tokoId))
             ->get()
-            ->keyBy(fn (AccurateSettlementLog $log) => $this->rowKey($log->tanggal_faktur->toDateString(), (int) $log->toko_id));
+            ->keyBy(
+                fn (AccurateSettlementLog $log) =>
+                    $this->rowKey(
+                        $log->tanggal_faktur->toDateString(),
+                        (int) $log->toko_id
+                    )
+            );
     }
 
-    private function mergeRows(Collection $systemRows, Collection $logs): Collection
-    {
+    private function mergeRows(
+        Collection $systemRows,
+        Collection $logs,
+        int $jenisTransaksi
+    ): Collection {
         $keys = $systemRows->keys()->merge($logs->keys())->unique();
 
-        return $keys->map(function (string $key) use ($systemRows, $logs): array {
+        return $keys->map(function (string $key) use (
+            $systemRows,
+            $logs,
+            $jenisTransaksi
+        ): array {
             $system = $systemRows->get($key);
+
             /** @var AccurateSettlementLog|null $log */
             $log = $logs->get($key);
 
-            $tanggal = $system?->tanggal_faktur ?: $log?->tanggal_faktur?->toDateString();
+            $tanggal = $system?->tanggal_faktur
+                ?: $log?->tanggal_faktur?->toDateString();
+
             $tokoId = (int) ($system?->toko_id ?: $log?->toko_id);
             $toko = $this->toko($tokoId);
 
@@ -185,7 +319,7 @@ class AccurateSettlementService
             }
 
             $totalSystem = round((float) ($system?->total_system ?? 0), 2);
-            $description = $this->description($tanggal, $toko);
+            $description = $this->description($tanggal, $toko, $jenisTransaksi);
 
             return [
                 'id' => null,
@@ -209,9 +343,13 @@ class AccurateSettlementService
         });
     }
 
-    private function buildUploadData(string $tanggalFaktur, int $tokoId, int $jenisTransaksi): array
-    {
+    private function buildUploadData(
+        string $tanggalFaktur,
+        int $tokoId,
+        int $jenisTransaksi
+    ): array {
         $dateExpression = 'DATE(COALESCE(tanggal_lunas, tanggal_invoice))';
+        $jenisLabel = $this->jenisTransaksiLabel($jenisTransaksi);
 
         $invoices = DB::table('pembayaran_invoice')
             ->where('status', PembayaranInvoice::STATUS_LUNAS)
@@ -222,17 +360,22 @@ class AccurateSettlementService
             ->get(['id', 'no_invoice', 'grand_total']);
 
         if ($invoices->isEmpty()) {
-            throw new RuntimeException('Tidak ada invoice umum lunas untuk tanggal dan cabang ini.');
+            throw new RuntimeException(
+                "Tidak ada invoice {$jenisLabel} lunas untuk tanggal dan cabang ini."
+            );
         }
 
         $toko = $this->toko($tokoId);
         $totalSystem = round((float) $invoices->sum('grand_total'), 2);
 
         if ($totalSystem <= 0) {
-            throw new RuntimeException('Total system 0. Faktur umum tidak perlu diupload ke Accurate.');
+            throw new RuntimeException(
+                "Total system 0. Faktur {$jenisLabel} tidak perlu diupload ke Accurate."
+            );
         }
 
         $invoiceIds = $invoices->pluck('id')->all();
+
         $lines = $this->accurateLines($invoiceIds);
         $totalAmount = round((float) array_sum(array_column($lines, 'unitPrice')), 2);
         $difference = round($totalSystem - $totalAmount, 2);
@@ -250,8 +393,8 @@ class AccurateSettlementService
             $totalAmount = round((float) array_sum(array_column($lines, 'unitPrice')), 2);
         }
 
-        $description = $this->description($tanggalFaktur, $toko);
-        $customerNo = (string) env('ACCURATE_UMUM_CUSTOMER_NO', 'UMUM');
+        $description = $this->description($tanggalFaktur, $toko, $jenisTransaksi);
+        $customerNo = $this->customerNo($jenisTransaksi);
         $branchName = (string) env('ACCURATE_BRANCH_NAME', $toko['nama_toko']);
 
         $payload = [
@@ -262,7 +405,8 @@ class AccurateSettlementService
             'detailItem' => $lines,
         ];
 
-        $salesmanNo = (string) env('ACCURATE_UMUM_SALESMAN_NO', '');
+        $salesmanNo = $this->salesmanNo($jenisTransaksi);
+
         if ($salesmanNo !== '') {
             $payload['salesmanNo'] = $salesmanNo;
         }
@@ -315,7 +459,9 @@ class AccurateSettlementService
             $itemName = $this->accurateItemName($item);
 
             if ($itemNo === '') {
-                throw new RuntimeException('Kode Accurate belum lengkap untuk item: ' . ($item->item_name ?: '-'));
+                throw new RuntimeException(
+                    'Kode Accurate belum lengkap untuk item: ' . ($item->item_name ?: '-')
+                );
             }
 
             $key = $itemNo . '|' . $itemName;
@@ -344,11 +490,13 @@ class AccurateSettlementService
     private function accurateItemNo(object $item): string
     {
         $snapshot = trim((string) ($item->kode_accurate_snapshot ?? ''));
+
         if ($snapshot !== '') {
             return $snapshot;
         }
 
         $source = trim((string) ($item->accurate_source_code ?? ''));
+
         if ($source !== '') {
             return $source;
         }
@@ -365,6 +513,7 @@ class AccurateSettlementService
     private function accurateItemName(object $item): string
     {
         $snapshot = trim((string) ($item->nama_accurate_snapshot ?? ''));
+
         if ($snapshot !== '') {
             return $snapshot;
         }
@@ -378,8 +527,11 @@ class AccurateSettlementService
         };
     }
 
-    private function serializeRowFromLog(AccurateSettlementLog $log, array $toko, ?object $system = null): array
-    {
+    private function serializeRowFromLog(
+        AccurateSettlementLog $log,
+        array $toko,
+        ?object $system = null
+    ): array {
         $tanggal = $log->tanggal_faktur->toDateString();
         $status = $this->statusMeta((int) $log->status, $log->error_message);
 
@@ -448,11 +600,51 @@ class AccurateSettlementService
         ];
     }
 
-    private function description(string $tanggal, array $toko): string
-    {
+    private function description(
+        string $tanggal,
+        array $toko,
+        int $jenisTransaksi = self::JENIS_TRANSAKSI_UMUM
+    ): string {
         $branch = strtoupper(trim((string) ($toko['nama_toko'] ?? 'CABANG')));
+        $date = Carbon::parse($tanggal)->format('d/m/Y');
 
-        return sprintf('TREATMENT & PRODUK %s %s', $branch, Carbon::parse($tanggal)->format('d/m/Y'));
+        if ($jenisTransaksi === self::JENIS_TRANSAKSI_ELITE_GLOWBAL) {
+            return sprintf('ELITE GLOWBAL TREATMENT & PRODUK %s %s', $branch, $date);
+        }
+
+        return sprintf('TREATMENT & PRODUK %s %s', $branch, $date);
+    }
+
+    private function jenisTransaksiLabel(int $jenisTransaksi): string
+    {
+        return match ($jenisTransaksi) {
+            self::JENIS_TRANSAKSI_ELITE_GLOWBAL => 'EliteGlowbal',
+            default => 'umum',
+        };
+    }
+
+    private function customerNo(int $jenisTransaksi): string
+    {
+        if ($jenisTransaksi === self::JENIS_TRANSAKSI_ELITE_GLOWBAL) {
+            return (string) env(
+                'ACCURATE_ELITE_GLOWBAL_CUSTOMER_NO',
+                env('ACCURATE_UMUM_CUSTOMER_NO', 'UMUM')
+            );
+        }
+
+        return (string) env('ACCURATE_UMUM_CUSTOMER_NO', 'UMUM');
+    }
+
+    private function salesmanNo(int $jenisTransaksi): string
+    {
+        if ($jenisTransaksi === self::JENIS_TRANSAKSI_ELITE_GLOWBAL) {
+            return (string) env(
+                'ACCURATE_ELITE_GLOWBAL_SALESMAN_NO',
+                env('ACCURATE_UMUM_SALESMAN_NO', '')
+            );
+        }
+
+        return (string) env('ACCURATE_UMUM_SALESMAN_NO', '');
     }
 
     private function rowKey(string $tanggal, int $tokoId): string

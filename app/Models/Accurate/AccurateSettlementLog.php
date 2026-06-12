@@ -2,47 +2,88 @@
 
 namespace App\Models\Accurate;
 
-use App\Models\Audit\Auditable;
+use App\Models\Concerns\Auditable;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Carbon;
-use Illuminate\Support\Facades\DB;
 
 class AccurateSettlementLog extends Model
 {
     use Auditable;
 
     public const STATUS_NO_DATA = 0;
-    public const STATUS_SUCCESS = 1;
-    public const STATUS_FAILED = 2;
-    public const STATUS_PROCESSING = 3;
+    public const STATUS_PROCESSING = 1;
+    public const STATUS_SUCCESS = 2;
+    public const STATUS_FAILED = 3;
 
     protected $table = 'accurate_settlement_log';
 
     protected $guarded = [];
 
+    public $timestamps = true;
+
+    protected $auditModuleName = 'Accurate';
+
     protected $casts = [
-        'tanggal_faktur' => 'date',
+        'toko_id' => 'integer',
         'jenis_transaksi' => 'integer',
+        'status' => 'integer',
         'total_system' => 'decimal:2',
         'total_amount' => 'decimal:2',
-        'status' => 'integer',
+        'retry_count' => 'integer',
+        'tanggal_faktur' => 'date',
+        'request_payload' => 'array',
+        'response_payload' => 'array',
         'uploaded_at' => 'datetime',
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
     ];
 
-    public function toko(): BelongsTo
-    {
-        return $this->belongsTo(\App\Models\master\MasterToko::class, 'toko_id');
-    }
-
-    public function scopeUmum($query)
+    public function scopeUmum(Builder $query): Builder
     {
         return $query->where('jenis_transaksi', 0);
     }
 
-    public function scopeBetweenTanggal($query, string $startDate, string $endDate)
-    {
+    public function scopeJenisTransaksi(
+        Builder $query,
+        int $jenisTransaksi
+    ): Builder {
+        return $query->where('jenis_transaksi', $jenisTransaksi);
+    }
+
+    public function scopeBetweenTanggal(
+        Builder $query,
+        string $startDate,
+        string $endDate
+    ): Builder {
         return $query->whereBetween('tanggal_faktur', [$startDate, $endDate]);
+    }
+
+    public static function findOrCreateDailyLog(
+        int $tokoId,
+        string $tanggalFaktur,
+        int $jenisTransaksi,
+        ?string $deskripsiData = null,
+        ?string $userName = null
+    ): self {
+        $tanggalFaktur = Carbon::parse($tanggalFaktur)->toDateString();
+
+        return self::firstOrCreate(
+            [
+                'toko_id' => $tokoId,
+                'tanggal_faktur' => $tanggalFaktur,
+                'jenis_transaksi' => $jenisTransaksi,
+            ],
+            [
+                'deskripsi_data' => $deskripsiData,
+                'total_system' => 0,
+                'total_amount' => 0,
+                'status' => self::STATUS_NO_DATA,
+                'uploaded_by' => $userName,
+                'created_by' => $userName,
+                'updated_by' => $userName,
+            ]
+        );
     }
 
     public function isSuccess(): bool
@@ -50,75 +91,46 @@ class AccurateSettlementLog extends Model
         return (int) $this->status === self::STATUS_SUCCESS;
     }
 
-    public function markProcessing(array $payload, float $totalSystem, float $totalAmount, ?string $userName = null): void
-    {
-        $this->forceFill([
-            'total_system' => $totalSystem,
-            'total_amount' => $totalAmount,
-            'status' => self::STATUS_PROCESSING,
-            'request_payload' => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+    public function markProcessing(
+        array $requestPayload,
+        float $totalSystem,
+        float $totalAmount,
+        ?string $userName = null
+    ): bool {
+        return $this->forceFill([
+            'request_payload' => $requestPayload,
             'response_payload' => null,
             'error_message' => null,
-            'uploaded_by' => $userName,
-            'uploaded_at' => null,
-        ])->save();
-    }
-
-    public function markSuccess(?string $fakturAccurate, array $responsePayload, ?string $userName = null): void
-    {
-        $this->forceFill([
-            'faktur_accurate' => $fakturAccurate ?: $this->faktur_accurate,
-            'status' => self::STATUS_SUCCESS,
-            'response_payload' => json_encode($responsePayload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
-            'error_message' => null,
+            'total_system' => round($totalSystem, 2),
+            'total_amount' => round($totalAmount, 2),
+            'status' => self::STATUS_PROCESSING,
             'uploaded_by' => $userName ?: $this->uploaded_by,
-            'uploaded_at' => Carbon::now(),
+            'updated_by' => $userName ?: $this->updated_by,
         ])->save();
     }
 
-    public function markFailed(string $message, array $responsePayload = []): void
-    {
-        $this->forceFill([
-            'status' => self::STATUS_FAILED,
-            'response_payload' => $responsePayload
-                ? json_encode($responsePayload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
-                : $this->response_payload,
-            'error_message' => $message,
-        ])->save();
-    }
-
-    public static function lockedDailyLog(int $tokoId, string $tanggalFaktur, int $jenisTransaksi = 0): ?self
-    {
-        return self::query()
-            ->where('toko_id', $tokoId)
-            ->whereDate('tanggal_faktur', $tanggalFaktur)
-            ->where('jenis_transaksi', $jenisTransaksi)
-            ->lockForUpdate()
-            ->first();
-    }
-
-    public static function findOrCreateDailyLog(
-        int $tokoId,
-        string $tanggalFaktur,
-        int $jenisTransaksi,
-        string $deskripsiData,
+    public function markSuccess(
+        ?string $fakturAccurate = null,
+        mixed $responsePayload = null,
         ?string $userName = null
-    ): self {
-        $log = self::lockedDailyLog($tokoId, $tanggalFaktur, $jenisTransaksi);
+    ): bool {
+        return $this->forceFill([
+            'faktur_accurate' => $fakturAccurate,
+            'response_payload' => $responsePayload,
+            'error_message' => null,
+            'status' => self::STATUS_SUCCESS,
+            'uploaded_by' => $userName ?: $this->uploaded_by,
+            'uploaded_at' => now(),
+            'updated_by' => $userName ?: $this->updated_by,
+        ])->save();
+    }
 
-        if ($log) {
-            return $log;
-        }
-
-        self::query()->create([
-            'toko_id' => $tokoId,
-            'tanggal_faktur' => $tanggalFaktur,
-            'jenis_transaksi' => $jenisTransaksi,
-            'deskripsi_data' => $deskripsiData,
-            'status' => self::STATUS_NO_DATA,
-            'created_by' => $userName,
-        ]);
-
-        return self::lockedDailyLog($tokoId, $tanggalFaktur, $jenisTransaksi);
+    public function markFailed(?string $errorMessage = null): bool
+    {
+        return $this->forceFill([
+            'status' => self::STATUS_FAILED,
+            'error_message' => $errorMessage,
+            'retry_count' => ((int) $this->retry_count) + 1,
+        ])->save();
     }
 }

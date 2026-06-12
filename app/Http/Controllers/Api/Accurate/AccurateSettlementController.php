@@ -11,27 +11,28 @@ use Throwable;
 
 class AccurateSettlementController extends Controller
 {
-    public function __construct(private readonly AccurateSettlementService $settlementService)
-    {
+    public function __construct(
+        private readonly AccurateSettlementService $settlementService
+    ) {
     }
 
     public function index(Request $request): JsonResponse
     {
-        $data = $this->settlementService->listUmum($request->only([
-            'date',
-            'start_date',
-            'end_date',
-            'toko_id',
-            'search',
-            'page',
-            'per_page',
-        ]));
+        try {
+            $data = $this->settlementService->listUmum($request->all());
 
-        return response()->json([
-            'status' => true,
-            'message' => 'Data settlement Accurate umum berhasil diambil.',
-            'data' => $data,
-        ]);
+            return response()->json([
+                'status' => true,
+                'message' => 'Data settlement Accurate umum berhasil diambil.',
+                'data' => $data,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Gagal mengambil data settlement Accurate umum.',
+                'error' => $exception->getMessage(),
+            ], 500);
+        }
     }
 
     public function upload(Request $request): JsonResponse
@@ -39,16 +40,12 @@ class AccurateSettlementController extends Controller
         $validator = Validator::make($request->all(), [
             'tanggal_faktur' => ['required', 'date'],
             'toko_id' => ['required', 'integer', 'exists:master_toko,id'],
-        ], [
-            'tanggal_faktur.required' => 'Tanggal faktur wajib diisi.',
-            'toko_id.required' => 'Cabang wajib diisi.',
-            'toko_id.exists' => 'Cabang tidak ditemukan.',
         ]);
 
         if ($validator->fails()) {
             return response()->json([
                 'status' => false,
-                'message' => 'Validasi upload faktur Accurate gagal.',
+                'message' => 'Validasi upload faktur umum gagal.',
                 'errors' => $validator->errors(),
             ], 422);
         }
@@ -68,9 +65,64 @@ class AccurateSettlementController extends Controller
         } catch (Throwable $exception) {
             return response()->json([
                 'status' => false,
-                'message' => 'Upload faktur umum Accurate gagal.',
+                'message' => 'Upload faktur umum ke Accurate gagal.',
                 'error' => $exception->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function eliteGlowbalIndex(Request $request): JsonResponse
+    {
+        try {
+            $data = $this->settlementService->listEliteGlowbal($request->all());
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Data settlement Accurate EliteGlowbal berhasil diambil.',
+                'data' => $data,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Gagal mengambil data settlement Accurate EliteGlowbal.',
+                'error' => $exception->getMessage(),
+            ], 500);
+        }
+    }
+
+    public function eliteGlowbalUpload(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'tanggal_faktur' => ['required', 'date'],
+            'toko_id' => ['required', 'integer', 'exists:master_toko,id'],
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Validasi upload faktur EliteGlowbal gagal.',
+                'errors' => $validator->errors(),
             ], 422);
+        }
+
+        try {
+            $row = $this->settlementService->uploadEliteGlowbal(
+                $request->input('tanggal_faktur'),
+                (int) $request->input('toko_id'),
+                $request->user()
+            );
+
+            return response()->json([
+                'status' => true,
+                'message' => 'Faktur EliteGlowbal berhasil diupload ke Accurate.',
+                'data' => $row,
+            ]);
+        } catch (Throwable $exception) {
+            return response()->json([
+                'status' => false,
+                'message' => 'Upload faktur EliteGlowbal ke Accurate gagal.',
+                'error' => $exception->getMessage(),
+            ], 500);
         }
     }
 }

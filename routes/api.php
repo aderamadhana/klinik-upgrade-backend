@@ -309,6 +309,9 @@ Route::middleware('auth:api')->group(function () {
     Route::prefix('accurate')->group(function () {
         Route::get('/settlement-umum', [AccurateSettlementController::class, 'index']);
         Route::post('/settlement-umum/upload', [AccurateSettlementController::class, 'upload']);
+
+        Route::get('/settlement-elite-glowbal', [AccurateSettlementController::class, 'eliteGlowbalIndex']);
+        Route::post('/settlement-elite-glowbal/upload', [AccurateSettlementController::class, 'eliteGlowbalUpload']);
     });
 
 
