@@ -109,16 +109,10 @@ class AntrianPerawatCpptController extends Controller
             $username = $this->username();
             $now = now();
 
-            if ((int) $task->status === RegistrasiTask::STATUS_MENUNGGU) {
-                $task->update([
-                    'status' => RegistrasiTask::STATUS_PROSES,
-                    'started_at' => $task->started_at ?: $now,
-                    'updated_by' => $username,
-                    'updated_at' => $now,
-                ]);
-            }
-
-            if ((int) $task->status !== RegistrasiTask::STATUS_PROSES) {
+            if (in_array((int) $task->status, [
+                RegistrasiTask::STATUS_SELESAI,
+                RegistrasiTask::STATUS_BATAL,
+            ], true)) {
                 throw ValidationException::withMessages([
                     'registrasi' => ['CPPT tidak dapat diubah karena task perawat sudah selesai atau dibatalkan.'],
                 ]);
@@ -246,8 +240,6 @@ class AntrianPerawatCpptController extends Controller
                 $this->buildPivotSync($assessmentIds, $now)
             );
 
-            $this->syncNurseTaskProgress($registrasi, $task, $now, $username);
-
             return $cppt;
         });
 
@@ -308,77 +300,6 @@ class AntrianPerawatCpptController extends Controller
         return $normalized !== '' ? $normalized : null;
     }
 
-
-    private function syncNurseTaskProgress(
-        RegistrasiKunjungan $registrasi,
-        RegistrasiTask $task,
-        $now,
-        string $username
-    ): void {
-        $cpptDone = $this->hasFinalCppt($registrasi->id);
-        $beforeAfterDone = $this->hasCompleteBeforeAfter($registrasi->id, $task->id);
-        $bahanDone = $this->hasBahanTreatment($registrasi->id, $task->id);
-
-        if ($cpptDone && $beforeAfterDone && $bahanDone) {
-            $task->update([
-                'status' => RegistrasiTask::STATUS_SELESAI,
-                'finished_at' => $task->finished_at ?: $now,
-                'updated_by' => $username,
-                'updated_at' => $now,
-            ]);
-
-            $registrasi->update([
-                'current_task' => RegistrasiKunjungan::TASK_DRAFT,
-                'status' => RegistrasiKunjungan::STATUS_SELESAI,
-                'updated_by' => $username,
-                'updated_at' => $now,
-            ]);
-        }
-    }
-
-    private function hasFinalCppt(int $registrasiId): bool
-    {
-        return DB::table('registrasi_perawat_cppt')
-            ->where('registrasi_id', $registrasiId)
-            ->where(function ($query) {
-                $query->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->where('status', RegistrasiPerawatCppt::STATUS_FINAL)
-            ->exists();
-    }
-
-    private function hasCompleteBeforeAfter(int $registrasiId, int $taskId): bool
-    {
-        $photos = DB::table('registrasi_perawat_before_after_foto')
-            ->select('tipe_foto', 'urutan')
-            ->where('registrasi_id', $registrasiId)
-            ->where('task_id', $taskId)
-            ->where(function ($query) {
-                $query->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->whereNotNull('file_path')
-            ->whereIn('tipe_foto', ['before', 'after'])
-            ->whereBetween('urutan', [1, 3])
-            ->get();
-
-        return $photos->where('tipe_foto', 'before')->pluck('urutan')->unique()->count() >= 3
-            && $photos->where('tipe_foto', 'after')->pluck('urutan')->unique()->count() >= 3;
-    }
-
-    private function hasBahanTreatment(int $registrasiId, int $taskId): bool
-    {
-        return DB::table('registrasi_perawat_bahan_treatment_detail')
-            ->where('registrasi_id', $registrasiId)
-            ->where('task_id', $taskId)
-            ->where(function ($query) {
-                $query->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->where(function ($query) {
-                $query->where('status', 1)
-                    ->orWhere('jumlah_terpakai', '>', 0);
-            })
-            ->exists();
-    }
 
     private function username(): string
     {

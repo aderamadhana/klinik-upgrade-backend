@@ -99,15 +99,6 @@ class AntrianPerawatBeforeAfterController extends Controller
             $username = $this->authenticatedUsername();
             $now = now();
 
-            if ((int) $lockedTask->status === RegistrasiTask::STATUS_MENUNGGU) {
-                $lockedTask->update([
-                    'status' => RegistrasiTask::STATUS_PROSES,
-                    'started_at' => $lockedTask->started_at ?: $now,
-                    'updated_by' => $username,
-                    'updated_at' => $now,
-                ]);
-            }
-
             $this->validateEditableState($lockedRegistrasi, $lockedTask);
 
             $existingPhotos = RegistrasiPerawatBeforeAfterFoto::query()
@@ -199,7 +190,6 @@ class AntrianPerawatBeforeAfterController extends Controller
             }
 
             $this->assertCompletePhotoSet($lockedRegistrasi->id, $lockedTask->id);
-            $this->syncNurseTaskProgress($lockedRegistrasi, $lockedTask, $now, $username);
 
             DB::commit();
 
@@ -317,18 +307,6 @@ class AntrianPerawatBeforeAfterController extends Controller
                 'task' => 'Task tindakan perawat sudah dibatalkan.',
             ]);
         }
-
-        if ((int) $task->status !== RegistrasiTask::STATUS_PROSES) {
-            throw ValidationException::withMessages([
-                'task' => 'Status task tindakan perawat tidak valid untuk proses upload.',
-            ]);
-        }
-
-        if ((int) $registrasi->current_task !== RegistrasiTask::TYPE_TINDAKAN_PERAWAT) {
-            throw ValidationException::withMessages([
-                'registrasi' => 'Registrasi tidak sedang berada pada tahap tindakan perawat.',
-            ]);
-        }
     }
 
     private function validateCompleteSubmission(Request $request, $existingPhotos): void
@@ -389,81 +367,6 @@ class AntrianPerawatBeforeAfterController extends Controller
     }
 
 
-    private function syncNurseTaskProgress(
-        RegistrasiKunjungan $registrasi,
-        RegistrasiTask $task,
-        $now,
-        string $username
-    ): void {
-        $cpptDone = $this->hasFinalCppt($registrasi->id, $task->id);
-        $beforeAfterDone = $this->hasCompleteBeforeAfter($registrasi->id, $task->id);
-        $bahanDone = $this->hasBahanTreatment($registrasi->id, $task->id);
-
-        if ($cpptDone && $beforeAfterDone && $bahanDone) {
-            $task->update([
-                'status' => RegistrasiTask::STATUS_SELESAI,
-                'finished_at' => $task->finished_at ?: $now,
-                'updated_by' => $username,
-                'updated_at' => $now,
-            ]);
-
-            $registrasi->update([
-                'current_task' => RegistrasiKunjungan::TASK_DRAFT,
-                'status' => RegistrasiKunjungan::STATUS_SELESAI,
-                'updated_by' => $username,
-                'updated_at' => $now,
-            ]);
-        }
-    }
-
-    private function hasFinalCppt(int $registrasiId, int $taskId): bool
-    {
-        return DB::table('registrasi_perawat_cppt')
-            ->where('registrasi_id', $registrasiId)
-            ->where('task_id', $taskId)
-            ->where(function ($query) {
-                $query->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->where('status', 1)
-            ->exists();
-    }
-
-    private function hasCompleteBeforeAfter(int $registrasiId, int $taskId): bool
-    {
-        $photos = DB::table('registrasi_perawat_before_after_foto')
-            ->select('tipe_foto', 'urutan')
-            ->where('registrasi_id', $registrasiId)
-            ->where('task_id', $taskId)
-            ->where(function ($query) {
-                $query->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->whereNotNull('file_path')
-            ->whereIn('tipe_foto', [
-                RegistrasiPerawatBeforeAfterFoto::TIPE_BEFORE,
-                RegistrasiPerawatBeforeAfterFoto::TIPE_AFTER,
-            ])
-            ->whereBetween('urutan', [1, self::SLOT_COUNT])
-            ->get();
-
-        return $photos->where('tipe_foto', RegistrasiPerawatBeforeAfterFoto::TIPE_BEFORE)->pluck('urutan')->unique()->count() >= self::SLOT_COUNT
-            && $photos->where('tipe_foto', RegistrasiPerawatBeforeAfterFoto::TIPE_AFTER)->pluck('urutan')->unique()->count() >= self::SLOT_COUNT;
-    }
-
-    private function hasBahanTreatment(int $registrasiId, int $taskId): bool
-    {
-        return DB::table('registrasi_perawat_bahan_treatment_detail')
-            ->where('registrasi_id', $registrasiId)
-            ->where('task_id', $taskId)
-            ->where(function ($query) {
-                $query->whereNull('is_delete')->orWhere('is_delete', 0);
-            })
-            ->where(function ($query) {
-                $query->where('status', 1)
-                    ->orWhere('jumlah_terpakai', '>', 0);
-            })
-            ->exists();
-    }
-
     private function buildResponseData(
         RegistrasiKunjungan $registrasi,
         RegistrasiTask $task,
@@ -502,8 +405,10 @@ class AntrianPerawatBeforeAfterController extends Controller
             'registrasi_id' => (int) $registrasi->id,
             'task_id' => (int) $task->id,
             'task_status' => (int) $task->status,
-            'editable' => (int) $registrasi->current_task === RegistrasiTask::TYPE_TINDAKAN_PERAWAT
-                && (int) $task->status === RegistrasiTask::STATUS_PROSES,
+            'editable' => !in_array((int) $task->status, [
+                RegistrasiTask::STATUS_SELESAI,
+                RegistrasiTask::STATUS_BATAL,
+            ], true),
             'required_per_type' => self::SLOT_COUNT,
             'required_total' => self::SLOT_COUNT * 2,
             'uploaded_count' => count($before) + count($after),

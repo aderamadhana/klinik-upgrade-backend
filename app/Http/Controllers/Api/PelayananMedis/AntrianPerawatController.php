@@ -422,16 +422,219 @@ class AntrianPerawatController extends Controller
 
     private function applyStatusFilter($query, $status)
     {
-        $taskStatus = $this->mapQueueStatusToTaskStatus($status);
+        $status = strtolower(trim((string) $status));
 
-        if ($taskStatus === null) {
+        if ($status === '' || $status === 'all' || $status === 'semua') {
             return;
         }
 
-        $query->whereHas('tasks', function ($q) use ($taskStatus) {
+        if ($status === 'batal') {
+            $this->whereNurseTaskStatus($query, RegistrasiTask::STATUS_BATAL);
+            return;
+        }
+
+        if ($status === 'selesai') {
+            $query->where(function ($q) {
+                $this->whereNurseTaskStatus($q, RegistrasiTask::STATUS_SELESAI);
+
+                $q->orWhere(function ($completeQuery) {
+                    $this->whereAllNurseInputsDone($completeQuery);
+                });
+            });
+
+            return;
+        }
+
+        if (in_array($status, ['proses', 'diproses', 'dipanggil'], true)) {
+            $this->whereNurseTaskStatusNot($query, RegistrasiTask::STATUS_BATAL);
+            $this->whereNurseTaskStatusNot($query, RegistrasiTask::STATUS_SELESAI);
+            $this->whereNotAllNurseInputsDone($query);
+
+            $query->where(function ($q) {
+                $this->whereNurseTaskStatus($q, RegistrasiTask::STATUS_PROSES);
+
+                $q->orWhere(function ($inputQuery) {
+                    $this->whereAnyNurseInputDone($inputQuery);
+                });
+            });
+
+            return;
+        }
+
+        if ($status === 'menunggu') {
+            $this->whereNurseTaskStatusNot($query, RegistrasiTask::STATUS_BATAL);
+            $this->whereNurseTaskStatusNot($query, RegistrasiTask::STATUS_SELESAI);
+            $this->whereNurseTaskStatusNot($query, RegistrasiTask::STATUS_PROSES);
+            $this->whereNotAllNurseInputsDone($query);
+            $this->whereNoNurseInputDone($query);
+        }
+    }
+
+    private function whereNurseTaskStatus($query, int $status)
+    {
+        $query->whereHas('tasks', function ($q) use ($status) {
             $q->where('task_type', RegistrasiTask::TYPE_TINDAKAN_PERAWAT)
-                ->where('status', $taskStatus);
+                ->where('status', $status)
+                ->where(function ($deleteQuery) {
+                    $deleteQuery->whereNull('is_delete')
+                        ->orWhere('is_delete', 0);
+                });
         });
+    }
+
+    private function whereNurseTaskStatusNot($query, int $status)
+    {
+        $query->whereHas('tasks', function ($q) use ($status) {
+            $q->where('task_type', RegistrasiTask::TYPE_TINDAKAN_PERAWAT)
+                ->where('status', '!=', $status)
+                ->where(function ($deleteQuery) {
+                    $deleteQuery->whereNull('is_delete')
+                        ->orWhere('is_delete', 0);
+                });
+        });
+    }
+
+    private function whereCpptDone($query)
+    {
+        $query->whereHas('perawatCppts', function ($q) {
+            $q->where(function ($deleteQuery) {
+                $deleteQuery->whereNull('is_delete')
+                    ->orWhere('is_delete', 0);
+            })->where(function ($statusQuery) {
+                $statusQuery->whereNull('status')
+                    ->orWhere('status', 1);
+            });
+        });
+    }
+
+    private function whereCpptNotDone($query)
+    {
+        $query->whereDoesntHave('perawatCppts', function ($q) {
+            $q->where(function ($deleteQuery) {
+                $deleteQuery->whereNull('is_delete')
+                    ->orWhere('is_delete', 0);
+            })->where(function ($statusQuery) {
+                $statusQuery->whereNull('status')
+                    ->orWhere('status', 1);
+            });
+        });
+    }
+
+    private function whereBeforeAfterDone($query)
+    {
+        $query
+            ->whereHas('beforeAfterFotos', function ($q) {
+                $q->where(function ($deleteQuery) {
+                    $deleteQuery->whereNull('is_delete')
+                        ->orWhere('is_delete', 0);
+                })
+                    ->where('tipe_foto', 'before')
+                    ->whereNotNull('file_path')
+                    ->where('file_path', '!=', '');
+            }, '>=', 3)
+            ->whereHas('beforeAfterFotos', function ($q) {
+                $q->where(function ($deleteQuery) {
+                    $deleteQuery->whereNull('is_delete')
+                        ->orWhere('is_delete', 0);
+                })
+                    ->where('tipe_foto', 'after')
+                    ->whereNotNull('file_path')
+                    ->where('file_path', '!=', '');
+            }, '>=', 3);
+    }
+
+    private function whereBeforeAfterNotDone($query)
+    {
+        $query->where(function ($q) {
+            $q->whereHas('beforeAfterFotos', function ($photoQuery) {
+                $photoQuery->where(function ($deleteQuery) {
+                    $deleteQuery->whereNull('is_delete')
+                        ->orWhere('is_delete', 0);
+                })
+                    ->where('tipe_foto', 'before')
+                    ->whereNotNull('file_path')
+                    ->where('file_path', '!=', '');
+            }, '<', 3)
+                ->orWhereHas('beforeAfterFotos', function ($photoQuery) {
+                    $photoQuery->where(function ($deleteQuery) {
+                        $deleteQuery->whereNull('is_delete')
+                            ->orWhere('is_delete', 0);
+                    })
+                        ->where('tipe_foto', 'after')
+                        ->whereNotNull('file_path')
+                        ->where('file_path', '!=', '');
+                }, '<', 3);
+        });
+    }
+
+    private function whereBahanTreatmentDone($query)
+    {
+        $query->whereHas('bahanTreatmentDetails', function ($q) {
+            $q->where(function ($deleteQuery) {
+                $deleteQuery->whereNull('is_delete')
+                    ->orWhere('is_delete', 0);
+            })->where(function ($filledQuery) {
+                $filledQuery->where('jumlah_terpakai', '>', 0)
+                    ->orWhere('status', 1);
+            });
+        });
+    }
+
+    private function whereBahanTreatmentNotDone($query)
+    {
+        $query->whereDoesntHave('bahanTreatmentDetails', function ($q) {
+            $q->where(function ($deleteQuery) {
+                $deleteQuery->whereNull('is_delete')
+                    ->orWhere('is_delete', 0);
+            })->where(function ($filledQuery) {
+                $filledQuery->where('jumlah_terpakai', '>', 0)
+                    ->orWhere('status', 1);
+            });
+        });
+    }
+
+    private function whereAllNurseInputsDone($query)
+    {
+        $this->whereCpptDone($query);
+        $this->whereBeforeAfterDone($query);
+        $this->whereBahanTreatmentDone($query);
+    }
+
+    private function whereNotAllNurseInputsDone($query)
+    {
+        $query->where(function ($q) {
+            $this->whereCpptNotDone($q);
+
+            $q->orWhere(function ($photoQuery) {
+                $this->whereBeforeAfterNotDone($photoQuery);
+            });
+
+            $q->orWhere(function ($bahanQuery) {
+                $this->whereBahanTreatmentNotDone($bahanQuery);
+            });
+        });
+    }
+
+    private function whereAnyNurseInputDone($query)
+    {
+        $query->where(function ($q) {
+            $this->whereCpptDone($q);
+
+            $q->orWhere(function ($photoQuery) {
+                $this->whereBeforeAfterDone($photoQuery);
+            });
+
+            $q->orWhere(function ($bahanQuery) {
+                $this->whereBahanTreatmentDone($bahanQuery);
+            });
+        });
+    }
+
+    private function whereNoNurseInputDone($query)
+    {
+        $this->whereCpptNotDone($query);
+        $this->whereBeforeAfterNotDone($query);
+        $this->whereBahanTreatmentNotDone($query);
     }
 
     private function buildSummary($query)
