@@ -77,15 +77,22 @@ class AntrianPerawatBahanTreatmentController extends Controller
             $this->assertCanOpen($registrasi);
 
             $task = $this->getNurseTask($registrasi, true);
+
             if (!$task) {
                 throw ValidationException::withMessages([
                     'registrasi' => ['Task tindakan perawat tidak ditemukan.'],
                 ]);
             }
 
+            $username = $this->username();
+            $now = now();
+
             if ((int) $task->status === RegistrasiTask::STATUS_MENUNGGU) {
-                throw ValidationException::withMessages([
-                    'registrasi' => ['Mulai antrian perawat terlebih dahulu sebelum mengisi bahan treatment.'],
+                $task->update([
+                    'status' => RegistrasiTask::STATUS_PROSES,
+                    'started_at' => $task->started_at ?: $now,
+                    'updated_by' => $username,
+                    'updated_at' => $now,
                 ]);
             }
 
@@ -96,14 +103,12 @@ class AntrianPerawatBahanTreatmentController extends Controller
             }
 
             $templates = $this->getValidTemplateMap($registrasi);
+
             if ($templates->isEmpty()) {
                 throw ValidationException::withMessages([
                     'items' => ['Template bahan treatment belum tersedia untuk treatment pada registrasi ini.'],
                 ]);
             }
-
-            $username = $this->username();
-            $now = now();
 
             foreach ($inputItems as $item) {
                 $key = $this->templateKey(
@@ -182,6 +187,8 @@ class AntrianPerawatBahanTreatmentController extends Controller
                 }
             }
 
+            $this->syncNurseTaskProgress($registrasi, $task, $now, $username);
+
             $registrasi = $this->getRegistrasi($registrasi->id);
             $task = $this->getNurseTask($registrasi);
 
@@ -236,6 +243,7 @@ class AntrianPerawatBahanTreatmentController extends Controller
         }
 
         $task = $this->getNurseTask($registrasi);
+
         if (!$task) {
             throw ValidationException::withMessages([
                 'registrasi' => ['Task tindakan perawat tidak ditemukan.'],
@@ -243,6 +251,7 @@ class AntrianPerawatBahanTreatmentController extends Controller
         }
 
         $paymentTask = $this->getPaymentTask($registrasi);
+
         if (!$paymentTask || (int) $paymentTask->status !== RegistrasiTask::STATUS_SELESAI) {
             throw ValidationException::withMessages([
                 'registrasi' => ['Bahan treatment hanya dapat diisi setelah pembayaran selesai.'],
@@ -355,6 +364,7 @@ class AntrianPerawatBahanTreatmentController extends Controller
             'summary' => [
                 'registrasi_id' => (int) $registrasi->id,
                 'task_id' => $task?->id,
+                'task_status' => $task?->status,
                 'kode_registrasi' => $registrasi->kode_registrasi,
                 'pasien' => $registrasi->pasien?->nama ?? '-',
                 'no_rm' => $registrasi->pasien?->no_rm ?? '-',
@@ -371,6 +381,78 @@ class AntrianPerawatBahanTreatmentController extends Controller
             ],
             'treatments' => $treatments,
         ];
+    }
+
+    private function syncNurseTaskProgress(
+        RegistrasiKunjungan $registrasi,
+        RegistrasiTask $task,
+        $now,
+        string $username
+    ): void {
+        $cpptDone = $this->hasFinalCppt($registrasi->id, $task->id);
+        $beforeAfterDone = $this->hasCompleteBeforeAfter($registrasi->id, $task->id);
+        $bahanDone = $this->hasBahanTreatment($registrasi->id, $task->id);
+
+        if ($cpptDone && $beforeAfterDone && $bahanDone) {
+            $task->update([
+                'status' => RegistrasiTask::STATUS_SELESAI,
+                'finished_at' => $task->finished_at ?: $now,
+                'updated_by' => $username,
+                'updated_at' => $now,
+            ]);
+
+            $registrasi->update([
+                'current_task' => RegistrasiKunjungan::TASK_DRAFT,
+                'status' => RegistrasiKunjungan::STATUS_SELESAI,
+                'updated_by' => $username,
+                'updated_at' => $now,
+            ]);
+        }
+    }
+
+    private function hasFinalCppt(int $registrasiId, int $taskId): bool
+    {
+        return DB::table('registrasi_perawat_cppt')
+            ->where('registrasi_id', $registrasiId)
+            ->where('task_id', $taskId)
+            ->where(function ($query) {
+                $query->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where('status', 1)
+            ->exists();
+    }
+
+    private function hasCompleteBeforeAfter(int $registrasiId, int $taskId): bool
+    {
+        $photos = DB::table('registrasi_perawat_before_after_foto')
+            ->select('tipe_foto', 'urutan')
+            ->where('registrasi_id', $registrasiId)
+            ->where('task_id', $taskId)
+            ->where(function ($query) {
+                $query->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->whereNotNull('file_path')
+            ->whereIn('tipe_foto', ['before', 'after'])
+            ->whereBetween('urutan', [1, 3])
+            ->get();
+
+        return $photos->where('tipe_foto', 'before')->pluck('urutan')->unique()->count() >= 3
+            && $photos->where('tipe_foto', 'after')->pluck('urutan')->unique()->count() >= 3;
+    }
+
+    private function hasBahanTreatment(int $registrasiId, int $taskId): bool
+    {
+        return DB::table('registrasi_perawat_bahan_treatment_detail')
+            ->where('registrasi_id', $registrasiId)
+            ->where('task_id', $taskId)
+            ->where(function ($query) {
+                $query->whereNull('is_delete')->orWhere('is_delete', 0);
+            })
+            ->where(function ($query) {
+                $query->where('status', RegistrasiPerawatBahanTreatmentDetail::STATUS_SUDAH_DIISI)
+                    ->orWhere('jumlah_terpakai', '>', 0);
+            })
+            ->exists();
     }
 
     private function getValidTemplateMap(RegistrasiKunjungan $registrasi)

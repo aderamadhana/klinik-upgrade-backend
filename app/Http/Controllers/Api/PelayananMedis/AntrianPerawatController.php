@@ -30,12 +30,21 @@ class AntrianPerawatController extends Controller
                 'bahanTreatmentDetails',
             ])
             ->active()
-            ->where('status', RegistrasiKunjungan::STATUS_AKTIF)
-            ->where('current_task', RegistrasiTask::TYPE_TINDAKAN_PERAWAT)
             ->where('is_treatment', 1)
             ->whereHas('tasks', function ($q) {
+                $q->where('task_type', RegistrasiTask::TYPE_TINDAKAN_PERAWAT)
+                    ->where(function ($query) {
+                        $query->whereNull('is_delete')
+                            ->orWhere('is_delete', 0);
+                    });
+            })
+            ->whereHas('tasks', function ($q) {
                 $q->where('task_type', RegistrasiTask::TYPE_PEMBAYARAN)
-                    ->where('status', RegistrasiTask::STATUS_SELESAI);
+                    ->where('status', RegistrasiTask::STATUS_SELESAI)
+                    ->where(function ($query) {
+                        $query->whereNull('is_delete')
+                            ->orWhere('is_delete', 0);
+                    });
             });
 
         if ($request->filled('toko_id')) {
@@ -443,8 +452,9 @@ class AntrianPerawatController extends Controller
         return [
             'total' => $mapped->count(),
             'menunggu' => $mapped->where('status_antrian_perawat', 'menunggu')->count(),
-            'diproses' => $mapped->where('status_antrian_perawat', 'proses')->count(),
+            'diproses' => $mapped->whereIn('status_antrian_perawat', ['dipanggil', 'proses'])->count(),
             'selesai' => $mapped->where('status_antrian_perawat', 'selesai')->count(),
+            'batal' => $mapped->whereIn('status_antrian_perawat', ['batal', 'dilewati'])->count(),
         ];
     }
 
@@ -516,21 +526,30 @@ class AntrianPerawatController extends Controller
         $row->setAttribute('before_after', $beforeAfter);
         $row->setAttribute('bahan_treatment', $bahanTreatment);
 
-        $row->setAttribute('status_task', $task?->status);
-        $row->setAttribute('status_antrian_perawat', $this->getQueueStatus($task, $cppt, $beforeAfter, $bahanTreatment));
+        $queueStatus = $this->getQueueStatus($task, $cppt, $beforeAfter, $bahanTreatment);
 
-        $row->setAttribute('can_delete_antrian', $task && (int) $task->status === RegistrasiTask::STATUS_MENUNGGU && !$cppt && !$beforeAfter && !$bahanTreatment);
+        $row->setAttribute('status_task', $task?->status);
+        $row->setAttribute('task_status', $task?->status);
+        $row->setAttribute('task_started_at', $task?->started_at);
+        $row->setAttribute('task_finished_at', $task?->finished_at);
+        $row->setAttribute('status_antrian_perawat', $queueStatus);
+
+        $row->setAttribute('can_delete_antrian', $queueStatus === 'menunggu' && !$cppt && !$beforeAfter && !$bahanTreatment);
         $row->setAttribute('can_process_antrian', $task && in_array((int) $task->status, [
             RegistrasiTask::STATUS_MENUNGGU,
             RegistrasiTask::STATUS_PROSES,
-        ], true));
+        ], true) && $queueStatus !== 'selesai');
 
         return $row;
     }
 
     private function getQueueStatus($task, bool $cppt, bool $beforeAfter, bool $bahanTreatment)
     {
-        if ($task && (int) $task->status === RegistrasiTask::STATUS_SELESAI) {
+        if ($task && (int) $task->status === RegistrasiTask::STATUS_BATAL) {
+            return 'batal';
+        }
+
+        if (($task && (int) $task->status === RegistrasiTask::STATUS_SELESAI) || ($cppt && $beforeAfter && $bahanTreatment)) {
             return 'selesai';
         }
 
@@ -574,7 +593,12 @@ class AntrianPerawatController extends Controller
             return false;
         }
 
-        return $this->hasActiveCollection($row->perawatCppts);
+        return $row->perawatCppts
+            ->filter(function ($item) {
+                return (!isset($item->is_delete) || (int) $item->is_delete === 0)
+                    && (!isset($item->status) || (int) $item->status === 1);
+            })
+            ->count() > 0;
     }
 
     private function hasBeforeAfter(RegistrasiKunjungan $row)
@@ -583,7 +607,25 @@ class AntrianPerawatController extends Controller
             return false;
         }
 
-        return $this->hasActiveCollection($row->beforeAfterFotos);
+        $photos = $row->beforeAfterFotos
+            ->filter(function ($item) {
+                return (!isset($item->is_delete) || (int) $item->is_delete === 0)
+                    && !empty($item->file_path);
+            });
+
+        $beforeCount = $photos
+            ->where('tipe_foto', 'before')
+            ->pluck('urutan')
+            ->unique()
+            ->count();
+
+        $afterCount = $photos
+            ->where('tipe_foto', 'after')
+            ->pluck('urutan')
+            ->unique()
+            ->count();
+
+        return $beforeCount >= 3 && $afterCount >= 3;
     }
 
     private function hasBahanTreatment(RegistrasiKunjungan $row)
@@ -592,18 +634,13 @@ class AntrianPerawatController extends Controller
             return false;
         }
 
-        return $this->hasActiveCollection($row->bahanTreatmentDetails);
-    }
-
-    private function hasActiveCollection($collection)
-    {
-        if (!$collection) {
-            return false;
-        }
-
-        return $collection
+        return $row->bahanTreatmentDetails
             ->filter(function ($item) {
-                return !isset($item->is_delete) || (int) $item->is_delete === 0;
+                $isActive = !isset($item->is_delete) || (int) $item->is_delete === 0;
+                $isFilled = ((float) ($item->jumlah_terpakai ?? 0)) > 0
+                    || (isset($item->status) && (int) $item->status === 1);
+
+                return $isActive && $isFilled;
             })
             ->count() > 0;
     }
