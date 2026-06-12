@@ -318,6 +318,12 @@ Route::middleware('auth:api')->group(function () {
 
         Route::get('/settlement-deposit', [AccurateSettlementController::class, 'depositIndex']);
         Route::post('/settlement-deposit/upload', [AccurateSettlementController::class, 'depositUpload']);
+
+        Route::get('/settlement-deposit-realization', [AccurateSettlementController::class, 'depositRealizationIndex']);
+        Route::post('/settlement-deposit-realization/upload', [AccurateSettlementController::class, 'depositRealizationUpload']);
+
+        Route::get('/settlement-sto', [AccurateSettlementController::class, 'stoIndex']);
+        Route::post('/settlement-sto/upload', [AccurateSettlementController::class, 'stoUpload']);
     });
 
 
