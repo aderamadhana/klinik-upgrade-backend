@@ -3,14 +3,21 @@
 namespace App\Http\Controllers\Api\Laporan;
 
 use App\Http\Controllers\Controller;
+use App\Services\Laporan\LaporanInsentifDokterExportService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
-use Symfony\Component\HttpFoundation\Response;
 
 class LaporanInsentifDokterController extends Controller
 {
+    private const PPN_RATE = 11;
+
+    public function __construct(
+        private readonly LaporanInsentifDokterExportService $exportService
+    ) {
+    }
+
     public function dokter(Request $request)
     {
         $search = trim((string) $request->query('search', ''));
@@ -83,7 +90,6 @@ class LaporanInsentifDokterController extends Controller
         $filters = $filters['data'];
         $treatmentRows = $this->getRows('treatment', 'summary', $filters);
         $produkRows = $this->getRows('produk', 'summary', $filters);
-
         $treatment = $this->makeSummaryAggregate($treatmentRows);
         $produk = $this->makeSummaryAggregate($produkRows);
 
@@ -138,25 +144,34 @@ class LaporanInsentifDokterController extends Controller
 
         $filters = $filters['data'];
         $rows = $this->getRows($kategori, $jenis, $filters);
-        $columns = $this->columns($kategori, $jenis);
-        $title = $this->title($kategori, $jenis);
+        $publicFilters = $this->publicFilters($filters);
         $filename = $this->filename($kategori, $jenis, $format, $filters);
+        $title = $this->title($kategori, $jenis);
+        $totalInsentif = (float) $rows->sum(function ($row) {
+            return $row['total_insentif'] ?? $row['nilai_insentif'] ?? 0;
+        });
 
-        $html = $this->buildHtml($title, $columns, $rows, $filters, $format === 'pdf');
+        $payload = [
+            'title' => $title,
+            'kategori' => $kategori,
+            'jenis' => $jenis,
+            'rows' => $rows,
+            'filters' => $publicFilters,
+            'period' => Carbon::parse($filters['tanggal_awal'])->format('d/m/Y')
+                . ' s/d '
+                . Carbon::parse($filters['tanggal_akhir'])->format('d/m/Y'),
+            'clinicName' => $publicFilters['toko_nama']
+                ? 'MS GLOW AESTHETIC ' . strtoupper($publicFilters['toko_nama'])
+                : 'MS GLOW AESTHETIC',
+            'totalInsentif' => $totalInsentif,
+            'ppnRate' => self::PPN_RATE,
+        ];
 
         if ($format === 'excel') {
-            return response($html, 200, [
-                'Content-Type' => 'application/vnd.ms-excel; charset=UTF-8',
-                'Content-Disposition' => 'attachment; filename="' . $filename . '"',
-                'Cache-Control' => 'max-age=0, no-cache, no-store, must-revalidate',
-                'Pragma' => 'no-cache',
-            ]);
+            return $this->exportService->excel($payload, $filename);
         }
 
-        return response($html, 200, [
-            'Content-Type' => 'text/html; charset=UTF-8',
-            'Content-Disposition' => 'inline; filename="' . $filename . '"',
-        ]);
+        return $this->exportService->pdf($payload, $filename);
     }
 
     private function normalizeFilters(Request $request): array
@@ -190,11 +205,15 @@ class LaporanInsentifDokterController extends Controller
 
     private function publicFilters(array $filters): array
     {
-        $doctor = DB::table('master_karyawan')->where('id', $filters['dokter_id'])->first(['id', 'nama']);
-        $toko = null;
+        $doctor = DB::table('master_karyawan')
+            ->where('id', $filters['dokter_id'])
+            ->first(['id', 'nama', 'is_dokter_spesialis']);
 
+        $toko = null;
         if (! empty($filters['toko_id'])) {
-            $toko = DB::table('master_toko')->where('id', $filters['toko_id'])->first(['id', 'nama_toko']);
+            $toko = DB::table('master_toko')
+                ->where('id', $filters['toko_id'])
+                ->first(['id', 'nama_toko']);
         }
 
         return [
@@ -202,6 +221,7 @@ class LaporanInsentifDokterController extends Controller
             'tanggal_akhir' => $filters['tanggal_akhir'],
             'dokter_id' => (int) $filters['dokter_id'],
             'dokter_nama' => $doctor->nama ?? '-',
+            'is_dokter_spesialis' => (int) ($doctor->is_dokter_spesialis ?? 0),
             'toko_id' => $filters['toko_id'],
             'toko_nama' => $toko->nama_toko ?? null,
         ];
@@ -233,7 +253,9 @@ class LaporanInsentifDokterController extends Controller
                     $row['dokter_id'] ?? 0,
                     $row['item_id'] ?? 0,
                     $row['nama_item'] ?? '-',
-                    $row['dasar_insentif'] ?? '-',
+                    $row['skema_insentif'] ?? 'flat',
+                    $row['insentif_persen'] ?? 0,
+                    $row['insentif_rupiah'] ?? 0,
                 ]);
             })
             ->map(function ($items) {
@@ -243,7 +265,14 @@ class LaporanInsentifDokterController extends Controller
                     'dokter_nama' => $first['dokter_nama'] ?? '-',
                     'nama_item' => $first['nama_item'] ?? '-',
                     'total_qty' => (float) $items->sum('qty'),
-                    'total_omzet' => (float) $items->sum('nilai_net'),
+                    'harga_awal' => (float) $items->sum('harga_awal'),
+                    'setelah_diskon' => (float) $items->sum('setelah_diskon'),
+                    'ppn_11' => (float) $items->sum('ppn_11'),
+                    'dasar_fee' => (float) $items->sum('dasar_fee'),
+                    'insentif_persen' => (float) ($first['insentif_persen'] ?? 0),
+                    'insentif_rupiah' => (float) ($first['insentif_rupiah'] ?? 0),
+                    'skema_insentif' => $first['skema_insentif'] ?? 'flat',
+                    'total_omzet' => (float) $items->sum('setelah_diskon'),
                     'dasar_insentif' => $first['dasar_insentif'] ?? '-',
                     'total_insentif' => (float) $items->sum('nilai_insentif'),
                 ];
@@ -254,19 +283,8 @@ class LaporanInsentifDokterController extends Controller
 
     private function getTreatmentDetailRows(array $filters)
     {
-        $netSql = 'COALESCE(NULLIF(pii.subtotal_after_diskon_subtotal, 0), NULLIF(pii.subtotal, 0), (pii.qty * pii.harga))';
-        $incentiveSql = "
-            CASE
-                WHEN COALESCE(kd.is_dokter_spesialis, 0) = 1
-                    AND LOWER(COALESCE(mtt.insentif_use_sp, '')) IN ('percent', 'persen', 'percentage')
-                    THEN ({$netSql}) * COALESCE(mtt.presentase_tarif_dokter_sp, 0) / 100
-                WHEN COALESCE(kd.is_dokter_spesialis, 0) = 1
-                    THEN COALESCE(NULLIF(mtt.flat_tarif_dokter_sp, 0), NULLIF(mtt.tarif_dokter, 0), 0) * pii.qty
-                WHEN LOWER(COALESCE(mtt.insentif_use, '')) IN ('percent', 'persen', 'percentage')
-                    THEN ({$netSql}) * COALESCE(mtt.presentase_tarif_dokter, 0) / 100
-                ELSE COALESCE(NULLIF(mtt.flat_tarif_dokter, 0), NULLIF(mtt.tarif_dokter, 0), 0) * pii.qty
-            END
-        ";
+        $netSql = $this->netItemSql();
+        $jenisTransaksiSql = $this->jenisTransaksiSql();
 
         return $this->baseItemQuery($filters)
             ->where('pii.item_type', 2)
@@ -281,10 +299,12 @@ class LaporanInsentifDokterController extends Controller
                 COALESCE(pii.dokter_id, pi.dokter_id) as dokter_id,
                 kd.nama as dokter_nama,
                 COALESCE(kd.is_dokter_spesialis, 0) as is_dokter_spesialis,
+                {$jenisTransaksiSql} as jenis_transaksi,
                 pii.treatment_id as item_id,
                 pii.nama_item,
                 pii.qty,
                 pii.harga,
+                (pii.qty * pii.harga) as harga_awal,
                 {$netSql} as nilai_net,
                 mtt.insentif_use,
                 mtt.insentif_use_sp,
@@ -292,23 +312,41 @@ class LaporanInsentifDokterController extends Controller
                 mtt.presentase_tarif_dokter_sp,
                 mtt.flat_tarif_dokter,
                 mtt.flat_tarif_dokter_sp,
-                mtt.tarif_dokter,
-                {$incentiveSql} as nilai_insentif
+                mtt.tarif_dokter
             ")
             ->orderBy('tanggal')
             ->orderBy('pi.no_invoice')
             ->get()
             ->map(function ($row) {
                 $isSp = (int) ($row->is_dokter_spesialis ?? 0) === 1;
-                $mode = $this->normalizeInsentifMode($isSp ? $row->insentif_use_sp : $row->insentif_use);
+                $configuredMode = $this->normalizeInsentifMode(
+                    $isSp ? $row->insentif_use_sp : $row->insentif_use
+                );
+                $jenisTransaksi = (int) ($row->jenis_transaksi ?? 0);
+                $isRegularPercentage = $jenisTransaksi === 0 && $configuredMode === 'percent';
+
                 $rate = $isSp
                     ? (float) ($row->presentase_tarif_dokter_sp ?? 0)
                     : (float) ($row->presentase_tarif_dokter ?? 0);
+
                 $flat = $isSp
                     ? (float) ($row->flat_tarif_dokter_sp ?? 0)
                     : (float) ($row->flat_tarif_dokter ?? 0);
+
                 $fallbackFlat = (float) ($row->tarif_dokter ?? 0);
                 $flat = $flat > 0 ? $flat : $fallbackFlat;
+
+                $qty = (float) $row->qty;
+                $setelahDiskon = max((float) $row->nilai_net, 0);
+                $ppn = $isRegularPercentage
+                    ? $this->extractInclusiveTax($setelahDiskon, self::PPN_RATE)
+                    : 0.0;
+                $dasarFee = $isRegularPercentage
+                    ? max($setelahDiskon - $ppn, 0)
+                    : 0.0;
+                $nilaiInsentif = $isRegularPercentage
+                    ? $dasarFee * $rate / 100
+                    : $flat * $qty;
 
                 return [
                     'tanggal' => $row->tanggal,
@@ -318,15 +356,24 @@ class LaporanInsentifDokterController extends Controller
                     'pasien_nama' => $row->pasien_nama,
                     'dokter_id' => (int) $row->dokter_id,
                     'dokter_nama' => $row->dokter_nama,
+                    'jenis_transaksi' => $jenisTransaksi,
+                    'jenis_transaksi_label' => $this->jenisTransaksiLabel($jenisTransaksi),
                     'item_id' => $row->item_id,
                     'nama_item' => $row->nama_item,
-                    'qty' => (float) $row->qty,
+                    'qty' => $qty,
                     'harga' => (float) $row->harga,
-                    'nilai_net' => (float) $row->nilai_net,
-                    'dasar_insentif' => $mode === 'percent'
-                        ? $this->number($rate) . '% dari omzet net'
+                    'harga_awal' => (float) $row->harga_awal,
+                    'nilai_net' => $setelahDiskon,
+                    'setelah_diskon' => $setelahDiskon,
+                    'ppn_11' => $ppn,
+                    'dasar_fee' => $dasarFee,
+                    'insentif_persen' => $isRegularPercentage ? $rate : 0.0,
+                    'insentif_rupiah' => $isRegularPercentage ? 0.0 : $flat,
+                    'skema_insentif' => $isRegularPercentage ? 'percent' : 'flat',
+                    'dasar_insentif' => $isRegularPercentage
+                        ? $this->number($rate) . '% dari dasar fee'
                         : 'Flat Rp ' . $this->money($flat) . ' x qty',
-                    'nilai_insentif' => (float) $row->nilai_insentif,
+                    'nilai_insentif' => $nilaiInsentif,
                 ];
             })
             ->values();
@@ -334,8 +381,8 @@ class LaporanInsentifDokterController extends Controller
 
     private function getProdukDetailRows(array $filters)
     {
-        $netSql = 'COALESCE(NULLIF(pii.subtotal_after_diskon_subtotal, 0), NULLIF(pii.subtotal, 0), (pii.qty * pii.harga))';
-        $incentiveSql = 'COALESCE(mpt.fee_dokter, 0) * pii.qty';
+        $netSql = $this->netItemSql();
+        $jenisTransaksiSql = $this->jenisTransaksiSql();
 
         return $this->baseItemQuery($filters)
             ->where('pii.item_type', 3)
@@ -353,18 +400,24 @@ class LaporanInsentifDokterController extends Controller
                 ps.nama as pasien_nama,
                 COALESCE(pii.dokter_id, pi.dokter_id) as dokter_id,
                 kd.nama as dokter_nama,
+                {$jenisTransaksiSql} as jenis_transaksi,
                 pii.produk_id as item_id,
                 pii.nama_item,
                 pii.qty,
                 pii.harga,
+                (pii.qty * pii.harga) as harga_awal,
                 {$netSql} as nilai_net,
-                COALESCE(mpt.fee_dokter, 0) as fee_dokter,
-                {$incentiveSql} as nilai_insentif
+                COALESCE(mpt.fee_dokter, 0) as fee_dokter
             ")
             ->orderBy('tanggal')
             ->orderBy('pi.no_invoice')
             ->get()
             ->map(function ($row) {
+                $qty = (float) $row->qty;
+                $feeDokter = (float) ($row->fee_dokter ?? 0);
+                $setelahDiskon = max((float) $row->nilai_net, 0);
+                $jenisTransaksi = (int) ($row->jenis_transaksi ?? 0);
+
                 return [
                     'tanggal' => $row->tanggal,
                     'no_invoice' => $row->no_invoice,
@@ -373,13 +426,22 @@ class LaporanInsentifDokterController extends Controller
                     'pasien_nama' => $row->pasien_nama,
                     'dokter_id' => (int) $row->dokter_id,
                     'dokter_nama' => $row->dokter_nama,
+                    'jenis_transaksi' => $jenisTransaksi,
+                    'jenis_transaksi_label' => $this->jenisTransaksiLabel($jenisTransaksi),
                     'item_id' => $row->item_id,
                     'nama_item' => $row->nama_item,
-                    'qty' => (float) $row->qty,
+                    'qty' => $qty,
                     'harga' => (float) $row->harga,
-                    'nilai_net' => (float) $row->nilai_net,
-                    'dasar_insentif' => 'Fee dokter Rp ' . $this->money((float) $row->fee_dokter) . ' x qty',
-                    'nilai_insentif' => (float) $row->nilai_insentif,
+                    'harga_awal' => (float) $row->harga_awal,
+                    'nilai_net' => $setelahDiskon,
+                    'setelah_diskon' => $setelahDiskon,
+                    'ppn_11' => 0.0,
+                    'dasar_fee' => 0.0,
+                    'insentif_persen' => 0.0,
+                    'insentif_rupiah' => $feeDokter,
+                    'skema_insentif' => 'flat',
+                    'dasar_insentif' => 'Fee dokter Rp ' . $this->money($feeDokter) . ' x qty',
+                    'nilai_insentif' => $feeDokter * $qty,
                 ];
             })
             ->values();
@@ -411,6 +473,40 @@ class LaporanInsentifDokterController extends Controller
         return $query;
     }
 
+    private function netItemSql(): string
+    {
+        return "
+            CASE
+                WHEN COALESCE(pii.subtotal_before_diskon_subtotal, 0) <> 0
+                    OR COALESCE(pii.diskon_subtotal_amount, 0) <> 0
+                THEN GREATEST(
+                    COALESCE(pii.subtotal_before_diskon_subtotal, 0)
+                    - COALESCE(pii.diskon_subtotal_amount, 0),
+                    0
+                )
+                WHEN COALESCE(pii.subtotal, 0) <> 0
+                THEN GREATEST(pii.subtotal, 0)
+                ELSE GREATEST(
+                    (pii.qty * pii.harga)
+                    - COALESCE(pii.diskon_amount, 0)
+                    - COALESCE(pii.diskon_referral, 0),
+                    0
+                )
+            END
+        ";
+    }
+
+    private function jenisTransaksiSql(): string
+    {
+        return "
+            CASE
+                WHEN COALESCE(pii.jenis_transaksi, 0) <> 0
+                THEN pii.jenis_transaksi
+                ELSE COALESCE(pi.jenis_transaksi, 0)
+            END
+        ";
+    }
+
     private function normalizeInsentifMode($mode): string
     {
         $mode = strtolower(trim((string) $mode));
@@ -418,46 +514,36 @@ class LaporanInsentifDokterController extends Controller
         return in_array($mode, ['percent', 'persen', 'percentage'], true) ? 'percent' : 'flat';
     }
 
-    private function columns(string $kategori, string $jenis): array
+    private function extractInclusiveTax(float $amount, float $rate): float
     {
-        if ($jenis === 'summary') {
-            return [
-                ['key' => 'dokter_nama', 'label' => 'Dokter'],
-                ['key' => 'nama_item', 'label' => $kategori === 'treatment' ? 'Treatment' : 'Produk'],
-                ['key' => 'total_qty', 'label' => 'Total Qty', 'type' => 'number'],
-                ['key' => 'total_omzet', 'label' => 'Total Omzet Net', 'type' => 'currency'],
-                ['key' => 'dasar_insentif', 'label' => 'Dasar Insentif'],
-                ['key' => 'total_insentif', 'label' => 'Total Insentif', 'type' => 'currency'],
-            ];
+        if ($amount <= 0 || $rate <= 0) {
+            return 0.0;
         }
 
-        return [
-            ['key' => 'tanggal', 'label' => 'Tanggal'],
-            ['key' => 'no_invoice', 'label' => 'No Invoice'],
-            ['key' => 'toko_nama', 'label' => 'Cabang'],
-            ['key' => 'no_rm', 'label' => 'No RM'],
-            ['key' => 'pasien_nama', 'label' => 'Pasien'],
-            ['key' => 'dokter_nama', 'label' => 'Dokter'],
-            ['key' => 'nama_item', 'label' => $kategori === 'treatment' ? 'Treatment' : 'Produk'],
-            ['key' => 'qty', 'label' => 'Qty', 'type' => 'number'],
-            ['key' => 'harga', 'label' => 'Harga', 'type' => 'currency'],
-            ['key' => 'nilai_net', 'label' => 'Subtotal Net', 'type' => 'currency'],
-            ['key' => 'dasar_insentif', 'label' => 'Dasar Insentif'],
-            ['key' => 'nilai_insentif', 'label' => 'Insentif', 'type' => 'currency'],
-        ];
+        return $amount * $rate / (100 + $rate);
+    }
+
+    private function jenisTransaksiLabel(int $jenisTransaksi): string
+    {
+        return match ($jenisTransaksi) {
+            1 => 'Endorse / Fasilitas Karyawan',
+            2 => 'EliteGlowbal',
+            3 => 'Owner',
+            4 => 'Deposit',
+            default => 'Umum',
+        };
     }
 
     private function title(string $kategori, string $jenis): string
     {
-        $prefix = $jenis === 'detail' ? '[DETAIL] ' : '';
         $item = $kategori === 'treatment' ? 'TREATMENT' : 'PRODUK';
 
-        return $prefix . 'LAPORAN INSENTIF ' . $item;
+        return 'LAPORAN INSENTIF ' . $item . ' (' . strtoupper($jenis) . ')';
     }
 
     private function filename(string $kategori, string $jenis, string $format, array $filters): string
     {
-        $extension = $format === 'excel' ? 'xls' : 'html';
+        $extension = $format === 'excel' ? 'xlsx' : 'pdf';
 
         return implode('-', [
             'laporan',
@@ -468,86 +554,6 @@ class LaporanInsentifDokterController extends Controller
             Carbon::parse($filters['tanggal_awal'])->format('Ymd'),
             Carbon::parse($filters['tanggal_akhir'])->format('Ymd'),
         ]) . '.' . $extension;
-    }
-
-    private function buildHtml(string $title, array $columns, $rows, array $filters, bool $printable): string
-    {
-        $publicFilters = $this->publicFilters($filters);
-        $period = Carbon::parse($filters['tanggal_awal'])->format('d/m/Y')
-            . ' - '
-            . Carbon::parse($filters['tanggal_akhir'])->format('d/m/Y');
-        $totalInsentif = (float) $rows->sum(function ($row) {
-            return $row['total_insentif'] ?? $row['nilai_insentif'] ?? 0;
-        });
-
-        $thead = collect($columns)->map(function ($column) {
-            return '<th>' . e($column['label']) . '</th>';
-        })->implode('');
-
-        $tbody = $rows->map(function ($row) use ($columns) {
-            $cells = collect($columns)->map(function ($column) use ($row) {
-                $type = $column['type'] ?? 'text';
-                $value = $row[$column['key']] ?? null;
-                $class = in_array($type, ['number', 'currency'], true) ? ' class="num"' : '';
-
-                return '<td' . $class . '>' . e($this->formatValue($value, $type)) . '</td>';
-            })->implode('');
-
-            return '<tr>' . $cells . '</tr>';
-        })->implode('');
-
-        if ($tbody === '') {
-            $tbody = '<tr><td colspan="' . count($columns) . '" class="empty">Tidak ada data pada filter ini.</td></tr>';
-        }
-
-        $autoPrint = $printable ? '<script>window.addEventListener("load", function () { window.print(); });</script>' : '';
-
-        return '<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>' . e($title) . '</title>
-<style>
-    body { font-family: Arial, Helvetica, sans-serif; color: #111827; font-size: 12px; margin: 24px; }
-    h1 { font-size: 18px; margin: 0 0 10px; }
-    .meta { margin-bottom: 16px; color: #374151; line-height: 1.7; }
-    .summary { margin: 12px 0 16px; font-size: 13px; font-weight: 700; }
-    table { width: 100%; border-collapse: collapse; }
-    th { background: #f3f4f6; border: 1px solid #d1d5db; padding: 7px; text-align: left; }
-    td { border: 1px solid #d1d5db; padding: 7px; vertical-align: top; }
-    .num { text-align: right; white-space: nowrap; }
-    .empty { text-align: center; color: #6b7280; padding: 20px; }
-    @media print { body { margin: 12mm; } }
-</style>
-</head>
-<body>
-<h1>' . e($title) . '</h1>
-<div class="meta">
-    Periode: <strong>' . e($period) . '</strong><br>
-    Dokter: <strong>' . e($publicFilters['dokter_nama']) . '</strong><br>
-    Cabang: <strong>' . e($publicFilters['toko_nama'] ?: 'Semua cabang / sesuai akses') . '</strong>
-</div>
-<div class="summary">Total Insentif: Rp ' . e($this->money($totalInsentif)) . '</div>
-<table>
-<thead><tr>' . $thead . '</tr></thead>
-<tbody>' . $tbody . '</tbody>
-</table>
-' . $autoPrint . '
-</body>
-</html>';
-    }
-
-    private function formatValue($value, string $type): string
-    {
-        if ($type === 'currency') {
-            return 'Rp ' . $this->money((float) $value);
-        }
-
-        if ($type === 'number') {
-            return $this->number((float) $value);
-        }
-
-        return (string) ($value ?? '-');
     }
 
     private function money(float $value): string

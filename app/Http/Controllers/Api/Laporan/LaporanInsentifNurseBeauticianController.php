@@ -3,6 +3,7 @@
 namespace App\Http\Controllers\Api\Laporan;
 
 use App\Http\Controllers\Controller;
+use App\Services\Laporan\LaporanInsentifNurseBeauticianExportService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -10,6 +11,11 @@ use Illuminate\Support\Facades\Validator;
 
 class LaporanInsentifNurseBeauticianController extends Controller
 {
+    public function __construct(
+        private readonly LaporanInsentifNurseBeauticianExportService $exportService
+    ) {
+    }
+
     public function staff(Request $request)
     {
         $search = trim((string) $request->query('search', ''));
@@ -127,24 +133,31 @@ class LaporanInsentifNurseBeauticianController extends Controller
 
         $filters = $filters['data'];
         $rows = $this->getRows($jenis, $filters);
-        $columns = $this->columns($jenis);
-        $title = $this->title($jenis);
+        $publicFilters = $this->publicFilters($filters);
         $filename = $this->filename($jenis, $format, $filters);
-        $html = $this->buildHtml($title, $columns, $rows, $filters, $format === 'pdf');
+        $totalInsentif = (float) $rows->sum(function ($row) {
+            return $row['total_insentif'] ?? $row['nilai_insentif'] ?? 0;
+        });
+
+        $payload = [
+            'title' => $this->title($jenis),
+            'jenis' => $jenis,
+            'rows' => $rows,
+            'filters' => $publicFilters,
+            'period' => Carbon::parse($filters['tanggal_awal'])->format('d/m/Y')
+                . ' s/d '
+                . Carbon::parse($filters['tanggal_akhir'])->format('d/m/Y'),
+            'clinicName' => $publicFilters['toko_nama']
+                ? 'MS GLOW AESTHETIC ' . strtoupper($publicFilters['toko_nama'])
+                : 'MS GLOW AESTHETIC',
+            'totalInsentif' => $totalInsentif,
+        ];
 
         if ($format === 'excel') {
-            return response($html, 200, [
-                'Content-Type' => 'application/vnd.ms-excel; charset=UTF-8',
-                'Content-Disposition' => 'attachment; filename="' . $filename . '"',
-                'Cache-Control' => 'max-age=0, no-cache, no-store, must-revalidate',
-                'Pragma' => 'no-cache',
-            ]);
+            return $this->exportService->excel($payload, $filename);
         }
 
-        return response($html, 200, [
-            'Content-Type' => 'text/html; charset=UTF-8',
-            'Content-Disposition' => 'inline; filename="' . $filename . '"',
-        ]);
+        return $this->exportService->pdf($payload, $filename);
     }
 
     private function normalizeFilters(Request $request): array
@@ -152,12 +165,16 @@ class LaporanInsentifNurseBeauticianController extends Controller
         $today = now()->toDateString();
         $tokoId = $request->query('toko_id', $request->header('X-Toko-Id'));
         $tokoId = is_numeric($tokoId) ? (int) $tokoId : null;
+
         $staffId = $request->query('staff_id', $request->query('perawat_id'));
         $staffId = is_numeric($staffId) ? (int) $staffId : null;
 
         $data = [
             'tanggal_awal' => $request->query('tanggal_awal', $today),
-            'tanggal_akhir' => $request->query('tanggal_akhir', $request->query('tanggal_awal', $today)),
+            'tanggal_akhir' => $request->query(
+                'tanggal_akhir',
+                $request->query('tanggal_awal', $today)
+            ),
             'staff_id' => $staffId,
             'toko_id' => $tokoId,
         ];
@@ -194,7 +211,9 @@ class LaporanInsentifNurseBeauticianController extends Controller
         }
 
         if (! empty($filters['toko_id'])) {
-            $toko = DB::table('master_toko')->where('id', $filters['toko_id'])->first(['id', 'nama_toko']);
+            $toko = DB::table('master_toko')
+                ->where('id', $filters['toko_id'])
+                ->first(['id', 'nama_toko']);
         }
 
         return [
@@ -229,81 +248,92 @@ class LaporanInsentifNurseBeauticianController extends Controller
         return $details
             ->groupBy(function ($row) {
                 return implode('|', [
-                    $row['staff_id'] ?? 0,
                     $row['item_id'] ?? 0,
                     $row['nama_item'] ?? '-',
-                    $row['tarif_beautician'] ?? 0,
+                    $row['insentif_rupiah'] ?? 0,
                 ]);
             })
             ->map(function ($items) {
                 $first = $items->first();
 
                 return [
-                    'staff_nama' => $first['staff_nama'] ?? '-',
-                    'staff_jabatan' => $first['staff_jabatan'] ?? '-',
                     'nama_item' => $first['nama_item'] ?? '-',
                     'total_qty' => (float) $items->sum('qty'),
-                    'total_omzet' => (float) $items->sum('nilai_net'),
-                    'dasar_insentif' => $first['dasar_insentif'] ?? '-',
+                    'harga_awal' => (float) $items->sum('harga_awal'),
+                    'insentif_rupiah' => (float) ($first['insentif_rupiah'] ?? 0),
+                    'total_omzet' => (float) $items->sum('setelah_diskon'),
                     'total_insentif' => (float) $items->sum('nilai_insentif'),
                 ];
             })
-            ->sortBy([
-                ['staff_nama', 'asc'],
-                ['nama_item', 'asc'],
-            ])
+            ->sortBy('nama_item')
             ->values();
     }
 
     private function getTreatmentDetailRows(array $filters)
     {
-        $netSql = 'COALESCE(NULLIF(pii.subtotal_after_diskon_subtotal, 0), NULLIF(pii.subtotal, 0), (pii.qty * pii.harga))';
-        $incentiveSql = 'COALESCE(mtt.tarif_beautician, 0) * pii.qty';
+        $effectiveDateSql = $this->effectiveDateSql();
+        $effectiveStaffIdSql = $this->effectiveStaffIdSql();
+        $effectiveTokoIdSql = $this->effectiveTokoIdSql();
+        $effectiveQtySql = $this->effectiveQtySql();
+        $effectiveGrossSql = $this->effectiveGrossSql();
+        $effectiveNetSql = $this->effectiveNetSql();
+        $jenisTransaksiSql = $this->jenisTransaksiSql();
+        $incentiveSql = "COALESCE(mtt.tarif_beautician, 0) * ({$effectiveQtySql})";
 
         return $this->baseTreatmentQuery($filters)
-            ->leftJoin('master_treatment_toko as mtt', 'mtt.id', '=', 'pii.treatment_toko_id')
             ->selectRaw("
-                DATE(COALESCE(pi.tanggal_lunas, pi.tanggal_invoice)) as tanggal,
+                {$effectiveDateSql} as tanggal,
                 pi.no_invoice,
-                pi.toko_id,
-                mt.nama_toko,
+                {$effectiveTokoIdSql} as toko_id,
+                COALESCE(mt_claim.nama_toko, mt_invoice.nama_toko) as toko_nama,
                 ps.no_rm,
                 ps.nama as pasien_nama,
-                pii.perawat_id as staff_id,
-                kp.nama as staff_nama,
-                jp.nama_jabatan as staff_jabatan,
+                {$effectiveStaffIdSql} as staff_id,
+                COALESCE(k_claim.nama, k_invoice.nama) as staff_nama,
+                COALESCE(j_claim.nama_jabatan, j_invoice.nama_jabatan) as staff_jabatan,
                 pii.treatment_id as item_id,
+                pii.treatment_toko_id,
                 pii.nama_item,
-                pii.qty,
-                pii.harga,
-                {$netSql} as nilai_net,
-                COALESCE(mtt.tarif_beautician, 0) as tarif_beautician,
-                {$incentiveSql} as nilai_insentif
+                {$jenisTransaksiSql} as jenis_transaksi,
+                {$effectiveQtySql} as qty,
+                {$effectiveGrossSql} as harga_awal,
+                {$effectiveNetSql} as setelah_diskon,
+                COALESCE(mtt.tarif_beautician, 0) as insentif_rupiah,
+                {$incentiveSql} as nilai_insentif,
+                CASE WHEN pdc.id IS NOT NULL THEN 1 ELSE 0 END as is_realisasi_deposit
             ")
-            ->orderBy('tanggal')
+            ->orderByRaw("{$effectiveDateSql} asc")
             ->orderBy('pi.no_invoice')
-            ->orderBy('kp.nama')
+            ->orderBy('pii.nama_item')
             ->get()
             ->map(function ($row) {
-                $tarif = (float) ($row->tarif_beautician ?? 0);
+                $jenisTransaksi = (int) ($row->jenis_transaksi ?? 0);
 
                 return [
-                    'tanggal' => $row->tanggal,
-                    'no_invoice' => $row->no_invoice,
-                    'toko_nama' => $row->nama_toko,
-                    'no_rm' => $row->no_rm,
-                    'pasien_nama' => $row->pasien_nama,
-                    'staff_id' => (int) $row->staff_id,
-                    'staff_nama' => $row->staff_nama,
-                    'staff_jabatan' => $row->staff_jabatan,
-                    'item_id' => $row->item_id,
-                    'nama_item' => $row->nama_item,
-                    'qty' => (float) $row->qty,
-                    'harga' => (float) $row->harga,
-                    'nilai_net' => (float) $row->nilai_net,
-                    'tarif_beautician' => $tarif,
-                    'dasar_insentif' => 'Fee Rp ' . $this->money($tarif) . ' x qty',
-                    'nilai_insentif' => (float) $row->nilai_insentif,
+                    'tanggal' => $row->tanggal
+                        ? Carbon::parse($row->tanggal)->format('d/m/Y')
+                        : '-',
+                    'no_invoice' => $row->no_invoice ?: '-',
+                    'toko_id' => $row->toko_id ? (int) $row->toko_id : null,
+                    'toko_nama' => $row->toko_nama ?: '-',
+                    'no_rm' => $row->no_rm ?: '-',
+                    'pasien_nama' => $row->pasien_nama ?: '-',
+                    'staff_id' => $row->staff_id ? (int) $row->staff_id : null,
+                    'staff_nama' => $row->staff_nama ?: '-',
+                    'staff_jabatan' => $row->staff_jabatan ?: '-',
+                    'item_id' => $row->item_id ? (int) $row->item_id : null,
+                    'treatment_toko_id' => $row->treatment_toko_id
+                        ? (int) $row->treatment_toko_id
+                        : null,
+                    'nama_item' => $row->nama_item ?: '-',
+                    'jenis_transaksi' => $jenisTransaksi,
+                    'jenis_transaksi_label' => $this->jenisTransaksiLabel($jenisTransaksi),
+                    'qty' => (float) ($row->qty ?? 0),
+                    'harga_awal' => (float) ($row->harga_awal ?? 0),
+                    'setelah_diskon' => (float) ($row->setelah_diskon ?? 0),
+                    'insentif_rupiah' => (float) ($row->insentif_rupiah ?? 0),
+                    'nilai_insentif' => (float) ($row->nilai_insentif ?? 0),
+                    'is_realisasi_deposit' => (int) ($row->is_realisasi_deposit ?? 0),
                 ];
             })
             ->values();
@@ -311,179 +341,138 @@ class LaporanInsentifNurseBeauticianController extends Controller
 
     private function baseTreatmentQuery(array $filters)
     {
+        $effectiveDateSql = $this->effectiveDateSql();
+        $effectiveStaffIdSql = $this->effectiveStaffIdSql();
+        $effectiveTokoIdSql = $this->effectiveTokoIdSql();
+        $jenisTransaksiSql = $this->jenisTransaksiSql();
+
         $query = DB::table('pembayaran_invoice_item as pii')
             ->join('pembayaran_invoice as pi', 'pi.id', '=', 'pii.pembayaran_id')
-            ->leftJoin('master_toko as mt', 'mt.id', '=', 'pi.toko_id')
+            ->leftJoin('pembayaran_deposit_treatment_claim as pdc', function ($join) {
+                $join->on('pdc.id', '=', 'pii.deposit_claim_id')
+                    ->orOn('pdc.pembayaran_item_id', '=', 'pii.id');
+            })
+            ->leftJoin('master_treatment_toko as mtt', 'mtt.id', '=', 'pii.treatment_toko_id')
             ->leftJoin('pasien as ps', 'ps.id', '=', 'pi.pasien_id')
-            ->leftJoin('master_karyawan as kp', 'kp.id', '=', 'pii.perawat_id')
-            ->leftJoin('master_jabatan as jp', 'jp.id', '=', 'kp.jabatan_id')
+            ->leftJoin('master_karyawan as k_invoice', 'k_invoice.id', '=', 'pii.perawat_id')
+            ->leftJoin('master_jabatan as j_invoice', 'j_invoice.id', '=', 'k_invoice.jabatan_id')
+            ->leftJoin('master_karyawan as k_claim', 'k_claim.id', '=', 'pdc.claim_perawat_id')
+            ->leftJoin('master_jabatan as j_claim', 'j_claim.id', '=', 'k_claim.jabatan_id')
+            ->leftJoin('master_toko as mt_invoice', 'mt_invoice.id', '=', 'pi.toko_id')
+            ->leftJoin('master_toko as mt_claim', 'mt_claim.id', '=', 'pdc.toko_claim_id')
             ->where('pi.status', 3)
             ->where('pi.is_delete', 0)
             ->where('pii.item_type', 2)
             ->where('pii.status', 1)
             ->where('pii.is_delete', 0)
-            ->whereNotNull('pii.perawat_id')
-            ->whereRaw('DATE(COALESCE(pi.tanggal_lunas, pi.tanggal_invoice)) BETWEEN ? AND ?', [
+            ->where(function ($q) {
+                $q->whereNull('pdc.id')
+                    ->orWhere(function ($claimQuery) {
+                        $claimQuery->where('pdc.status', 1)
+                            ->where('pdc.is_delete', 0);
+                    });
+            })
+            ->whereRaw("{$effectiveStaffIdSql} IS NOT NULL")
+            ->whereRaw("{$effectiveDateSql} BETWEEN ? AND ?", [
                 $filters['tanggal_awal'],
                 $filters['tanggal_akhir'],
-            ]);
+            ])
+            // Pembelian deposit tidak menghasilkan insentif nurse. Yang masuk hanya
+            // treatment invoice biasa dan pemakaian/realisasi deposit.
+            ->whereRaw("(pdc.id IS NOT NULL OR {$jenisTransaksiSql} <> 4)");
 
         if (! empty($filters['staff_id'])) {
-            $query->where('pii.perawat_id', (int) $filters['staff_id']);
+            $query->whereRaw("{$effectiveStaffIdSql} = ?", [(int) $filters['staff_id']]);
         }
 
         if (! empty($filters['toko_id'])) {
-            $query->where('pi.toko_id', (int) $filters['toko_id']);
+            $query->whereRaw("{$effectiveTokoIdSql} = ?", [(int) $filters['toko_id']]);
         }
 
         return $query;
     }
 
-    private function columns(string $jenis): array
+    private function effectiveDateSql(): string
     {
-        if ($jenis === 'summary') {
-            return [
-                ['key' => 'staff_nama', 'label' => 'Beautician/Nurse'],
-                ['key' => 'staff_jabatan', 'label' => 'Jabatan'],
-                ['key' => 'nama_item', 'label' => 'Treatment'],
-                ['key' => 'total_qty', 'label' => 'Total Qty', 'type' => 'number'],
-                ['key' => 'total_omzet', 'label' => 'Total Omzet Net', 'type' => 'currency'],
-                ['key' => 'dasar_insentif', 'label' => 'Dasar Insentif'],
-                ['key' => 'total_insentif', 'label' => 'Total Insentif', 'type' => 'currency'],
-            ];
-        }
+        return 'DATE(CASE WHEN pdc.id IS NOT NULL '
+            . 'THEN COALESCE(pdc.claimed_at, pi.tanggal_lunas, pi.tanggal_invoice) '
+            . 'ELSE COALESCE(pi.tanggal_lunas, pi.tanggal_invoice) END)';
+    }
 
-        return [
-            ['key' => 'tanggal', 'label' => 'Tanggal'],
-            ['key' => 'no_invoice', 'label' => 'No Invoice'],
-            ['key' => 'toko_nama', 'label' => 'Cabang'],
-            ['key' => 'no_rm', 'label' => 'No RM'],
-            ['key' => 'pasien_nama', 'label' => 'Pasien'],
-            ['key' => 'staff_nama', 'label' => 'Beautician/Nurse'],
-            ['key' => 'staff_jabatan', 'label' => 'Jabatan'],
-            ['key' => 'nama_item', 'label' => 'Treatment'],
-            ['key' => 'qty', 'label' => 'Qty', 'type' => 'number'],
-            ['key' => 'harga', 'label' => 'Harga', 'type' => 'currency'],
-            ['key' => 'nilai_net', 'label' => 'Subtotal Net', 'type' => 'currency'],
-            ['key' => 'dasar_insentif', 'label' => 'Dasar Insentif'],
-            ['key' => 'nilai_insentif', 'label' => 'Insentif', 'type' => 'currency'],
-        ];
+    private function effectiveStaffIdSql(): string
+    {
+        return 'COALESCE(pdc.claim_perawat_id, pii.perawat_id)';
+    }
+
+    private function effectiveTokoIdSql(): string
+    {
+        return 'COALESCE(pdc.toko_claim_id, pi.toko_id)';
+    }
+
+    private function effectiveQtySql(): string
+    {
+        return 'CASE WHEN pdc.id IS NOT NULL '
+            . 'THEN COALESCE(NULLIF(pdc.qty_claim, 0), pii.qty) '
+            . 'ELSE pii.qty END';
+    }
+
+    private function effectiveGrossSql(): string
+    {
+        return 'CASE WHEN pdc.id IS NOT NULL '
+            . 'THEN COALESCE(pdc.nilai_realisasi, 0) '
+            . 'ELSE (pii.qty * pii.harga) END';
+    }
+
+    private function effectiveNetSql(): string
+    {
+        return 'CASE '
+            . 'WHEN pdc.id IS NOT NULL THEN COALESCE(pdc.nilai_realisasi, 0) '
+            . 'WHEN pii.subtotal_before_diskon_subtotal <> 0 '
+            . '  OR pii.diskon_subtotal_amount <> 0 '
+            . '  OR pii.subtotal_after_diskon_subtotal <> 0 '
+            . 'THEN pii.subtotal_after_diskon_subtotal '
+            . 'ELSE pii.subtotal END';
+    }
+
+    private function jenisTransaksiSql(): string
+    {
+        return 'CASE '
+            . 'WHEN pdc.id IS NOT NULL THEN 5 '
+            . 'WHEN COALESCE(pii.jenis_transaksi, 0) <> 0 THEN pii.jenis_transaksi '
+            . 'ELSE COALESCE(pi.jenis_transaksi, 0) END';
+    }
+
+    private function jenisTransaksiLabel(int $jenis): string
+    {
+        return match ($jenis) {
+            0 => 'Umum',
+            1 => 'Endorse / Fasilitas Karyawan',
+            2 => 'EliteGlowbal',
+            3 => 'Owner',
+            4 => 'Deposit',
+            5 => 'Realisasi Deposit',
+            default => 'Lainnya',
+        };
     }
 
     private function title(string $jenis): string
     {
-        $prefix = $jenis === 'detail' ? '[DETAIL] ' : '';
-
-        return $prefix . 'LAPORAN INSENTIF TREATMENT NURSE';
+        return 'LAPORAN INSENTIF TREATMENT ('
+            . strtoupper($jenis === 'detail' ? 'DETAIL' : 'SUMMARY')
+            . ')';
     }
 
     private function filename(string $jenis, string $format, array $filters): string
     {
-        $extension = $format === 'excel' ? 'xls' : 'html';
+        $extension = $format === 'excel' ? 'xlsx' : 'pdf';
 
         return implode('-', [
             'laporan',
             'insentif',
             'nurse',
-            'beautician',
             $jenis,
             Carbon::parse($filters['tanggal_awal'])->format('Ymd'),
             Carbon::parse($filters['tanggal_akhir'])->format('Ymd'),
         ]) . '.' . $extension;
-    }
-
-    private function buildHtml(string $title, array $columns, $rows, array $filters, bool $printable): string
-    {
-        $publicFilters = $this->publicFilters($filters);
-        $period = Carbon::parse($filters['tanggal_awal'])->format('d/m/Y')
-            . ' - '
-            . Carbon::parse($filters['tanggal_akhir'])->format('d/m/Y');
-        $totalInsentif = (float) $rows->sum(function ($row) {
-            return $row['total_insentif'] ?? $row['nilai_insentif'] ?? 0;
-        });
-        $staffName = $publicFilters['staff_nama']
-            ? trim($publicFilters['staff_nama'] . ($publicFilters['staff_jabatan'] ? ' - ' . $publicFilters['staff_jabatan'] : ''))
-            : 'Semua nurse/beautician';
-
-        $thead = collect($columns)->map(function ($column) {
-            return '<th>' . e($column['label']) . '</th>';
-        })->implode('');
-
-        $tbody = $rows->map(function ($row) use ($columns) {
-            $cells = collect($columns)->map(function ($column) use ($row) {
-                $type = $column['type'] ?? 'text';
-                $value = $row[$column['key']] ?? null;
-                $class = in_array($type, ['number', 'currency'], true) ? ' class="num"' : '';
-
-                return '<td' . $class . '>' . e($this->formatValue($value, $type)) . '</td>';
-            })->implode('');
-
-            return '<tr>' . $cells . '</tr>';
-        })->implode('');
-
-        if ($tbody === '') {
-            $tbody = '<tr><td colspan="' . count($columns) . '" class="empty">Tidak ada data pada filter ini.</td></tr>';
-        }
-
-        $autoPrint = $printable ? '<script>window.addEventListener("load", function () { window.print(); });</script>' : '';
-
-        return '<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>' . e($title) . '</title>
-<style>
-    body { font-family: Arial, Helvetica, sans-serif; color: #111827; font-size: 12px; margin: 24px; }
-    h1 { font-size: 18px; margin: 0 0 10px; }
-    .meta { margin-bottom: 16px; color: #374151; line-height: 1.7; }
-    .summary { margin: 12px 0 16px; font-size: 13px; font-weight: 700; }
-    table { width: 100%; border-collapse: collapse; }
-    th { background: #f3f4f6; border: 1px solid #d1d5db; padding: 7px; text-align: left; }
-    td { border: 1px solid #d1d5db; padding: 7px; vertical-align: top; }
-    .num { text-align: right; white-space: nowrap; }
-    .empty { text-align: center; color: #6b7280; padding: 20px; }
-    @media print { body { margin: 12mm; } }
-</style>
-</head>
-<body>
-<h1>' . e($title) . '</h1>
-<div class="meta">
-    Periode: <strong>' . e($period) . '</strong><br>
-    Beautician/Nurse: <strong>' . e($staffName) . '</strong><br>
-    Cabang: <strong>' . e($publicFilters['toko_nama'] ?: 'Semua cabang / sesuai akses') . '</strong>
-</div>
-<div class="summary">Total Insentif: Rp ' . e($this->money($totalInsentif)) . '</div>
-<table>
-<thead><tr>' . $thead . '</tr></thead>
-<tbody>' . $tbody . '</tbody>
-</table>
-' . $autoPrint . '
-</body>
-</html>';
-    }
-
-    private function formatValue($value, string $type): string
-    {
-        if ($type === 'currency') {
-            return 'Rp ' . $this->money((float) $value);
-        }
-
-        if ($type === 'number') {
-            return $this->number((float) $value);
-        }
-
-        return (string) ($value ?? '-');
-    }
-
-    private function money(float $value): string
-    {
-        return number_format($value, 0, ',', '.');
-    }
-
-    private function number(float $value): string
-    {
-        $decimals = floor($value) == $value ? 0 : 2;
-
-        return number_format($value, $decimals, ',', '.');
     }
 }

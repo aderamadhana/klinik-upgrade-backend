@@ -3,35 +3,45 @@
 namespace App\Http\Controllers\Api\Laporan;
 
 use App\Http\Controllers\Controller;
+use App\Services\Laporan\LaporanInsentifApotekerExportService;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Validator as LaravelValidator;
+use Symfony\Component\HttpFoundation\BinaryFileResponse;
+use Symfony\Component\HttpFoundation\Response;
 
 class LaporanInsentifApotekerController extends Controller
 {
-    public function petugas(Request $request)
+    public function __construct(
+        private readonly LaporanInsentifApotekerExportService $exportService
+    ) {
+    }
+
+    public function petugas(Request $request): JsonResponse
     {
         $search = trim((string) $request->query('search', ''));
-        $limit = (int) $request->query('limit', 50);
-        $limit = $limit > 0 ? min($limit, 100) : 50;
+        $limit = max(1, min((int) $request->query('limit', 50), 100));
 
         $query = DB::table('master_karyawan as k')
             ->leftJoin('master_jabatan as j', 'j.id', '=', 'k.jabatan_id')
-            ->where(function ($q) {
-                $q->where('k.is_delete', 0)
+            ->where(function (Builder $builder): void {
+                $builder->where('k.is_delete', 0)
                     ->orWhereNull('k.is_delete');
             })
-            ->where(function ($q) {
-                $q->whereIn('j.kode_jabatan', ['AP', 'AA'])
+            ->where(function (Builder $builder): void {
+                $builder->whereIn('j.kode_jabatan', ['AP', 'AA'])
                     ->orWhere('j.nama_jabatan', 'like', '%apoteker%')
                     ->orWhere('j.nama_jabatan', 'like', '%farmasi%');
             });
 
         if ($search !== '') {
-            $query->where(function ($q) use ($search) {
-                $q->where('k.nama', 'like', "%{$search}%")
+            $query->where(function (Builder $builder) use ($search): void {
+                $builder->where('k.nama', 'like', "%{$search}%")
                     ->orWhere('k.kode', 'like', "%{$search}%")
                     ->orWhere('j.nama_jabatan', 'like', "%{$search}%");
             });
@@ -48,7 +58,7 @@ class LaporanInsentifApotekerController extends Controller
                 'j.kode_jabatan',
                 'j.nama_jabatan as jabatan',
             ])
-            ->map(function ($item) {
+            ->map(static function (object $item): array {
                 $jabatan = $item->jabatan ?: 'Apoteker / Asisten Apoteker';
 
                 return [
@@ -57,7 +67,7 @@ class LaporanInsentifApotekerController extends Controller
                     'nama' => $item->nama,
                     'jabatan' => $jabatan,
                     'kode_jabatan' => $item->kode_jabatan,
-                    'label' => trim(($item->nama ?? '-') . ' - ' . $jabatan),
+                    'label' => trim(($item->nama ?: '-') . ' - ' . $jabatan),
                 ];
             })
             ->values();
@@ -69,34 +79,36 @@ class LaporanInsentifApotekerController extends Controller
         ]);
     }
 
-    public function summary(Request $request)
+    public function summary(Request $request): JsonResponse
     {
-        $filters = $this->normalizeFilters($request);
+        $normalized = $this->normalizeFilters($request);
 
-        if ($filters['validator']->fails()) {
+        if ($normalized['validator']->fails()) {
             return response()->json([
                 'status' => false,
                 'message' => 'Filter laporan tidak valid.',
-                'errors' => $filters['validator']->errors(),
+                'errors' => $normalized['validator']->errors(),
             ], 422);
         }
 
-        $filters = $filters['data'];
-        $rows = $this->getRows('summary', $filters);
-        $aggregate = $this->makeSummaryAggregate($rows);
+        $filters = $normalized['data'];
+        $rows = $this->getResepRows($filters);
+        $summary = $this->makeSummary($rows);
 
         return response()->json([
             'status' => true,
             'message' => 'Ringkasan insentif apoteker berhasil diambil.',
             'data' => [
                 'filters' => $this->publicFilters($filters),
-                'produk' => $aggregate,
-                'grand_total_insentif' => $aggregate['total_insentif'],
+                'resep' => $summary['resep'],
+                // Dipertahankan agar FE lama tidak langsung rusak.
+                'produk' => $summary['produk'],
+                'grand_total_insentif' => $summary['resep']['total_insentif'],
             ],
         ]);
     }
 
-    public function export(Request $request, string $format)
+    public function export(Request $request, string $format): Response|BinaryFileResponse|JsonResponse
     {
         $format = strtolower($format);
 
@@ -107,51 +119,53 @@ class LaporanInsentifApotekerController extends Controller
             ], 422);
         }
 
-        $filters = $this->normalizeFilters($request);
+        $normalized = $this->normalizeFilters($request);
 
-        if ($filters['validator']->fails()) {
+        if ($normalized['validator']->fails()) {
             return response()->json([
                 'status' => false,
                 'message' => 'Filter laporan tidak valid.',
-                'errors' => $filters['validator']->errors(),
+                'errors' => $normalized['validator']->errors(),
             ], 422);
         }
 
-        $filters = $filters['data'];
-        $rows = $this->getRows('detail', $filters);
-        $columns = $this->columns();
-        $title = 'LAPORAN INSENTIF APOTEKER';
+        $filters = $normalized['data'];
+        $rows = $this->getResepRows($filters);
+        $publicFilters = $this->publicFilters($filters);
         $filename = $this->filename($format, $filters);
-        $html = $this->buildHtml($title, $columns, $rows, $filters, $format === 'pdf');
 
         if ($format === 'excel') {
-            return response($html, 200, [
-                'Content-Type' => 'application/vnd.ms-excel; charset=UTF-8',
-                'Content-Disposition' => 'attachment; filename="' . $filename . '"',
-                'Cache-Control' => 'max-age=0, no-cache, no-store, must-revalidate',
-                'Pragma' => 'no-cache',
-            ]);
+            return $this->exportService->excel(
+                rows: $rows,
+                filters: $publicFilters,
+                filename: $filename,
+            );
         }
 
-        return response($html, 200, [
-            'Content-Type' => 'text/html; charset=UTF-8',
-            'Content-Disposition' => 'inline; filename="' . $filename . '"',
-        ]);
+        return $this->exportService->pdf(
+            rows: $rows,
+            filters: $publicFilters,
+            filename: $filename,
+        );
     }
 
+    /**
+     * @return array{validator: LaravelValidator, data: array<string, mixed>}
+     */
     private function normalizeFilters(Request $request): array
     {
         $today = now()->toDateString();
         $tokoId = $request->query('toko_id', $request->header('X-Toko-Id'));
-        $tokoId = is_numeric($tokoId) ? (int) $tokoId : null;
         $petugasId = $request->query('apoteker_id', $request->query('petugas_id'));
-        $petugasId = is_numeric($petugasId) ? (int) $petugasId : null;
 
         $data = [
             'tanggal_awal' => $request->query('tanggal_awal', $today),
-            'tanggal_akhir' => $request->query('tanggal_akhir', $request->query('tanggal_awal', $today)),
-            'apoteker_id' => $petugasId,
-            'toko_id' => $tokoId,
+            'tanggal_akhir' => $request->query(
+                'tanggal_akhir',
+                $request->query('tanggal_awal', $today)
+            ),
+            'apoteker_id' => is_numeric($petugasId) ? (int) $petugasId : null,
+            'toko_id' => is_numeric($tokoId) ? (int) $tokoId : null,
         ];
 
         $validator = Validator::make($data, [
@@ -169,6 +183,10 @@ class LaporanInsentifApotekerController extends Controller
         ];
     }
 
+    /**
+     * @param array<string, mixed> $filters
+     * @return array<string, mixed>
+     */
     private function publicFilters(array $filters): array
     {
         $petugas = null;
@@ -177,7 +195,7 @@ class LaporanInsentifApotekerController extends Controller
         if (! empty($filters['apoteker_id'])) {
             $petugas = DB::table('master_karyawan as k')
                 ->leftJoin('master_jabatan as j', 'j.id', '=', 'k.jabatan_id')
-                ->where('k.id', $filters['apoteker_id'])
+                ->where('k.id', (int) $filters['apoteker_id'])
                 ->first([
                     'k.id',
                     'k.nama',
@@ -186,7 +204,9 @@ class LaporanInsentifApotekerController extends Controller
         }
 
         if (! empty($filters['toko_id'])) {
-            $toko = DB::table('master_toko')->where('id', $filters['toko_id'])->first(['id', 'nama_toko']);
+            $toko = DB::table('master_toko')
+                ->where('id', (int) $filters['toko_id'])
+                ->first(['id', 'nama_toko']);
         }
 
         return [
@@ -195,125 +215,47 @@ class LaporanInsentifApotekerController extends Controller
             'apoteker_id' => $filters['apoteker_id'] ? (int) $filters['apoteker_id'] : null,
             'apoteker_nama' => $petugas->nama ?? null,
             'apoteker_jabatan' => $petugas->jabatan ?? null,
-            'toko_id' => $filters['toko_id'],
+            'toko_id' => $filters['toko_id'] ? (int) $filters['toko_id'] : null,
             'toko_nama' => $toko->nama_toko ?? null,
+            'fee_per_resep' => $this->feePerResep(),
         ];
     }
 
-    private function makeSummaryAggregate($rows): array
-    {
-        return [
-            'total_item' => $rows->count(),
-            'total_qty' => (float) $rows->sum('total_qty'),
-            'total_omzet' => (float) $rows->sum('total_omzet'),
-            'total_insentif' => (float) $rows->sum('total_insentif'),
-        ];
-    }
-
-    private function getRows(string $jenis, array $filters)
-    {
-        $details = $this->getProdukDetailRows($filters);
-
-        if ($jenis === 'detail') {
-            return $details;
-        }
-
-        return $details
-            ->groupBy(function ($row) {
-                return implode('|', [
-                    $row['apoteker_id'] ?? 0,
-                    $row['item_id'] ?? 0,
-                    $row['nama_item'] ?? '-',
-                    $row['tarif_insentif'] ?? 0,
-                ]);
-            })
-            ->map(function ($items) {
-                $first = $items->first();
-
-                return [
-                    'apoteker_nama' => $first['apoteker_nama'] ?? '-',
-                    'apoteker_jabatan' => $first['apoteker_jabatan'] ?? '-',
-                    'nama_item' => $first['nama_item'] ?? '-',
-                    'total_qty' => (float) $items->sum('qty'),
-                    'total_omzet' => (float) $items->sum('nilai_net'),
-                    'dasar_insentif' => $first['dasar_insentif'] ?? '-',
-                    'total_insentif' => (float) $items->sum('nilai_insentif'),
-                ];
-            })
-            ->sortBy([
-                ['apoteker_nama', 'asc'],
-                ['nama_item', 'asc'],
-            ])
-            ->values();
-    }
-
-    private function getProdukDetailRows(array $filters)
-    {
-        $netSql = 'COALESCE(NULLIF(pii.subtotal_after_diskon_subtotal, 0), NULLIF(pii.subtotal, 0), (pii.qty * pii.harga))';
-        $feeColumn = $this->feeColumnSql();
-        $incentiveSql = "COALESCE({$feeColumn}, 0) * pii.qty";
-        $tanggalSql = 'COALESCE(far.finished_at, pi.tanggal_lunas, pi.tanggal_invoice)';
-
-        return $this->baseResepQuery($filters)
-            ->leftJoin('master_produk_toko as mpt', 'mpt.id', '=', 'pii.produk_toko_id')
-            ->selectRaw("
-                DATE({$tanggalSql}) as tanggal,
-                far.finished_at,
-                pi.no_invoice,
-                pi.toko_id,
-                mt.nama_toko,
-                ps.no_rm,
-                ps.nama as pasien_nama,
-                far.petugas_karyawan_id as apoteker_id,
-                COALESCE(kp.nama, far.petugas_nama_snapshot) as apoteker_nama,
-                COALESCE(jp.nama_jabatan, far.petugas_jabatan_snapshot) as apoteker_jabatan,
-                pii.produk_id as item_id,
-                pii.nama_item,
-                pii.satuan,
-                pii.qty,
-                pii.harga,
-                {$netSql} as nilai_net,
-                COALESCE({$feeColumn}, 0) as tarif_insentif,
-                {$incentiveSql} as nilai_insentif
-            ")
-            ->orderBy('tanggal')
-            ->orderBy('pi.no_invoice')
-            ->orderBy('kp.nama')
-            ->get()
-            ->map(function ($row) {
-                $tarif = (float) ($row->tarif_insentif ?? 0);
-
-                return [
-                    'tanggal' => $row->tanggal,
-                    'finished_at' => $row->finished_at,
-                    'no_invoice' => $row->no_invoice,
-                    'toko_nama' => $row->nama_toko,
-                    'no_rm' => $row->no_rm,
-                    'pasien_nama' => $row->pasien_nama,
-                    'apoteker_id' => (int) $row->apoteker_id,
-                    'apoteker_nama' => $row->apoteker_nama,
-                    'apoteker_jabatan' => $row->apoteker_jabatan,
-                    'item_id' => $row->item_id,
-                    'nama_item' => $row->nama_item,
-                    'satuan' => $row->satuan,
-                    'qty' => (float) $row->qty,
-                    'harga' => (float) $row->harga,
-                    'nilai_net' => (float) $row->nilai_net,
-                    'tarif_insentif' => $tarif,
-                    'dasar_insentif' => 'Fee Rp ' . $this->money($tarif) . ' x qty',
-                    'nilai_insentif' => (float) $row->nilai_insentif,
-                ];
-            })
-            ->values();
-    }
-
-    private function baseResepQuery(array $filters)
+    /**
+     * Menghasilkan satu baris untuk satu resep/faktur selesai.
+     * Dengan demikian faktur yang memiliki banyak item obat tidak dihitung ganda.
+     *
+     * @param array<string, mixed> $filters
+     * @return Collection<int, array<string, mixed>>
+     */
+    private function getResepRows(array $filters): Collection
     {
         $tanggalSql = 'COALESCE(far.finished_at, pi.tanggal_lunas, pi.tanggal_invoice)';
+        $feePerResep = $this->feePerResep();
+
+        $produkAggregate = DB::table('pembayaran_invoice_item as item')
+            ->selectRaw(
+                'item.pembayaran_id,
+                 COUNT(item.id) as total_item_produk,
+                 SUM(item.qty) as total_qty_produk,
+                 SUM(
+                    COALESCE(
+                        NULLIF(item.subtotal_after_diskon_subtotal, 0),
+                        NULLIF(item.subtotal, 0),
+                        item.qty * item.harga
+                    )
+                 ) as total_omzet_produk'
+            )
+            ->where('item.item_type', 3)
+            ->where('item.status', 1)
+            ->where('item.is_delete', 0)
+            ->groupBy('item.pembayaran_id');
 
         $query = DB::table('farmasi_antrian_resep as far')
             ->join('pembayaran_invoice as pi', 'pi.id', '=', 'far.pembayaran_id')
-            ->join('pembayaran_invoice_item as pii', 'pii.pembayaran_id', '=', 'pi.id')
+            ->leftJoinSub($produkAggregate, 'produk', static function ($join): void {
+                $join->on('produk.pembayaran_id', '=', 'pi.id');
+            })
             ->leftJoin('master_toko as mt', 'mt.id', '=', 'pi.toko_id')
             ->leftJoin('pasien as ps', 'ps.id', '=', 'pi.pasien_id')
             ->leftJoin('master_karyawan as kp', 'kp.id', '=', 'far.petugas_karyawan_id')
@@ -321,9 +263,6 @@ class LaporanInsentifApotekerController extends Controller
             ->where('far.status', 2)
             ->where('pi.status', 3)
             ->where('pi.is_delete', 0)
-            ->where('pii.item_type', 3)
-            ->where('pii.status', 1)
-            ->where('pii.is_delete', 0)
             ->whereNotNull('far.petugas_karyawan_id')
             ->whereRaw("DATE({$tanggalSql}) BETWEEN ? AND ?", [
                 $filters['tanggal_awal'],
@@ -338,41 +277,93 @@ class LaporanInsentifApotekerController extends Controller
             $query->where('pi.toko_id', (int) $filters['toko_id']);
         }
 
-        return $query;
+        return $query
+            ->selectRaw(
+                "far.id as resep_id,
+                 DATE({$tanggalSql}) as tanggal,
+                 far.finished_at,
+                 pi.id as pembayaran_id,
+                 pi.no_invoice,
+                 pi.toko_id,
+                 mt.nama_toko,
+                 ps.no_rm,
+                 ps.nama as pasien_nama,
+                 far.petugas_karyawan_id as apoteker_id,
+                 COALESCE(kp.nama, far.petugas_nama_snapshot) as apoteker_nama,
+                 COALESCE(jp.nama_jabatan, far.petugas_jabatan_snapshot) as apoteker_jabatan,
+                 COALESCE(produk.total_item_produk, 0) as total_item_produk,
+                 COALESCE(produk.total_qty_produk, 0) as total_qty_produk,
+                 COALESCE(produk.total_omzet_produk, 0) as total_omzet_produk"
+            )
+            ->orderBy('apoteker_nama')
+            ->orderBy('tanggal')
+            ->orderBy('pi.no_invoice')
+            ->get()
+            ->map(static function (object $row) use ($feePerResep): array {
+                return [
+                    'resep_id' => (int) $row->resep_id,
+                    'tanggal' => $row->tanggal,
+                    'finished_at' => $row->finished_at,
+                    'pembayaran_id' => (int) $row->pembayaran_id,
+                    'no_invoice' => $row->no_invoice ?: '-',
+                    'toko_id' => (int) $row->toko_id,
+                    'toko_nama' => $row->nama_toko ?: '-',
+                    'no_rm' => $row->no_rm,
+                    'pasien_nama' => $row->pasien_nama,
+                    'apoteker_id' => (int) $row->apoteker_id,
+                    'apoteker_nama' => $row->apoteker_nama ?: '-',
+                    'apoteker_jabatan' => $row->apoteker_jabatan ?: 'Apoteker / Asisten Apoteker',
+                    'total_item_produk' => (int) $row->total_item_produk,
+                    'total_qty_produk' => (float) $row->total_qty_produk,
+                    'total_omzet_produk' => (float) $row->total_omzet_produk,
+                    'fee' => $feePerResep,
+                    'nilai_insentif' => $feePerResep,
+                ];
+            })
+            ->values();
     }
 
-    private function feeColumnSql(): string
+    /**
+     * @return array{
+     *   resep: array<string, float|int>,
+     *   produk: array<string, float|int>
+     * }
+     */
+    private function makeSummary(Collection $rows): array
     {
-        if (Schema::hasColumn('master_produk_toko', 'fee_apoteker')) {
-            return 'mpt.fee_apoteker';
-        }
+        $totalResep = $rows->count();
+        $totalInsentif = (float) $rows->sum('nilai_insentif');
 
-        return 'mpt.fee_beautician';
-    }
-
-    private function columns(): array
-    {
         return [
-            ['key' => 'tanggal', 'label' => 'Tanggal Selesai'],
-            ['key' => 'no_invoice', 'label' => 'No Invoice'],
-            ['key' => 'toko_nama', 'label' => 'Cabang'],
-            ['key' => 'no_rm', 'label' => 'No RM'],
-            ['key' => 'pasien_nama', 'label' => 'Pasien'],
-            ['key' => 'apoteker_nama', 'label' => 'Apoteker / Asisten'],
-            ['key' => 'apoteker_jabatan', 'label' => 'Jabatan'],
-            ['key' => 'nama_item', 'label' => 'Produk / Obat'],
-            ['key' => 'qty', 'label' => 'Qty', 'type' => 'number'],
-            ['key' => 'satuan', 'label' => 'Satuan'],
-            ['key' => 'harga', 'label' => 'Harga', 'type' => 'currency'],
-            ['key' => 'nilai_net', 'label' => 'Subtotal Net', 'type' => 'currency'],
-            ['key' => 'dasar_insentif', 'label' => 'Dasar Insentif'],
-            ['key' => 'nilai_insentif', 'label' => 'Insentif', 'type' => 'currency'],
+            'resep' => [
+                'total_resep' => $totalResep,
+                'total_faktur' => $totalResep,
+                'fee_per_resep' => $this->feePerResep(),
+                'total_insentif' => $totalInsentif,
+            ],
+            'produk' => [
+                'total_item' => (int) $rows->sum('total_item_produk'),
+                'total_qty' => (float) $rows->sum('total_qty_produk'),
+                'total_omzet' => (float) $rows->sum('total_omzet_produk'),
+                'total_insentif' => $totalInsentif,
+            ],
         ];
     }
 
+    private function feePerResep(): float
+    {
+        return max(
+            0,
+            (float) config('laporan.insentif_apoteker.fee_per_resep', 2000)
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $filters
+     */
     private function filename(string $format, array $filters): string
     {
-        $extension = $format === 'excel' ? 'xls' : 'html';
+        $extension = $format === 'excel' ? 'xlsx' : 'pdf';
 
         return implode('-', [
             'laporan',
@@ -381,98 +372,5 @@ class LaporanInsentifApotekerController extends Controller
             Carbon::parse($filters['tanggal_awal'])->format('Ymd'),
             Carbon::parse($filters['tanggal_akhir'])->format('Ymd'),
         ]) . '.' . $extension;
-    }
-
-    private function buildHtml(string $title, array $columns, $rows, array $filters, bool $printable): string
-    {
-        $publicFilters = $this->publicFilters($filters);
-        $period = Carbon::parse($filters['tanggal_awal'])->format('d/m/Y')
-            . ' - '
-            . Carbon::parse($filters['tanggal_akhir'])->format('d/m/Y');
-        $totalInsentif = (float) $rows->sum('nilai_insentif');
-        $petugasName = $publicFilters['apoteker_nama']
-            ? trim($publicFilters['apoteker_nama'] . ($publicFilters['apoteker_jabatan'] ? ' - ' . $publicFilters['apoteker_jabatan'] : ''))
-            : 'Semua apoteker / asisten apoteker';
-
-        $thead = collect($columns)->map(function ($column) {
-            return '<th>' . e($column['label']) . '</th>';
-        })->implode('');
-
-        $tbody = $rows->map(function ($row) use ($columns) {
-            $cells = collect($columns)->map(function ($column) use ($row) {
-                $type = $column['type'] ?? 'text';
-                $value = $row[$column['key']] ?? null;
-                $class = in_array($type, ['number', 'currency'], true) ? ' class="num"' : '';
-
-                return '<td' . $class . '>' . e($this->formatValue($value, $type)) . '</td>';
-            })->implode('');
-
-            return '<tr>' . $cells . '</tr>';
-        })->implode('');
-
-        if ($tbody === '') {
-            $tbody = '<tr><td colspan="' . count($columns) . '" class="empty">Tidak ada data pada filter ini.</td></tr>';
-        }
-
-        $autoPrint = $printable ? '<script>window.addEventListener("load", function () { window.print(); });</script>' : '';
-
-        return '<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>' . e($title) . '</title>
-<style>
-    body { font-family: Arial, Helvetica, sans-serif; color: #111827; font-size: 12px; margin: 24px; }
-    h1 { font-size: 18px; margin: 0 0 10px; }
-    .meta { margin-bottom: 16px; color: #374151; line-height: 1.7; }
-    .summary { margin: 12px 0 16px; font-size: 13px; font-weight: 700; }
-    table { width: 100%; border-collapse: collapse; }
-    th { background: #f3f4f6; border: 1px solid #d1d5db; padding: 7px; text-align: left; }
-    td { border: 1px solid #d1d5db; padding: 7px; vertical-align: top; }
-    .num { text-align: right; white-space: nowrap; }
-    .empty { text-align: center; color: #6b7280; padding: 20px; }
-    @media print { body { margin: 12mm; } }
-</style>
-</head>
-<body>
-<h1>' . e($title) . '</h1>
-<div class="meta">
-    Periode: <strong>' . e($period) . '</strong><br>
-    Apoteker / Asisten: <strong>' . e($petugasName) . '</strong><br>
-    Cabang: <strong>' . e($publicFilters['toko_nama'] ?: 'Semua cabang / sesuai akses') . '</strong>
-</div>
-<div class="summary">Total Insentif: Rp ' . e($this->money($totalInsentif)) . '</div>
-<table>
-<thead><tr>' . $thead . '</tr></thead>
-<tbody>' . $tbody . '</tbody>
-</table>
-' . $autoPrint . '
-</body>
-</html>';
-    }
-
-    private function formatValue($value, string $type): string
-    {
-        if ($type === 'currency') {
-            return 'Rp ' . $this->money((float) $value);
-        }
-
-        if ($type === 'number') {
-            return $this->number((float) $value);
-        }
-
-        return (string) ($value ?? '-');
-    }
-
-    private function money(float $value): string
-    {
-        return number_format($value, 0, ',', '.');
-    }
-
-    private function number(float $value): string
-    {
-        $decimals = floor($value) == $value ? 0 : 2;
-
-        return number_format($value, $decimals, ',', '.');
     }
 }

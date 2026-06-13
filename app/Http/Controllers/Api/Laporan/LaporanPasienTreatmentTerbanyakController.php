@@ -3,28 +3,37 @@
 namespace App\Http\Controllers\Api\Laporan;
 
 use App\Http\Controllers\Controller;
+use App\Services\Laporan\LaporanPasienTreatmentTerbanyakExportService;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
+use Symfony\Component\HttpFoundation\Response;
 
 class LaporanPasienTreatmentTerbanyakController extends Controller
 {
     private const ALLOWED_JENIS_TRANSAKSI = [0, 1, 2, 3, 4];
 
-    public function summary(Request $request)
-    {
-        $filters = $this->normalizeFilters($request);
+    public function __construct(
+        private readonly LaporanPasienTreatmentTerbanyakExportService $exportService
+    ) {
+    }
 
-        if ($filters['validator']->fails()) {
+    public function summary(Request $request): JsonResponse
+    {
+        $normalized = $this->normalizeFilters($request);
+
+        if ($normalized['validator']->fails()) {
             return response()->json([
                 'status' => false,
                 'message' => 'Filter laporan tidak valid.',
-                'errors' => $filters['validator']->errors(),
+                'errors' => $normalized['validator']->errors(),
             ], 422);
         }
 
-        $filters = $filters['data'];
+        $filters = $normalized['data'];
         $rows = $this->getRows($filters);
         $jenisOptions = $this->getJenisTransaksiOptions();
 
@@ -48,7 +57,7 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
         ]);
     }
 
-    public function export(Request $request, string $format)
+    public function export(Request $request, string $format): Response
     {
         $format = strtolower($format);
 
@@ -59,36 +68,23 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
             ], 422);
         }
 
-        $filters = $this->normalizeFilters($request);
+        $normalized = $this->normalizeFilters($request);
 
-        if ($filters['validator']->fails()) {
+        if ($normalized['validator']->fails()) {
             return response()->json([
                 'status' => false,
                 'message' => 'Filter laporan tidak valid.',
-                'errors' => $filters['validator']->errors(),
+                'errors' => $normalized['validator']->errors(),
             ], 422);
         }
 
-        $filters = $filters['data'];
+        $filters = $normalized['data'];
         $rows = $this->getRows($filters);
-        $columns = $this->columns();
-        $title = 'DATA PASIEN TREATMENT TERBANYAK';
-        $filename = $this->filename($format, $filters);
-        $html = $this->buildHtml($title, $columns, $rows, $filters, $format === 'pdf');
+        $report = $this->buildReport($rows, $filters);
 
-        if ($format === 'excel') {
-            return response($html, 200, [
-                'Content-Type' => 'application/vnd.ms-excel; charset=UTF-8',
-                'Content-Disposition' => 'attachment; filename="' . $filename . '"',
-                'Cache-Control' => 'max-age=0, no-cache, no-store, must-revalidate',
-                'Pragma' => 'no-cache',
-            ]);
-        }
-
-        return response($html, 200, [
-            'Content-Type' => 'text/html; charset=UTF-8',
-            'Content-Disposition' => 'inline; filename="' . $filename . '"',
-        ]);
+        return $format === 'excel'
+            ? $this->exportService->excel($report)
+            : $this->exportService->pdf($report);
     }
 
     private function normalizeFilters(Request $request): array
@@ -113,7 +109,10 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
 
         $data = [
             'tanggal_awal' => $request->query('tanggal_awal', $today),
-            'tanggal_akhir' => $request->query('tanggal_akhir', $request->query('tanggal_awal', $today)),
+            'tanggal_akhir' => $request->query(
+                'tanggal_akhir',
+                $request->query('tanggal_awal', $today)
+            ),
             'peringkat' => $peringkat,
             'toko_id' => $tokoId,
             'jenis_transaksi' => $jenisTransaksi,
@@ -143,7 +142,9 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
         $toko = null;
 
         if (! empty($filters['toko_id'])) {
-            $toko = DB::table('master_toko')->where('id', $filters['toko_id'])->first(['id', 'nama_toko']);
+            $toko = DB::table('master_toko')
+                ->where('id', $filters['toko_id'])
+                ->first(['id', 'nama_toko']);
         }
 
         return [
@@ -158,7 +159,7 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
         ];
     }
 
-    private function getRows(array $filters)
+    private function getRows(array $filters): Collection
     {
         $tanggalSql = 'COALESCE(pi.tanggal_lunas, pi.tanggal_invoice)';
 
@@ -168,8 +169,12 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
             ->leftJoin('pasien as pasien', 'pasien.id', '=', 'pi.pasien_id')
             ->leftJoin('master_treatment as treatment', 'treatment.id', '=', 'pii.treatment_id')
             ->leftJoin('master_jenis_transaksi as jt', 'jt.id', '=', 'pii.jenis_transaksi')
-            ->leftJoin('master_karyawan as dokter', function ($join) {
-                $join->on('dokter.id', '=', DB::raw('COALESCE(pii.dokter_id, pi.dokter_id, pi.referensi_dokter_id)'));
+            ->leftJoin('master_karyawan as dokter', function ($join): void {
+                $join->on(
+                    'dokter.id',
+                    '=',
+                    DB::raw('COALESCE(pii.dokter_id, pi.dokter_id, pi.referensi_dokter_id)')
+                );
             })
             ->leftJoin('master_karyawan as perawat', 'perawat.id', '=', 'pii.perawat_id')
             ->where('pi.status', 3)
@@ -182,33 +187,67 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
                 $filters['tanggal_awal'],
                 $filters['tanggal_akhir'],
             ])
-            ->when(! empty($filters['toko_id']), function ($query) use ($filters) {
+            ->when(! empty($filters['toko_id']), function ($query) use ($filters): void {
                 $query->where('pi.toko_id', (int) $filters['toko_id']);
             })
-            ->when($filters['jenis_transaksi'] !== null, function ($query) use ($filters) {
+            ->when($filters['jenis_transaksi'] !== null, function ($query) use ($filters): void {
                 $query->where('pii.jenis_transaksi', (int) $filters['jenis_transaksi']);
             })
-            ->selectRaw("\n                pi.id as pembayaran_id,\n                pi.no_invoice,\n                pi.kode_registrasi,\n                pi.toko_id,\n                toko.nama_toko,\n                pi.pasien_id,\n                pasien.no_rm,\n                pasien.nama as nama_pasien,\n                pasien.no_hp,\n                pasien.no_wa,\n                DATE({$tanggalSql}) as tanggal_transaksi,\n                pii.id as item_id,\n                pii.treatment_id,\n                COALESCE(treatment.nama, pii.nama_item) as nama_treatment,\n                pii.nama_item,\n                pii.qty,\n                pii.harga,\n                pii.diskon_amount,\n                pii.diskon_referral,\n                pii.diskon_subtotal_amount,\n                pii.subtotal,\n                pii.jenis_transaksi as jenis_transaksi_id,\n                COALESCE(jt.nama_jenis_transaksi, CONCAT('Jenis ', pii.jenis_transaksi)) as jenis_transaksi_nama,\n                dokter.nama as nama_dokter,\n                perawat.nama as nama_perawat\n            ")
+            ->selectRaw("
+                pi.id as pembayaran_id,
+                pi.no_invoice,
+                pi.kode_registrasi,
+                pi.toko_id,
+                toko.nama_toko,
+                pi.pasien_id,
+                pasien.no_rm,
+                pasien.nama as nama_pasien,
+                pasien.no_hp,
+                pasien.no_wa,
+                DATE({$tanggalSql}) as tanggal_transaksi,
+                pii.id as item_id,
+                pii.treatment_id,
+                COALESCE(treatment.nama, pii.nama_item) as nama_treatment,
+                pii.nama_item,
+                pii.qty,
+                pii.harga,
+                pii.diskon_amount,
+                pii.diskon_referral,
+                pii.diskon_subtotal_amount,
+                pii.subtotal,
+                pii.jenis_transaksi as jenis_transaksi_id,
+                COALESCE(jt.nama_jenis_transaksi, CONCAT('Jenis ', pii.jenis_transaksi)) as jenis_transaksi_nama,
+                dokter.nama as nama_dokter,
+                perawat.nama as nama_perawat
+            ")
             ->orderBy('pasien.nama')
             ->orderBy('pi.id')
             ->get();
 
         $rows = $details
             ->groupBy('pasien_id')
-            ->map(function ($items) {
+            ->map(function (Collection $items): array {
                 $first = $items->first();
-                $treatments = $items->groupBy(function ($row) {
-                    return ($row->treatment_id ?: 'item-' . $row->nama_treatment) . '|' . $row->nama_treatment;
-                })->map(function ($treatmentItems) {
-                    $firstTreatment = $treatmentItems->first();
 
-                    return [
-                        'treatment_id' => $firstTreatment->treatment_id,
-                        'nama_treatment' => $firstTreatment->nama_treatment ?: $firstTreatment->nama_item,
-                        'total_qty' => (float) $treatmentItems->sum('qty'),
-                        'total_net' => (float) $treatmentItems->sum('subtotal'),
-                    ];
-                })->sortByDesc('total_qty')->values();
+                $treatments = $items
+                    ->groupBy(function (object $row): string {
+                        return ($row->treatment_id ?: 'item-' . $row->nama_treatment)
+                            . '|'
+                            . $row->nama_treatment;
+                    })
+                    ->map(function (Collection $treatmentItems): array {
+                        $firstTreatment = $treatmentItems->first();
+
+                        return [
+                            'treatment_id' => $firstTreatment->treatment_id,
+                            'nama_treatment' => $firstTreatment->nama_treatment
+                                ?: $firstTreatment->nama_item,
+                            'total_qty' => (float) $treatmentItems->sum('qty'),
+                            'total_net' => (float) $treatmentItems->sum('subtotal'),
+                        ];
+                    })
+                    ->sortByDesc('total_qty')
+                    ->values();
 
                 $topTreatment = $treatments->first();
                 $cabangs = $items->pluck('nama_toko')->filter()->unique()->values();
@@ -235,16 +274,29 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
                     'treatment_terbanyak' => $topTreatment['nama_treatment'] ?? '-',
                     'qty_treatment_terbanyak' => (float) ($topTreatment['total_qty'] ?? 0),
                     'nilai_treatment_terbanyak' => (float) ($topTreatment['total_net'] ?? 0),
-                    'jenis_transaksi' => $jenisTransaksi->isNotEmpty() ? $jenisTransaksi->implode(', ') : '-',
+                    'jenis_transaksi' => $jenisTransaksi->isNotEmpty()
+                        ? $jenisTransaksi->implode(', ')
+                        : '-',
                     'dokter' => $dokters->isNotEmpty() ? $dokters->implode(', ') : '-',
                     'perawat' => $perawats->isNotEmpty() ? $perawats->implode(', ') : '-',
-                    'invoice_terkait' => $items->pluck('no_invoice')->filter()->unique()->values()->implode(', '),
-                    'treatment_detail' => $treatments->take(5)->map(function ($item) {
-                        return $item['nama_treatment'] . ' (' . $this->formatNumber($item['total_qty']) . 'x)';
-                    })->implode(', '),
+                    'invoice_terkait' => $items
+                        ->pluck('no_invoice')
+                        ->filter()
+                        ->unique()
+                        ->values()
+                        ->implode(', '),
+                    'treatment_detail' => $treatments
+                        ->take(5)
+                        ->map(function (array $item): string {
+                            return $item['nama_treatment']
+                                . ' ('
+                                . $this->formatNumber($item['total_qty'])
+                                . 'x)';
+                        })
+                        ->implode(', '),
                 ];
             })
-            ->sort(function ($a, $b) {
+            ->sort(function (array $a, array $b): int {
                 $qtyCompare = $b['total_qty_treatment'] <=> $a['total_qty_treatment'];
 
                 if ($qtyCompare !== 0) {
@@ -263,111 +315,56 @@ class LaporanPasienTreatmentTerbanyakController extends Controller
             ->take((int) $filters['peringkat'])
             ->values();
 
-        return $rows->map(function ($row, $index) {
+        return $rows->map(function (array $row, int $index): array {
             $row['peringkat'] = $index + 1;
 
             return $row;
         });
     }
 
-    private function columns(): array
+    private function buildReport(Collection $rows, array $filters): array
     {
+        $publicFilters = $this->publicFilters($filters);
+        $branchName = trim((string) ($publicFilters['toko_nama'] ?? ''));
+
         return [
-            ['key' => 'peringkat', 'label' => 'Peringkat', 'type' => 'number'],
-            ['key' => 'no_rm', 'label' => 'No RM'],
-            ['key' => 'nama_pasien', 'label' => 'Nama Pasien'],
-            ['key' => 'no_hp', 'label' => 'No HP/WA'],
-            ['key' => 'cabang', 'label' => 'Cabang'],
-            ['key' => 'total_invoice', 'label' => 'Jumlah Invoice', 'type' => 'number'],
-            ['key' => 'total_hari_transaksi', 'label' => 'Jumlah Hari', 'type' => 'number'],
-            ['key' => 'total_item_treatment', 'label' => 'Jumlah Item', 'type' => 'number'],
-            ['key' => 'total_qty_treatment', 'label' => 'Total Qty Treatment', 'type' => 'number'],
-            ['key' => 'total_jenis_treatment', 'label' => 'Jenis Treatment', 'type' => 'number'],
-            ['key' => 'total_nilai_treatment', 'label' => 'Total Net Treatment', 'type' => 'currency'],
-            ['key' => 'rata_nilai_per_qty', 'label' => 'Rata-rata per Qty', 'type' => 'currency'],
-            ['key' => 'treatment_terbanyak', 'label' => 'Treatment Terbanyak'],
-            ['key' => 'qty_treatment_terbanyak', 'label' => 'Qty Treatment Terbanyak', 'type' => 'number'],
-            ['key' => 'treatment_detail', 'label' => 'Top 5 Treatment'],
-            ['key' => 'jenis_transaksi', 'label' => 'Jenis Transaksi'],
-            ['key' => 'dokter', 'label' => 'Dokter'],
-            ['key' => 'perawat', 'label' => 'Nurse/Beautician'],
-            ['key' => 'invoice_terkait', 'label' => 'Invoice Terkait'],
+            'title' => 'DATA PASIEN TREATMENT TERBANYAK',
+            'company_name' => 'PT. KOSMETIKA KLINIK INDONESIA',
+            'company_contact' => 'Email : admin@msglowclinic.id | Website : www.msglowclinic.id',
+            'branch_label' => $branchName !== ''
+                ? 'MS GLOW AESTHETIC ' . mb_strtoupper($branchName)
+                : 'SEMUA CABANG',
+            'period_label' => $this->formatDateLong($filters['tanggal_awal'])
+                . ' s/d '
+                . $this->formatDateLong($filters['tanggal_akhir']),
+            'jenis_transaksi_label' => $publicFilters['jenis_transaksi_label'],
+            'peringkat_label' => 'Top ' . (int) $filters['peringkat'],
+            'generated_at' => now()->format('d/m/Y H:i:s'),
+            'filename_base' => sprintf(
+                'laporan-pasien-treatment-terbanyak-%s-sd-%s-top-%d',
+                $filters['tanggal_awal'],
+                $filters['tanggal_akhir'],
+                (int) $filters['peringkat']
+            ),
+            'rows' => $rows
+                ->map(function (array $row): array {
+                    return [
+                        'no' => (int) $row['peringkat'],
+                        'nama_pasien' => $row['nama_pasien'],
+                        'jumlah_transaksi' => (int) $row['total_invoice'],
+                        'total_nominal' => (float) $row['total_nilai_treatment'],
+                    ];
+                })
+                ->values()
+                ->all(),
+            'totals' => [
+                'jumlah_transaksi' => (int) $rows->sum('total_invoice'),
+                'total_nominal' => (float) $rows->sum('total_nilai_treatment'),
+            ],
         ];
     }
 
-    private function buildHtml(string $title, array $columns, $rows, array $filters, bool $autoPrint = false): string
-    {
-        $filterRows = [
-            ['Tanggal', $this->formatDate($filters['tanggal_awal']) . ' s/d ' . $this->formatDate($filters['tanggal_akhir'])],
-            ['Peringkat', 'Top ' . (int) $filters['peringkat']],
-            ['Cabang', $this->publicFilters($filters)['toko_nama'] ?: 'Semua cabang'],
-            ['Jenis Transaksi', $this->jenisTransaksiLabel($filters['jenis_transaksi'])],
-            ['Tanggal Berdasarkan', 'Tanggal lunas invoice'],
-        ];
-
-        $head = collect($columns)->map(function ($column) {
-            return '<th>' . e($column['label']) . '</th>';
-        })->implode('');
-
-        $body = $rows->map(function ($row) use ($columns) {
-            $cells = collect($columns)->map(function ($column) use ($row) {
-                $value = $row[$column['key']] ?? null;
-                $type = $column['type'] ?? 'text';
-                $class = in_array($type, ['currency', 'number'], true) ? ' class="num"' : '';
-
-                if ($type === 'currency') {
-                    $value = $this->formatCurrency($value);
-                } elseif ($type === 'number') {
-                    $value = $this->formatNumber($value);
-                }
-
-                return '<td' . $class . '>' . e((string) ($value ?? '-')) . '</td>';
-            })->implode('');
-
-            return '<tr>' . $cells . '</tr>';
-        })->implode('');
-
-        if ($rows->isEmpty()) {
-            $body = '<tr><td colspan="' . count($columns) . '" style="text-align:center;color:#777;padding:18px;">Tidak ada data pada periode ini.</td></tr>';
-        }
-
-        $filterHtml = collect($filterRows)->map(function ($item) {
-            return '<tr><td style="width:160px;font-weight:bold;">' . e($item[0]) . '</td><td>' . e($item[1]) . '</td></tr>';
-        })->implode('');
-
-        $printedAt = Carbon::now()->format('d/m/Y H:i:s');
-        $autoPrintScript = $autoPrint ? '<script>window.addEventListener("load", function(){ window.print(); });</script>' : '';
-
-        return '<!doctype html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>' . e($title) . '</title>
-<style>
-body{font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#111;margin:18px;}
-h1{font-size:18px;margin:0 0 10px;}
-.meta{margin-bottom:14px;border-collapse:collapse;}
-.meta td{padding:4px 8px;border:1px solid #ddd;}
-table.report{border-collapse:collapse;width:100%;}
-.report th{background:#f3f4f6;font-weight:bold;}
-.report th,.report td{border:1px solid #d7d7d7;padding:6px;vertical-align:top;}
-.num{text-align:right;white-space:nowrap;}
-.footer{margin-top:12px;font-size:11px;color:#666;}
-@media print{body{margin:10mm;} .no-print{display:none;}}
-</style>
-</head>
-<body>
-<div class="no-print" style="margin-bottom:12px;"><button onclick="window.print()">Print / Save PDF</button></div>
-<h1>' . e($title) . '</h1>
-<table class="meta">' . $filterHtml . '</table>
-<table class="report"><thead><tr>' . $head . '</tr></thead><tbody>' . $body . '</tbody></table>
-<div class="footer">Dicetak: ' . e($printedAt) . '</div>
-' . $autoPrintScript . '
-</body>
-</html>';
-    }
-
-    private function getJenisTransaksiOptions()
+    private function getJenisTransaksiOptions(): Collection
     {
         $rows = DB::table('master_jenis_transaksi')
             ->whereIn('id', self::ALLOWED_JENIS_TRANSAKSI)
@@ -381,13 +378,15 @@ table.report{border-collapse:collapse;width:100%;}
             return $rows;
         }
 
-        return collect(self::ALLOWED_JENIS_TRANSAKSI)->map(function ($id) use ($rows) {
+        return collect(self::ALLOWED_JENIS_TRANSAKSI)->map(function (int $id) use ($rows): object {
             $row = $rows->firstWhere('id', $id);
 
             return (object) [
                 'id' => $id,
-                'kode_jenis_transaksi' => $row->kode_jenis_transaksi ?? $this->defaultJenisTransaksiCode($id),
-                'nama_jenis_transaksi' => $row->nama_jenis_transaksi ?? $this->defaultJenisTransaksiLabel($id),
+                'kode_jenis_transaksi' => $row->kode_jenis_transaksi
+                    ?? $this->defaultJenisTransaksiCode($id),
+                'nama_jenis_transaksi' => $row->nama_jenis_transaksi
+                    ?? $this->defaultJenisTransaksiLabel($id),
             ];
         });
     }
@@ -403,7 +402,8 @@ table.report{border-collapse:collapse;width:100%;}
             ->where('is_delete', 0)
             ->first(['nama_jenis_transaksi']);
 
-        return $row->nama_jenis_transaksi ?? $this->defaultJenisTransaksiLabel((int) $id);
+        return $row->nama_jenis_transaksi
+            ?? $this->defaultJenisTransaksiLabel((int) $id);
     }
 
     private function defaultJenisTransaksiCode(int $id): string
@@ -430,19 +430,6 @@ table.report{border-collapse:collapse;width:100%;}
         };
     }
 
-    private function filename(string $format, array $filters): string
-    {
-        $extension = $format === 'excel' ? 'xls' : 'html';
-
-        return sprintf(
-            'data-pasien-treatment-terbanyak-%s-sd-%s-top-%s.%s',
-            $filters['tanggal_awal'],
-            $filters['tanggal_akhir'],
-            (int) $filters['peringkat'],
-            $extension
-        );
-    }
-
     private function normalizePhone(?string $value): string
     {
         $phone = preg_replace('/\s+/', '', (string) $value);
@@ -462,22 +449,18 @@ table.report{border-collapse:collapse;width:100%;}
         return $phone;
     }
 
-    private function formatDate(?string $value): string
+    private function formatDateLong(string $value): string
     {
-        if (! $value) {
-            return '-';
-        }
-
-        return Carbon::parse($value)->format('d/m/Y');
-    }
-
-    private function formatCurrency($value): string
-    {
-        return 'Rp ' . number_format((float) $value, 0, ',', '.');
+        return Carbon::parse($value)
+            ->locale('id')
+            ->translatedFormat('j F Y');
     }
 
     private function formatNumber($value): string
     {
-        return number_format((float) $value, 2, ',', '.');
+        $number = (float) $value;
+        $decimals = floor($number) === $number ? 0 : 2;
+
+        return number_format($number, $decimals, ',', '.');
     }
 }
