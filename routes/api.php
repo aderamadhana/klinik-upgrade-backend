@@ -59,6 +59,12 @@ use App\Http\Controllers\Api\Laporan\LaporanProdukObatController;
 use App\Http\Controllers\Api\Laporan\LaporanPasienTreatmentTerbanyakController;
 use App\Http\Controllers\Api\Laporan\LaporanTopPasienNominalTerbanyakController;
 use App\Http\Controllers\Api\Laporan\LaporanTindakanTerlarisController;
+use App\Http\Controllers\Api\Laporan\LaporanTreatmentTidakLakuController;
+use App\Http\Controllers\Api\Laporan\LaporanPasienPalingSeringBelanjaController;
+use App\Http\Controllers\Api\Laporan\LaporanDetailTreatmentController;
+use App\Http\Controllers\Api\Laporan\LaporanPasienTerakhirTransaksiTreatmentController;
+use App\Http\Controllers\Api\Laporan\LaporanPembayaranFoController;
+use App\Http\Controllers\Api\Laporan\LaporanJumlahPeningkatanController;
 
 use App\Http\Controllers\Api\Accurate\AccurateSettlementController;
 
@@ -302,8 +308,36 @@ Route::middleware('auth:api')->group(function () {
             Route::get('/export/{format}', [LaporanTindakanTerlarisController::class, 'export']);
         });
 
+        Route::prefix('treatment-tidak-laku')->group(function () {
+            Route::get('/summary', [LaporanTreatmentTidakLakuController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanTreatmentTidakLakuController::class, 'export']);
+        });
+        
+        Route::prefix('pasien-paling-sering-belanja')->group(function () {
+            Route::get('/summary', [LaporanPasienPalingSeringBelanjaController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanPasienPalingSeringBelanjaController::class, 'export']);
+        });
 
+        Route::prefix('detail-treatment')->group(function () {
+            Route::get('/summary', [LaporanDetailTreatmentController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanDetailTreatmentController::class, 'export']);
+        });
 
+        Route::prefix('pasien-terakhir-transaksi')->group(function () {
+            Route::get('/summary', [LaporanPasienTerakhirTransaksiTreatmentController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanPasienTerakhirTransaksiTreatmentController::class, 'export']);
+        });
+
+        Route::prefix('pembayaran-fo')->group(function () {
+            Route::get('/kasir', [LaporanPembayaranFoController::class, 'kasir']);
+            Route::get('/summary', [LaporanPembayaranFoController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanPembayaranFoController::class, 'export']);
+        });
+        
+        Route::prefix('jumlah-peningkatan')->group(function () {
+            Route::get('/summary', [LaporanJumlahPeningkatanController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanJumlahPeningkatanController::class, 'export']);
+        });
     });
 
     Route::prefix('accurate')->group(function () {
