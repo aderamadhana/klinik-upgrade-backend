@@ -28,6 +28,8 @@ use App\Http\Controllers\Api\Administrasi\PasienController;
 use App\Http\Controllers\Api\Administrasi\PasienDepositController;
 use App\Http\Controllers\Api\Administrasi\PasienTierController;
 use App\Http\Controllers\Api\Administrasi\PasienPoinController;
+use App\Http\Controllers\Api\Administrasi\PasienPengkajianAwalController;
+use App\Http\Controllers\Api\Administrasi\SkinAnalyzerController;
 
 use App\Http\Controllers\Api\Registrasi\RegistrasiLayananController;
 
@@ -134,6 +136,30 @@ Route::middleware('auth:api')->group(function () {
             ->whereNumber('id')
             ->whereNumber('ledgerId');
         Route::apiResource('pasien', PasienController::class);
+
+        Route::get('pasien/{id}/pengkajian-awal',[PasienPengkajianAwalController::class, 'index'])->whereNumber('id');
+        Route::get('pasien/{id}/pengkajian-awal/{pengkajianId}',[PasienPengkajianAwalController::class, 'show'])->whereNumber('id')->whereNumber('pengkajianId');
+        Route::post(
+            'pasien/{id}/pengkajian-awal',
+            [PasienPengkajianAwalController::class, 'store']
+        )->whereNumber('id');
+        Route::put(
+            'pasien/{id}/pengkajian-awal/{pengkajianId}',
+            [PasienPengkajianAwalController::class, 'update']
+        )
+            ->whereNumber('id')
+            ->whereNumber('pengkajianId');
+        Route::apiResource('pasien', PasienController::class);
+
+        Route::get(
+            'pasien/{id}/skin-analyzer',
+            [SkinAnalyzerController::class, 'index'],
+        )->whereNumber('id');
+
+        Route::post(
+            'pasien/{id}/skin-analyzer',
+            [SkinAnalyzerController::class, 'store'],
+        )->whereNumber('id');
     });
 
     Route::prefix('farmasi')->group(function () {
