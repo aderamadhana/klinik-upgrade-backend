@@ -65,6 +65,9 @@ use App\Http\Controllers\Api\Laporan\LaporanDetailTreatmentController;
 use App\Http\Controllers\Api\Laporan\LaporanPasienTerakhirTransaksiTreatmentController;
 use App\Http\Controllers\Api\Laporan\LaporanPembayaranFoController;
 use App\Http\Controllers\Api\Laporan\LaporanJumlahPeningkatanController;
+use App\Http\Controllers\Api\Laporan\LaporanProdukResepDokterController;
+use App\Http\Controllers\Api\Laporan\LaporanBelumRealisasiDepositController;
+use App\Http\Controllers\Api\Laporan\LaporanBahanTreatmentController;
 
 use App\Http\Controllers\Api\Accurate\AccurateSettlementController;
 
@@ -337,6 +340,24 @@ Route::middleware('auth:api')->group(function () {
         Route::prefix('jumlah-peningkatan')->group(function () {
             Route::get('/summary', [LaporanJumlahPeningkatanController::class, 'summary']);
             Route::get('/export/{format}', [LaporanJumlahPeningkatanController::class, 'export']);
+        });
+        
+        Route::prefix('produk-resep-dokter')->group(function () {
+            Route::get('/dokter', [LaporanProdukResepDokterController::class, 'dokter']);
+            Route::get('/summary', [LaporanProdukResepDokterController::class, 'summary']);
+            Route::get('/export/{format}', [LaporanProdukResepDokterController::class, 'export']);
+        });
+
+        Route::prefix('belum-realisasi-deposit')->group(function () {
+            Route::get('/summary', [LaporanBelumRealisasiDepositController::class, 'summary']);
+            Route::get('/export/pdf', [LaporanBelumRealisasiDepositController::class, 'exportPdf']);
+        });
+
+        Route::prefix('bahan-treatment')->group(function () {
+            Route::get('/summary', [LaporanBahanTreatmentController::class, 'summary']);
+            Route::get('/export/{jenis}/{format}', [LaporanBahanTreatmentController::class, 'export'])
+                ->whereIn('jenis', ['detail', 'rekap'])
+                ->whereIn('format', ['pdf', 'excel']);
         });
     });
 
