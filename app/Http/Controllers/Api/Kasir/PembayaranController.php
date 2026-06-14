@@ -621,6 +621,7 @@ class PembayaranController extends Controller
             'status' => $invoice->status,
             'status_key' => $this->mapInvoiceStatusToKey((int) ($invoice->status ?? 0)),
             'status_label' => $this->mapInvoiceStatusToLabel((int) ($invoice->status ?? 0)),
+            'is_premier' => (int) ($invoice->is_premier ?? 0),
             'grand_total' => (float) ($invoice->grand_total ?? 0),
             'total_bayar' => (float) ($invoice->total_bayar ?? 0),
             'sisa_tagihan' => (float) ($invoice->sisa_tagihan ?? 0),
@@ -1601,6 +1602,7 @@ class PembayaranController extends Controller
             'metode' => $invoice->metode?->where('is_delete', 0)->values() ?? [],
             'metode_pembayaran' => $metodePembayaran,
             'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
+            'is_premier' => (int) ($invoice->is_premier ?? 0),
             'referensi_dokter_id' => $invoice->referensi_dokter_id ?? null,
             'deposit_expired_option_id' => $invoice->deposit_expired_option_id ?? null,
             'deposit_expired_at' => $invoice->deposit_expired_at ?? null,
@@ -1714,6 +1716,7 @@ class PembayaranController extends Controller
             'status_key' => $this->mapInvoiceStatusToKey($invoice->status),
             'status_label' => $this->mapInvoiceStatusToLabel($invoice->status),
             'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
+            'is_premier' => (int) ($invoice->is_premier ?? 0),
             'referensi_dokter_id' => $invoice->referensi_dokter_id ?? null,
             'deposit_expired_option_id' => $invoice->deposit_expired_option_id ?? null,
             'deposit_expired_at' => $invoice->deposit_expired_at ?? null,
@@ -3403,6 +3406,7 @@ class PembayaranController extends Controller
         $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
             'tanggal_lunas' => now(),
             'jenis_transaksi' => $jenisTransaksi,
+            'is_premier' => $this->resolveIsPremierFromRequest($request, $invoice),
             'referensi_dokter_id' => $jenisTransaksi === 4
                 ? $request->input('referensi_dokter_id')
                 : null,
@@ -4356,6 +4360,17 @@ class PembayaranController extends Controller
         return $digits;
     }
 
+    protected function resolveIsPremierFromRequest(
+        Request $request,
+        ?PembayaranInvoice $invoice = null
+    ): int {
+        if ($request->has('is_premier')) {
+            return $request->boolean('is_premier') ? 1 : 0;
+        }
+
+        return (int) ($invoice?->is_premier ?? 0) === 1 ? 1 : 0;
+    }
+
     protected function consumeVoucherQuotaIfNeeded(object $voucher, PembayaranInvoice $invoice): void
     {
         if (!Schema::hasTable('master_voucher_diskon')) {
@@ -4482,6 +4497,7 @@ class PembayaranController extends Controller
             'kode_registrasi' => $invoice->kode_registrasi,
             'pasien_id' => $invoice->pasien_id,
             'jenis_transaksi' => (int) ($invoice->jenis_transaksi ?? 0),
+            'is_premier' => (int) ($invoice->is_premier ?? 0),
             'grand_total' => (float) ($invoice->grand_total ?? 0),
             'items' => $items->map(function ($item) {
                 return [
@@ -5263,6 +5279,7 @@ class PembayaranController extends Controller
             'pasien_id' => $registrasi->pasien_id,
             'dokter_id' => $registrasi->dokter_awal_id ?? null,
             'jenis_transaksi' => 0,
+            'is_premier' => (int) ($existing->is_premier ?? 0),
             'subtotal_obat' => 0,
             'subtotal_produk' => (float) ($registrasi->total_penjualan ?? 0),
             'subtotal_treatment' => (float) ($registrasi->total_treatment ?? 0),
@@ -6070,6 +6087,7 @@ class PembayaranController extends Controller
             'last_at' => microtime(true),
             'request_summary' => [
                 'jenis_transaksi' => $request->input('jenis_transaksi'),
+                'is_premier' => $request->input('is_premier'),
                 'grand_total' => $request->input('grand_total'),
                 'metode_count' => is_array($request->input('metode')) ? count($request->input('metode')) : 0,
                 'penjualan_count' => is_array($request->input('penjualan_items')) ? count($request->input('penjualan_items')) : 0,
@@ -6121,6 +6139,7 @@ class PembayaranController extends Controller
             'jumlah_bayar' => 'nullable|numeric|min:0',
             'catatan_pembayaran' => 'nullable|string',
             'jenis_transaksi' => 'nullable|integer|in:0,1,2,3,4',
+            'is_premier' => 'nullable|boolean',
             'referensi_dokter_id' => 'nullable|integer',
             'deposit_expired_option_id' => 'nullable|integer',
             'deposit_expired_at' => 'nullable|date',
@@ -6215,9 +6234,18 @@ class PembayaranController extends Controller
                 }
 
                 $jenisTransaksi = (int) $request->input('jenis_transaksi', $invoice->jenis_transaksi ?? 0);
+                $isPremier = $this->resolveIsPremierFromRequest($request, $invoice);
                 $depositExpiredAt = $this->resolveDepositExpiredAt($request);
-                $this->markPaymentFinishTrace($trace, 'resolveDepositExpiredAt.finished', [
+
+                $invoice->forceFill($this->onlyExistingColumns('pembayaran_invoice', [
+                    'is_premier' => $isPremier,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]))->save();
+
+                $this->markPaymentFinishTrace($trace, 'resolvePaymentOptions.finished', [
                     'jenis_transaksi' => $jenisTransaksi,
+                    'is_premier' => $isPremier,
                     'deposit_expired_at' => $depositExpiredAt,
                 ]);
 
@@ -6401,6 +6429,7 @@ class PembayaranController extends Controller
                 $invoice->update($this->onlyExistingColumns('pembayaran_invoice', [
                     'tanggal_lunas' => now(),
                     'jenis_transaksi' => $jenisTransaksi,
+                    'is_premier' => $isPremier,
                     'referensi_dokter_id' => $jenisTransaksi === 4
                         ? $request->input('referensi_dokter_id')
                         : ($request->input('referensi_dokter_id', $invoice->referensi_dokter_id ?? null)),
