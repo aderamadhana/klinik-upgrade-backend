@@ -21,6 +21,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\ValidationException;
 
 class AntrianDokterController extends Controller
 {
@@ -122,6 +123,7 @@ class AntrianDokterController extends Controller
                 'konsultasiFotos',
                 'treatmentDetails.treatment',
                 'treatmentDetails.treatmentToko',
+                'treatmentDetails.perawat.jabatan',
                 'penjualanDetails.produk',
                 'penjualanDetails.produkToko',
             ])
@@ -279,7 +281,10 @@ class AntrianDokterController extends Controller
             'treatment_items.*.jumlah' => 'nullable|integer|min:1',
             'treatment_items.*.qty' => 'nullable|integer|min:1',
             'treatment_items.*.total' => 'nullable|numeric|min:0',
-            'treatment_items.*.perawat_id' => 'nullable|integer',
+            'treatment_items.*.perawat_id' => 'nullable|integer|exists:master_karyawan,id',
+            'treatment_items.*.perawat_nama' => 'nullable|string|max:150',
+            'treatment_items.*.perawat_jabatan_kode' => 'nullable|string|max:50',
+            'treatment_items.*.perawat_jabatan_nama' => 'nullable|string|max:100',
             'treatment_items.*.perlu_tindakan_perawat' => 'nullable|boolean',
             'treatment_items.*.route_treatment' => 'nullable|string|max:30',
             'treatment_items.*.catatan' => 'nullable|string',
@@ -434,6 +439,16 @@ class AntrianDokterController extends Controller
             DB::commit();
 
             return $this->doctorFinishSuccessResponse($registrasi, $invoice, false);
+        } catch (ValidationException $e) {
+            if (DB::transactionLevel() > 0) {
+                DB::rollBack();
+            }
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
         } catch (\Throwable $e) {
             if (DB::transactionLevel() > 0) {
                 DB::rollBack();
@@ -741,74 +756,115 @@ class AntrianDokterController extends Controller
         }
     }
 
-    private function replaceDoctorTreatmentItems(Request $request, RegistrasiKunjungan $registrasi, RegistrasiTask $task): void
-    {
+    private function replaceDoctorTreatmentItems(
+        Request $request,
+        RegistrasiKunjungan $registrasi,
+        RegistrasiTask $task
+    ): void {
         $items = collect($request->input('treatment_items', []))
-            ->filter(fn ($item) => !empty($item['treatment_toko_id']) || !empty($item['treatment_id']))
+            ->filter(function ($item) {
+                return !empty($item['treatment_toko_id'])
+                    || !empty($item['treatment_id']);
+            })
             ->values();
 
         RegistrasiTreatmentDetail::query()
             ->where('registrasi_id', $registrasi->id)
-            ->where('source_type', 2)
+            ->where('source_type', RegistrasiTreatmentDetail::SOURCE_DOKTER)
             ->where('source_task_id', $task->id)
-            ->update($this->onlyExistingColumns('registrasi_treatment_detail', [
-                'status' => 9,
-                'is_delete' => 1,
-                'updated_by' => $this->username(),
-                'updated_at' => now(),
-            ]));
+            ->update($this->onlyExistingColumns(
+                'registrasi_treatment_detail',
+                [
+                    'status' => RegistrasiTreatmentDetail::STATUS_BATAL,
+                    'is_delete' => 1,
+                    'updated_by' => $this->username(),
+                    'updated_at' => now(),
+                ]
+            ));
 
-        foreach ($items as $item) {
+        foreach ($items as $index => $item) {
             $treatmentTokoId = $item['treatment_toko_id'] ?? null;
             $treatmentId = $item['treatment_id'] ?? null;
 
             $harga = (float) ($item['harga'] ?? 0);
             $jumlah = max((int) ($item['jumlah'] ?? $item['qty'] ?? 1), 1);
             $total = (float) ($item['total'] ?? ($harga * $jumlah));
-            $namaTreatment = $item['nama_treatment'] ?? $item['nama'] ?? 'Treatment';
+            $namaTreatment = $item['nama_treatment']
+                ?? $item['nama']
+                ?? 'Treatment';
 
-            $existingTreatment = $this->findActiveBaseTreatmentDetail($registrasi, $treatmentTokoId, $treatmentId);
+            $existingTreatment = $this->findActiveBaseTreatmentDetail(
+                $registrasi,
+                $treatmentTokoId,
+                $treatmentId
+            );
 
-            if ($existingTreatment) {
-                $existingTreatment->update($this->onlyExistingColumns('registrasi_treatment_detail', [
-                    'nama_treatment' => $namaTreatment,
-                    'harga' => $harga,
-                    'jumlah' => $jumlah,
-                    'total' => $total,
-                    'perlu_tindakan_perawat' => $this->isTrue($item['perlu_tindakan_perawat'] ?? false) ? 1 : 0,
-                    'route_treatment' => $item['route_treatment'] ?? null,
-                    'catatan' => $item['catatan'] ?? null,
-                    'is_saran_dokter' => 0,
-                    'updated_by' => $this->username(),
-                    'updated_at' => now(),
-                ]));
+            $perawatId = array_key_exists('perawat_id', $item)
+                ? (filled($item['perawat_id']) ? (int) $item['perawat_id'] : null)
+                : ($existingTreatment?->perawat_id
+                    ? (int) $existingTreatment->perawat_id
+                    : null);
+
+if ($existingTreatment) {
+                $existingTreatment->update(
+                    $this->onlyExistingColumns(
+                        'registrasi_treatment_detail',
+                        [
+                            'perawat_id' => $perawatId,
+                            'nama_treatment' => $namaTreatment,
+                            'harga' => $harga,
+                            'jumlah' => $jumlah,
+                            'total' => $total,
+                            'perlu_tindakan_perawat' => $this->isTrue(
+                                $item['perlu_tindakan_perawat'] ?? false
+                            ) ? 1 : 0,
+                            'route_treatment' =>
+                                $item['route_treatment'] ?? null,
+                            'catatan' => $item['catatan'] ?? null,
+                            'is_saran_dokter' => 0,
+                            'status' => RegistrasiTreatmentDetail::STATUS_BELUM_DIKERJAKAN,
+                            'is_delete' => 0,
+                            'updated_by' => $this->username(),
+                            'updated_at' => now(),
+                        ]
+                    )
+                );
 
                 continue;
             }
 
-            RegistrasiTreatmentDetail::create($this->onlyExistingColumns('registrasi_treatment_detail', [
-                'registrasi_id' => $registrasi->id,
-                'source_type' => 2,
-                'source_task_id' => $task->id,
-                'source_karyawan_id' => $registrasi->dokter_awal_id,
-                'is_saran_dokter' => 1,
-                'is_deposit_claim' => 0,
-                'deposit_treatment_id' => null,
-                'deposit_claim_id' => null,
-                'treatment_toko_id' => $treatmentTokoId,
-                'treatment_id' => $treatmentId,
-                'nama_treatment' => $namaTreatment,
-                'harga' => $harga,
-                'jumlah' => $jumlah,
-                'total' => $total,
-                'perlu_tindakan_perawat' => $this->isTrue($item['perlu_tindakan_perawat'] ?? false) ? 1 : 0,
-                'route_treatment' => $item['route_treatment'] ?? null,
-                'catatan' => $item['catatan'] ?? null,
-                'status' => 0,
-                'is_delete' => 0,
-                'created_by' => $this->username(),
-                'created_at' => now(),
-            ]));
+            RegistrasiTreatmentDetail::create(
+                $this->onlyExistingColumns(
+                    'registrasi_treatment_detail',
+                    [
+                        'registrasi_id' => $registrasi->id,
+                        'source_type' => RegistrasiTreatmentDetail::SOURCE_DOKTER,
+                        'source_task_id' => $task->id,
+                        'source_karyawan_id' => $registrasi->dokter_awal_id,
+                        'perawat_id' => $perawatId,
+                        'is_saran_dokter' => 1,
+                        'is_deposit_claim' => 0,
+                        'deposit_treatment_id' => null,
+                        'deposit_claim_id' => null,
+                        'treatment_toko_id' => $treatmentTokoId,
+                        'treatment_id' => $treatmentId,
+                        'nama_treatment' => $namaTreatment,
+                        'harga' => $harga,
+                        'jumlah' => $jumlah,
+                        'total' => $total,
+                        'perlu_tindakan_perawat' => $this->isTrue(
+                            $item['perlu_tindakan_perawat'] ?? false
+                        ) ? 1 : 0,
+                        'route_treatment' =>
+                            $item['route_treatment'] ?? null,
+                        'catatan' => $item['catatan'] ?? null,
+                        'status' => RegistrasiTreatmentDetail::STATUS_BELUM_DIKERJAKAN,
+                        'is_delete' => 0,
+                        'created_by' => $this->username(),
+                        'created_at' => now(),
+                    ]
+                )
+            );
         }
     }
 
@@ -1082,7 +1138,7 @@ class AntrianDokterController extends Controller
                 'diskon_referral' => $item->diskon_referral ?? 0,
                 'subtotal' => $subtotal,
                 'dokter_id' => $registrasi->dokter_awal_id,
-                'perawat_id' => $registrasi->perawat_awal_id,
+                'perawat_id' => $item->perawat_id ?: null,
                 'is_saran_dokter' => (int) ($item->is_saran_dokter ?? 0),
                 'status' => PembayaranInvoiceItem::STATUS_AKTIF,
                 'is_delete' => 0,

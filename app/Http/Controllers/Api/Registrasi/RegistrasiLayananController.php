@@ -21,6 +21,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\ValidationException;
 
 class RegistrasiLayananController extends Controller
 {
@@ -419,7 +420,7 @@ class RegistrasiLayananController extends Controller
                 'dokterAwal:id,nama',
                 'perawatAwal:id,nama',
                 'tasks',
-                'treatmentDetails',
+                'treatmentDetails.perawat',
                 'penjualanDetails',
             ])
             ->active()
@@ -695,6 +696,13 @@ class RegistrasiLayananController extends Controller
                     'harga' => (float) ($item->harga ?? $item->harga_treatment ?? $item->treatment_harga ?? 0),
                     'jumlah' => (float) ($item->jumlah ?? $item->qty ?? 1),
                     'total' => (float) ($item->total ?? $item->subtotal ?? $item->total_harga ?? 0),
+                    'perawat_id' => $item->perawat_id,
+                    'perawat_nama' => $item->perawat?->nama,
+                    'perawat' => $item->perawat ? [
+                        'id' => $item->perawat->id,
+                        'nama' => $item->perawat->nama,
+                        'jabatan_id' => $item->perawat->jabatan_id,
+                    ] : null,
                 ];
             })->values(),
 
@@ -774,7 +782,11 @@ class RegistrasiLayananController extends Controller
             'konsultasi_online.bukti_foto_kanan' => 'nullable|file|mimes:jpg,jpeg,png,webp|max:5120',
 
             'treatment' => 'nullable|array',
-            'treatment.items' => 'nullable|array',
+            'treatment.items.*.perawat_id' => [
+                'nullable',
+                'integer',
+                'exists:master_karyawan,id',
+            ],
 
             'penjualan' => 'nullable|array',
             'penjualan.items' => 'nullable|array',
@@ -939,9 +951,49 @@ class RegistrasiLayananController extends Controller
         try {
             $tokoId = (int) $request->toko_id;
 
-            $treatmentItems = $this->normalizeTreatmentItems(
+            $rawTreatmentItems = collect(
                 $request->input('treatment.items', [])
-            );
+            )
+                ->filter(function ($item) {
+                    return !empty($item['treatment_toko_id'])
+                        || !empty($item['treatment_id'])
+                        || !empty($item['tindakan_id']);
+                })
+                ->values();
+
+            $treatmentItems = collect(
+                $this->normalizeTreatmentItems($rawTreatmentItems->all())
+            )
+                ->values()
+                ->map(function ($item, $index) use ($rawTreatmentItems) {
+                    $rawItem = $rawTreatmentItems->get($index, []);
+
+                    $perawatId = $rawItem['perawat_id'] ?? null;
+
+                    $item['perawat_id'] = filled($perawatId)
+                        ? (int) $perawatId
+                        : null;
+                    $item['perawat_nama'] =
+                        $rawItem['perawat_nama'] ?? null;
+                    $item['perawat_jabatan_kode'] =
+                        $rawItem['perawat_jabatan_kode'] ?? null;
+                    $item['perawat_jabatan_nama'] =
+                        $rawItem['perawat_jabatan_nama'] ?? null;
+
+                    return $item;
+                })
+                ->all();
+
+            $selectedTreatmentPerawatIds = collect($treatmentItems)
+                ->pluck('perawat_id')
+                ->filter()
+                ->map(fn ($value) => (int) $value)
+                ->unique()
+                ->values();
+
+            $primaryTreatmentPerawatId = $selectedTreatmentPerawatIds->count() === 1
+                ? (int) $selectedTreatmentPerawatIds->first()
+                : null;
 
             $penjualanItems = $this->normalizePenjualanItems(
                 $request->input('penjualan.items', [])
@@ -1001,7 +1053,9 @@ class RegistrasiLayananController extends Controller
                 'registered_at' => now(),
                 'catatan_registrasi' => $request->input('catatan_registrasi'),
                 'dokter_awal_id' => $request->input('dokter_id'),
-                'perawat_awal_id' => $request->input('perawat_id'),
+                'perawat_awal_id' => $adaTreatment
+                    ? $primaryTreatmentPerawatId
+                    : $request->input('perawat_id'),
                 'channel_konsultasi' => $channelKonsultasi,
                 'is_treatment' => $adaTreatment ? 1 : 0,
                 'is_penjualan' => $adaPenjualan ? 1 : 0,
@@ -1054,7 +1108,8 @@ class RegistrasiLayananController extends Controller
                 $adaPenjualan,
                 $needNurseStation,
                 $needPembayaran,
-                $request
+                $request,
+                $primaryTreatmentPerawatId
             );
 
             $konsultasi = null;
@@ -1102,7 +1157,7 @@ class RegistrasiLayananController extends Controller
                 'perawatAwal',
                 'tasks',
                 'konsultasiIntake',
-                'treatmentDetails',
+                'treatmentDetails.perawat',
                 'penjualanDetails',
             ]);
 
@@ -1111,6 +1166,14 @@ class RegistrasiLayananController extends Controller
                 'message' => 'Registrasi berhasil disimpan',
                 'data' => $registrasi,
             ], 201);
+        } catch (ValidationException $e) {
+            DB::rollBack();
+
+            return response()->json([
+                'status' => false,
+                'message' => 'Validasi gagal',
+                'errors' => $e->errors(),
+            ], 422);
         } catch (\Throwable $e) {
             DB::rollBack();
 
@@ -1863,7 +1926,12 @@ class RegistrasiLayananController extends Controller
             ->flatMap(function ($rows) {
                 return $rows;
             })
-            ->pluck('source_karyawan_id')
+            ->flatMap(function ($item) {
+                return [
+                    $item->perawat_id ?? null,
+                    $item->source_karyawan_id ?? null,
+                ];
+            })
             ->filter()
             ->unique()
             ->values();
@@ -1932,8 +2000,12 @@ class RegistrasiLayananController extends Controller
 
                     $html = '<div>' . e($nama . $formatQty($item->jumlah ?? 1));
 
-                    $perawatNama = !empty($item->source_karyawan_id)
-                        ? ($treatmentKaryawanNames[$item->source_karyawan_id] ?? null)
+                    $perawatId = $item->perawat_id
+                        ?? $item->source_karyawan_id
+                        ?? null;
+
+                    $perawatNama = $perawatId
+                        ? ($treatmentKaryawanNames[$perawatId] ?? null)
                         : null;
 
                     if ($perawatNama) {
@@ -2151,7 +2223,8 @@ class RegistrasiLayananController extends Controller
         bool $adaPenjualan,
         bool $needNurseStation,
         bool $needPembayaran,
-        Request $request
+        Request $request,
+        ?int $primaryTreatmentPerawatId = null
     ) {
         $tasks = [];
         $order = 1;
@@ -2184,7 +2257,7 @@ class RegistrasiLayananController extends Controller
             $tasks['perawat'] = RegistrasiTask::create([
                 'registrasi_id' => $registrasi->id,
                 'task_type' => RegistrasiTask::TYPE_TINDAKAN_PERAWAT,
-                'assigned_karyawan_id' => $request->input('perawat_id'),
+                'assigned_karyawan_id' => $primaryTreatmentPerawatId,
                 'task_order' => $order++,
                 'status' => RegistrasiTask::STATUS_MENUNGGU,
                 'created_by' => $this->username(),
@@ -2322,11 +2395,14 @@ class RegistrasiLayananController extends Controller
                 );
             }
 
+            $perawatId = $item['perawat_id'] ?? null;
+
             RegistrasiTreatmentDetail::create([
                 'registrasi_id' => $registrasi->id,
                 'source_type' => RegistrasiTreatmentDetail::SOURCE_FO,
                 'source_task_id' => $task?->id,
                 'source_karyawan_id' => null,
+                'is_saran_dokter' => 0,
                 'is_deposit_claim' => $this->toBool($item['is_deposit_claim'] ?? false) ? 1 : 0,
                 'deposit_treatment_id' => $item['deposit_treatment_id'] ?? null,
                 'deposit_claim_id' => $item['deposit_claim_id'] ?? null,
@@ -2339,6 +2415,11 @@ class RegistrasiLayananController extends Controller
                 'harga' => $item['harga'],
                 'jumlah' => $item['jumlah'],
                 'total' => $item['total'],
+                'perawat_id' => filled($perawatId) ? (int) $perawatId : null,
+                'perlu_tindakan_perawat' => $this->toBool(
+                    $item['perlu_tindakan_perawat'] ?? false
+                ) ? 1 : 0,
+                'route_treatment' => $item['route_treatment'] ?? null,
                 'catatan' => $item['catatan'] ?? null,
                 'status' => RegistrasiTreatmentDetail::STATUS_BELUM_DIKERJAKAN,
                 'is_delete' => 0,

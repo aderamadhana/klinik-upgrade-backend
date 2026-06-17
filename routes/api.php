@@ -423,6 +423,7 @@ Route::prefix('reference')->group(function () {
     Route::get('tipe-treatment', [ReferenceController::class, 'tipeTreatment']);
     Route::get('produk-by-toko', [ReferenceController::class, 'produkByToko']);
     Route::get('treatment-by-toko', [ReferenceController::class, 'treatmentByToko']);
+    Route::get('nurse-beautician',[ReferenceController::class, 'nurseBeautician']);
     Route::get('voucher-diskon-jenis', [ReferenceController::class, 'voucherDiskonJenis']);
     Route::get('voucher-diskon-kategori', [ReferenceController::class, 'voucherDiskonKategori']);
     Route::get('voucher-diskon-template', [ReferenceController::class, 'voucherDiskonTemplate']);

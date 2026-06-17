@@ -2,8 +2,8 @@
 
 namespace App\Models\Pembayaran;
 
+use App\Models\Master\MasterKaryawan;
 use App\Models\Registrasi\RegistrasiKunjungan;
-use Illuminate\Database\Eloquent\Model;
 
 class PembayaranInvoiceItem extends BasePembayaranModel
 {
@@ -33,13 +33,13 @@ class PembayaranInvoiceItem extends BasePembayaranModel
         'diskon_referral' => 'decimal:2',
         'subtotal' => 'decimal:2',
         'expired_at' => 'date',
-
         'item_type' => 'integer',
         'source_type' => 'integer',
         'diskon_tipe' => 'integer',
         'status' => 'integer',
         'is_delete' => 'integer',
         'is_saran_dokter' => 'integer',
+        'perawat_id' => 'integer',
     ];
 
     public function scopeActive($query)
@@ -57,6 +57,11 @@ class PembayaranInvoiceItem extends BasePembayaranModel
     public function registrasi()
     {
         return $this->belongsTo(RegistrasiKunjungan::class, 'registrasi_id');
+    }
+
+    public function perawat()
+    {
+        return $this->belongsTo(MasterKaryawan::class, 'perawat_id');
     }
 
     public function promos()

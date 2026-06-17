@@ -1619,4 +1619,32 @@ class ReferenceController extends Controller
             'data' => $data,
         ]);
     }
+
+    public function nurseBeautician(Request $request)
+    {
+        $validated = $request->validate([
+            'toko_id' => [
+                'required',
+                'integer',
+                'exists:master_toko,id',
+            ],
+            'tanggal' => [
+                'nullable',
+                'date_format:Y-m-d',
+            ],
+        ]);
+
+        $data = app(
+            \App\Services\Registrasi\TreatmentPerformerService::class
+        )->options(
+            (int) $validated['toko_id'],
+            $validated['tanggal'] ?? now()->toDateString()
+        );
+
+        return response()->json([
+            'status' => true,
+            'message' => 'Data nurse / beautician berhasil diambil.',
+            'data' => $data,
+        ]);
+    }
 }
