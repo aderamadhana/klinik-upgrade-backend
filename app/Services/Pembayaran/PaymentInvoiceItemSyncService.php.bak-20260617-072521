@@ -603,7 +603,7 @@ class PaymentInvoiceItemSyncService
                 'subtotal_after_diskon_subtotal' => $subtotal,
                 'subtotal' => $subtotal,
                 'dokter_id' => $registrasi->dokter_awal_id ?? null,
-                'perawat_id' => $detail->perawat_id ?? null,
+                'perawat_id' => $registrasi->perawat_awal_id ?? null,
                 'is_saran_dokter' => (int) ($detail->is_saran_dokter ?? 0),
                 'status' => 1,
                 'is_delete' => 0,

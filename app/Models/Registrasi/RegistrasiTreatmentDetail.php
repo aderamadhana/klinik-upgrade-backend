@@ -6,33 +6,6 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
 {
     protected $table = 'registrasi_treatment_detail';
 
-    protected $fillable = [
-        'registrasi_id',
-        'source_type',
-        'source_task_id',
-        'source_karyawan_id',
-        'is_saran_dokter',
-        'is_deposit_claim',
-        'deposit_treatment_id',
-        'deposit_claim_id',
-        'treatment_toko_id',
-        'treatment_id',
-        'nama_treatment',
-        'harga',
-        'jumlah',
-        'total',
-        'perawat_id',
-        'perlu_tindakan_perawat',
-        'route_treatment',
-        'catatan',
-        'status',
-        'is_delete',
-        'created_by',
-        'updated_by',
-        'created_at',
-        'updated_at',
-    ];
-
     public const SOURCE_FO = 1;
     public const SOURCE_DOKTER = 2;
     public const SOURCE_PERAWAT = 3;
@@ -48,7 +21,8 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
         'source_type' => 'integer',
         'source_task_id' => 'integer',
         'source_karyawan_id' => 'integer',
-        'is_saran_dokter' => 'boolean',
+        'perawat_id' => 'integer',
+        'is_saran_dokter' => 'integer',
         'is_deposit_claim' => 'boolean',
         'deposit_treatment_id' => 'integer',
         'deposit_claim_id' => 'integer',
@@ -57,7 +31,6 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
         'harga' => 'decimal:2',
         'jumlah' => 'integer',
         'total' => 'decimal:2',
-        'perawat_id' => 'integer',
         'perlu_tindakan_perawat' => 'boolean',
         'status' => 'integer',
         'is_delete' => 'boolean',
@@ -78,7 +51,7 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
     public function sourceKaryawan()
     {
         return $this->belongsTo(
-            'App\Models\Master\MasterKaryawan',
+            'App\\Models\\Master\\MasterKaryawan',
             'source_karyawan_id'
         );
     }
@@ -86,7 +59,7 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
     public function perawat()
     {
         return $this->belongsTo(
-            'App\Models\Master\MasterKaryawan',
+            'App\\Models\\Master\\MasterKaryawan',
             'perawat_id'
         );
     }
@@ -94,7 +67,7 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
     public function treatmentToko()
     {
         return $this->belongsTo(
-            'App\Models\Master\MasterTreatmentToko',
+            'App\\Models\\Master\\MasterTreatmentToko',
             'treatment_toko_id'
         );
     }
@@ -102,7 +75,7 @@ class RegistrasiTreatmentDetail extends BaseRegistrasiModel
     public function treatment()
     {
         return $this->belongsTo(
-            'App\Models\Master\MasterTreatment',
+            'App\\Models\\Master\\MasterTreatment',
             'treatment_id'
         );
     }
